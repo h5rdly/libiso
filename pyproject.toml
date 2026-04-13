@@ -7,9 +7,9 @@ name = "libiso"
 dynamic = ["version"]
 description = "Cross-platform USB image burning library"
 readme = "Readme.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 
 
 [tool.maturin]
-features = ["pyo3/extension-module", "pyo3/abi3-py313"]
+features = ["pyo3/extension-module", "pyo3/abi3-py312"]
 module-name = "libiso._libiso"
