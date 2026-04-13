@@ -1,57 +1,58 @@
+import os
 import tempfile
-import sys
+import unittest
 import libiso
 
 
-def progress_callback(written: int, total: int):
-    # Calculate percentage
-    percent = (written / total) * 100
-    
-    # Print a beautiful progress bar
-    bar_length = 40
-    filled = int(bar_length * (written / total))
-    bar = '=' * filled + '-' * (bar_length - filled)
-    
-    # \r overwrites the current line in the terminal!
-    sys.stdout.write(f"\rWriting: [{bar}] {percent:.1f}% ({written}/{total} bytes)")
-    sys.stdout.flush()
+class TestWriterIso(unittest.TestCase):
 
-# 1. Ask Rust to forge a 2MB mock ISO in RAM
-iso_bytes = libiso.create_mock_iso("TEST_ISO", ["BOOTX64.EFI"], True)
+    def setUp(self):
 
-# 2. Write it to a temporary "Source" file
-with tempfile.NamedTemporaryFile(delete=False) as source_file:
-    source_file.write(iso_bytes)
-    source_path = source_file.name
+        # Create a 64MB dummy file to act as our "USB Drive"
+        self.dest_fd = tempfile.NamedTemporaryFile(delete=False)
+        self.dest_fd.write(b'\x00' * (64 * 1024 * 1024))
+        self.dest_fd.close()
+        self.dest_path = self.dest_fd.name
 
-# 3. Create a temporary "Destination" file (pretend this is /dev/sdb)
-with tempfile.NamedTemporaryFile(delete=False) as dest_file:
-    dest_path = dest_file.name
+        # Create a real small ISO for extraction testing
+        self.iso_content = libiso.create_mock_iso("TEST_ISO", ["EFI/BOOT/BOOTX64.EFI", "KERNEL.BIN"], True)
+        self.source_fd = tempfile.NamedTemporaryFile(delete=False)
+        self.source_fd.write(self.iso_content)
+        self.source_fd.close()
+        self.source_path = self.source_fd.name
 
-print(f"Starting DD Mode Write...")
-print(f"Source: {source_path}")
-print(f"Dest:   {dest_path}\n")
 
-# 4. FIRE THE RUST WRITER!
-try:
-    libiso.write_image_dd(source_path, dest_path, progress_callback)
-    print("\n\nWrite Completed Successfully!")
-except Exception as e:
-    print(f"\n\nWrite Failed: {e}")
+    def tearDown(self):
 
-def mock_callback(written: int, total: int):
-    pass # We aren't extracting files yet!
+        if os.path.exists(self.dest_path):
+            os.remove(self.dest_path)
+        if os.path.exists(self.source_path):
+            os.remove(self.source_path)
 
-# Create a 64MB dummy file to act as our "USB Drive"
-with tempfile.NamedTemporaryFile(delete=False) as dest_file:
-    dest_file.write(b'\x00' * (64 * 1024 * 1024)) 
-    dest_path = dest_file.name
 
-print(f"Testing Phase 1: GPT Partitioning on {dest_path}")
+    def test_iso_extraction_full_cycle(self):
+        
+        def progress(written, total):
+            pass  # Silent for tests
 
-try:
-    # Notice we pass `has_large_file=False` for now
-    libiso.write_image_iso("Cargo.toml", dest_path, False, mock_callback)
-    print("Success! The mock drive now has a valid UEFI GPT partition table.")
-except Exception as e:
-    print(f"Failed: {e}")
+        # This should perform Partitioning -> Formatting -> Extraction
+        try:
+            libiso.write_image_iso(self.source_path, self.dest_path, False, progress)
+        except Exception as e:
+            self.fail(f"write_image_iso raised exception: {e}")
+
+        # Basic verification: Check if the file is no longer just zeros
+        with open(self.dest_path, "rb") as f:
+            first_chunk = f.read(512)
+            # MBR signature 0x55AA should be at the end
+            self.assertEqual(first_chunk[510:], b"\x55\xAA")
+            
+            # Check partition start (1MB = 1048576)
+            f.seek(1048576)
+            partition_start = f.read(3)
+            # FAT32 starts with jump instruction 0xEB or 0xE9
+            self.assertIn(partition_start[0], [0xEB, 0xE9])
+
+
+if __name__ == "__main__":
+    unittest.main()

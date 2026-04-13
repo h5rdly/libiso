@@ -8,25 +8,61 @@ use hadris_part::scheme_io::DiskPartitionSchemeWriteExt;
 
 use hadris_fat::sync::{FatFs, FatFsWriteExt};
 use hadris_fat::sync::dir::FatDir;
-// use hadris_fat::sync::Write as FatWrite;
 use hadris_fat::sync::format::{FatVolumeFormatter, FormatOptions, FatTypeSelection};
-// use hadris_fat::exfat::format::{ExFatFormatOptions, calculate_layout};
 
 use hadris_iso::sync::IsoImage;
 use hadris_iso::directory::DirectoryRef;
 
 use pyo3::prelude::*;
 
-
 // 4MB chunk size is the sweet spot for maximum USB flash drive throughput
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
+
+/// A wrapper to sandbox hadris-fat inside a specific partition.
+/// This prevents it from doing absolute seeks that overwrite the GPT!
+pub struct PartitionWrapper<T: Read + Write + Seek> {
+    pub inner: T,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl<T: Read + Write + Seek> Read for PartitionWrapper<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<T: Read + Write + Seek> Write for PartitionWrapper<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: Read + Write + Seek> Seek for PartitionWrapper<T> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let actual_pos = match pos {
+            SeekFrom::Start(n) => SeekFrom::Start(self.offset + n),
+            SeekFrom::Current(n) => SeekFrom::Current(n),
+            // Translate End seeks to the end of the partition, not the physical disk
+            SeekFrom::End(n) => {
+                let partition_end = self.offset + self.size;
+                SeekFrom::Start(partition_end.saturating_add_signed(n))
+            }
+        };
+        let res = self.inner.seek(actual_pos)?;
+        Ok(res.saturating_sub(self.offset))
+    }
+}
 
 #[pyfunction]
 pub fn write_image_dd(
     py: Python,
     image_path: String,
     device_path: String,
-    callback: Py<PyAny>, // <-- FIX 1: Replaced PyObject with Py<PyAny>
+    callback: Py<PyAny>, 
 ) -> PyResult<()> {
     
     let iso_path = Path::new(&image_path);
@@ -40,9 +76,6 @@ pub fn write_image_dd(
     let mut src_file = File::open(iso_path)?;
     let total_bytes = src_file.metadata()?.len();
 
-    // Open the destination device. 
-    // WARNING: On Windows (\\.\PhysicalDriveX) and Linux (/dev/sdX), 
-    // this will throw a PermissionError if Python is not run as Admin/root!
     let dest_file_res = OpenOptions::new().write(true).open(&device_path);
     let mut dest_file = match dest_file_res {
         Ok(f) => f,
@@ -54,10 +87,8 @@ pub fn write_image_dd(
         }
     };
 
-    // Create a kanal channel to stream progress updates
     let (tx, rx) = kanal::bounded::<(u64, u64)>(100);
 
-    // Spawn the background writer thread
     let handle = thread::spawn(move || -> std::io::Result<()> {
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut bytes_written = 0u64;
@@ -65,49 +96,33 @@ pub fn write_image_dd(
         loop {
             let bytes_read = src_file.read(&mut buffer)?;
             if bytes_read == 0 {
-                break; // EOF reached
+                break;
             }
 
             dest_file.write_all(&buffer[..bytes_read])?;
             bytes_written += bytes_read as u64;
 
-            // Send progress back to the main thread. 
-            // If the main thread crashed or cancelled, this gracefully aborts.
             if tx.send((bytes_written, total_bytes)).is_err() {
                 break; 
             }
         }
         
-        // Force the OS to flush all hardware cache buffers to the physical USB
-        // before we report 100% completion!
         dest_file.sync_all()?;
-        
         Ok(())
     });
 
-    // Main Python Thread: Listen to the channel and fire the callback
     loop {
-        // FIX 2: Replaced allow_threads with detach
-        // We detach the Python GIL so other Python threads can run while we wait 
-        // for the background Rust thread to send the next chunk update.
         let msg = py.detach(|| rx.recv());
 
         match msg {
             Ok((written, total)) => {
-                // We re-acquired the GIL. Fire the Python progress callback!
-                callback.call1(py, (written, total))?;
-                
-                // Allow Python to process KeyboardInterrupt (Ctrl+C)
+                let _ = callback.call1(py, (written, total));
                 py.check_signals()?;
             }
-            Err(_) => {
-                // The channel was closed, meaning the background thread finished.
-                break;
-            }
+            Err(_) => break,
         }
     }
 
-    // Check if the background thread succeeded or threw a low-level IO error
     match handle.join() {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(format!(
@@ -119,12 +134,11 @@ pub fn write_image_dd(
     }
 }
 
-
 fn copy_recursive<T: Read + Write + Seek>(
     fs_handle: &FatFs<T>,
     iso: &IsoImage<File>,
     iso_dir_ref: DirectoryRef,
-    usb_dir: &FatDir<T>,
+    usb_dir: &mut FatDir<T>,
     tx: &kanal::Sender<(u64, u64)>,
     bytes_written: &mut u64,
     total_bytes: u64,
@@ -138,9 +152,9 @@ fn copy_recursive<T: Read + Write + Seek>(
         let name = entry.display_name().into_owned();
         
         if entry.is_directory() {
-            let sub_usb_dir = fs_handle.create_dir(usb_dir, &name)?;
+            let mut sub_usb_dir = fs_handle.create_dir(usb_dir, &name)?;
             let sub_iso_ref = entry.as_dir_ref(iso)?;
-            copy_recursive(fs_handle, iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_bytes)?;
+            copy_recursive(fs_handle, iso, sub_iso_ref, &mut sub_usb_dir, tx, bytes_written, total_bytes)?;
         } else {
             let file_entry = fs_handle.create_file(usb_dir, &name)?;
             let mut writer = fs_handle.write_file(&file_entry)?;
@@ -149,8 +163,6 @@ fn copy_recursive<T: Read + Write + Seek>(
             for chunk in file_data.chunks(CHUNK_SIZE) {
                 let mut pos = 0;
                 while pos < chunk.len() {
-                    // Call .write() directly. This bypasses the trait resolution 
-                    // issue with .write_all() while achieving the same result.
                     let n = writer.write(&chunk[pos..])?;
                     if n == 0 {
                         return Err(Box::new(std::io::Error::new(
@@ -170,7 +182,6 @@ fn copy_recursive<T: Read + Write + Seek>(
     Ok(())
 }
 
-
 #[pyfunction]
 pub fn write_image_iso(
     py: Python,
@@ -186,7 +197,7 @@ pub fn write_image_iso(
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err("ISO not found"));
     }
 
-    // 2. Open the destination device with exclusive write access
+    // 2. Open the destination device
     let mut dest_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -203,80 +214,71 @@ pub fn write_image_iso(
     // ---------------------------------------------------------
     // PHASE 1: PARTITIONING (GPT)
     // ---------------------------------------------------------
-    // We assume standard 512-byte logical sectors for the USB drive.
     let total_sectors = dest_size / 512;
-    
-    // Create a new GPT disk layout in RAM
     let mut gpt = GptDisk::new(total_sectors, 512);
-    
-    // Standard 1MB alignment for flash memory (2048 sectors * 512 bytes)
     let start_lba = 2048; 
-    
-    // Leave the last 34 sectors for the secondary GPT backup header
     let end_lba = total_sectors - 34; 
 
-    // Create the primary data partition (Microsoft Basic Data GUID)
-    // This GUID tells Windows/Linux/macOS "Hey, this is a normal mountable flash drive!"
     let partition = GptPartitionEntry::new(
         Guid::BASIC_DATA, 
-        Guid::default(), // hadris-part will zero this out, which is fine for USBs
+        Guid::default(),
         start_lba, 
         end_lba
     );
 
-    // Add the partition to our layout
     gpt.add_partition(partition).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
         "Failed to create partition: {:?}", e
     )))?;
 
-    // Wrap it in a protective MBR (required by the UEFI spec so older BIOSes don't think the drive is blank)
     let protective_mbr = gpt.create_protective_mbr();
     let scheme = DiskPartitionScheme::Gpt { protective_mbr, gpt };
 
-    // BLAST THE PARTITION TABLE TO THE DRIVE!
     DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("Failed to write GPT to device: {:?}", e))
     })?;
 
-    // Force the OS to flush the new partition table to hardware
     dest_file.sync_all()?;
 
-   
     // ---------------------------------------------------------
-    // PHASE 2: FORMATTING (FAT32)
+    // PHASE 2 & 3 WRAPPER INITIALIZATION
     // ---------------------------------------------------------
     let partition_offset_bytes = start_lba * 512;
     let partition_size_bytes = (end_lba - start_lba + 1) * 512;
 
+    // Wrap the file so hadris-fat cannot escape the partition boundaries
+    let mut wrapped_partition = PartitionWrapper {
+        inner: dest_file,
+        offset: partition_offset_bytes,
+        size: partition_size_bytes,
+    };
+
+    // ---------------------------------------------------------
+    // PHASE 2: FORMATTING
+    // ---------------------------------------------------------
     if has_large_file {
-        // Placeholder for exFAT logic
         return Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "exFAT support for >4GB files is coming in a future update."
         ));
     } else {
-        // Seek to the start of our new partition
-        dest_file.seek(SeekFrom::Start(partition_offset_bytes))?;
+        wrapped_partition.seek(SeekFrom::Start(0))?;
 
         let options = FormatOptions::new(partition_size_bytes)
             .with_label("LIBISO_USB")
             .with_fat_type(FatTypeSelection::Fat32);
 
-        // FatVolumeFormatter::format is a sync function in hadris-fat::sync
-        FatVolumeFormatter::format(&mut dest_file, options).map_err(|e| {
+        FatVolumeFormatter::format(&mut wrapped_partition, options).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("FAT32 Format failed: {:?}", e))
         })?;
     }
 
+    wrapped_partition.flush()?;
     println!("Phase 2 Complete: Filesystem formatted!");
-
-   // ... [After Phase 2 Formatting] ...
 
     // ---------------------------------------------------------
     // PHASE 3: EXTRACTION
     // ---------------------------------------------------------
-    dest_file.seek(SeekFrom::Start(partition_offset_bytes))?;
-    
-    let usb_fs = FatFs::open(dest_file).map_err(|e| {
+    wrapped_partition.seek(SeekFrom::Start(0))?;
+    let usb_fs = FatFs::open(wrapped_partition).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to open USB FS: {:?}", e))
     })?;
 
@@ -292,20 +294,21 @@ pub fn write_image_iso(
     thread::spawn(move || {
         let mut written = 0u64;
         let root = iso_img.root_dir();
-        let mut usb_root = usb_fs.root_dir(); // Make this mut
+        let mut usb_root = usb_fs.root_dir(); 
         
         if let Err(e) = copy_recursive(&usb_fs, &iso_img, root.dir_ref(), &mut usb_root, &tx, &mut written, total_size) {
             eprintln!("Extraction error: {:?}", e);
         }
     });
 
-    // Progress Loop
     loop {
         let msg = py.detach(|| rx.recv());
         match msg {
             Ok((written, total)) => {
-                callback.call1(py, (written, total))?;
-                py.check_signals()?;
+                let _ = callback.call1(py, (written, total));
+                if py.check_signals().is_err() {
+                    break;
+                }
             }
             Err(_) => break,
         }
