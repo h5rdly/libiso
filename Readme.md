@@ -39,11 +39,11 @@ print(stats)
 # Size:              5669099520 bytes
 # ISOHybrid:         true
 # Large File (>4GB): false
-
+#
 # --- Boot Info ---
 # Bootable:          true (BIOS: true, UEFI: true)
 # Secure Boot:       false
-
+#
 # --- Windows Metadata ---
 # Is Windows:        False
 
