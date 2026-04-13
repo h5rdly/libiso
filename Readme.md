@@ -46,7 +46,5 @@ print(stats)
 #
 # --- Windows Metadata ---
 # Is Windows:        False
-
-
-
 ```
+- Writing the image - in progress for `v0.1.0`
