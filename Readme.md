@@ -7,7 +7,7 @@ libiso is Rust backed Python library for burning images on USB drives.
 
 ##  Size
 
-The `.so` size on linux is ~`0.6Mb`, no external dependencies.
+The `.so` size on linux is ~`0.8Mb`, no external dependencies.
 
 
 ##  Installation
