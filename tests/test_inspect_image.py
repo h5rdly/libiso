@@ -1,12 +1,15 @@
-import os
-import tempfile
+import os, tempfile
+
 import unittest
+
 import libiso
+
 
 class TestInspectImage(unittest.TestCase):
 
     def _generate_and_test(self, volume_name: str, files: list[str], is_isohybrid: bool):
-        '''Helper to forge an ISO in RAM, write to temp file, and parse it.'''
+        '''Helper to forge an ISO in RAM, write to temp file, and parse it'''
+
         iso_bytes = libiso.create_mock_iso(volume_name, files, is_isohybrid)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix='.iso') as tmp:

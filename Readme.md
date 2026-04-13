@@ -7,7 +7,7 @@ libiso is Rust backed Python library for burning images on USB drives.
 
 ##  Size
 
-The `.so` size on linux is ~`0.4Mb`, no external dependencies.
+The `.so` size on linux is ~`0.6Mb`, no external dependencies.
 
 
 ##  Installation
@@ -31,5 +31,22 @@ for drive in libiso.list_removable_drives():
 # Name:  USB Flash Disk - 239 GB (/dev/sda)
 # Path:  /dev/sda
 # Size:  256691404800 bytes
-```
 
+stats = libiso.inspect_image('/path/to/manjaro-kde-26.0.4-260327-linux618.iso'
+print(stats)
+
+# Volume Label:      MANJARO_KDE_2604
+# Size:              5669099520 bytes
+# ISOHybrid:         true
+# Large File (>4GB): false
+
+# --- Boot Info ---
+# Bootable:          true (BIOS: true, UEFI: true)
+# Secure Boot:       false
+
+# --- Windows Metadata ---
+# Is Windows:        False
+
+
+
+```

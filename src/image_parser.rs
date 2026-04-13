@@ -6,6 +6,7 @@ use hadris_iso::sync::IsoImage;
 use hadris_iso::directory::DirectoryRef;
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 
 #[pyclass(from_py_object)]
@@ -36,7 +37,7 @@ pub struct WindowsMetadata {
 
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug)]
-pub struct ImageReport {
+pub struct ImageStats {
     #[pyo3(get)]
     pub file_path: String,
     #[pyo3(get)]
@@ -53,6 +54,86 @@ pub struct ImageReport {
     
     #[pyo3(get)]
     pub windows_info: Option<WindowsMetadata>, 
+}
+
+
+#[pymethods]
+impl BootCapabilities {
+    pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("is_bootable", self.is_bootable)?;
+        dict.set_item("supports_bios", self.supports_bios)?;
+        dict.set_item("supports_uefi", self.supports_uefi)?;
+        dict.set_item("secure_boot_signed", self.secure_boot_signed)?;
+        Ok(dict)
+    }
+}
+
+#[pymethods]
+impl WindowsMetadata {
+    pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("is_windows", self.is_windows)?;
+        dict.set_item("is_windows_11", self.is_windows_11)?;
+        dict.set_item("install_image_type", &self.install_image_type)?;
+        dict.set_item("supports_wintogo", self.supports_wintogo)?;
+        Ok(dict)
+    }
+}
+
+#[pymethods]
+impl ImageStats {
+    pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("file_path", &self.file_path)?;
+        dict.set_item("size_bytes", self.size_bytes)?;
+        dict.set_item("volume_label", &self.volume_label)?;
+        dict.set_item("is_isohybrid", self.is_isohybrid)?;
+        dict.set_item("has_large_file", self.has_large_file)?;
+        
+        // Nest the dictionaries
+        dict.set_item("boot_info", self.boot_info.as_dict(py)?)?;
+        
+        if let Some(win_info) = &self.windows_info {
+            dict.set_item("windows_info", win_info.as_dict(py)?)?;
+        } else {
+            dict.set_item("windows_info", py.None())?;
+        }
+        
+        Ok(dict)
+    }
+
+    fn __str__(&self) -> String {
+        let mut s = format!(
+            "Volume Label:      {}\n\
+             Size:              {} bytes\n\
+             ISOHybrid:         {}\n\
+             Large File (>4GB): {}\n\n\
+             --- Boot Info ---\n\
+             Bootable:          {} (BIOS: {}, UEFI: {})\n\
+             Secure Boot:       {}\n",
+            self.volume_label, self.size_bytes, self.is_isohybrid, self.has_large_file,
+            self.boot_info.is_bootable, self.boot_info.supports_bios, self.boot_info.supports_uefi,
+            self.boot_info.secure_boot_signed
+        );
+
+        s.push_str("\n--- Windows Metadata ---\n");
+        if let Some(win) = &self.windows_info {
+            s.push_str(&format!(
+                "Is Windows:        Yes (Win 11: {})\n\
+                 Image Type:        {}\n\
+                 WinToGo Supported: {}\n",
+                win.is_windows_11, win.install_image_type.to_uppercase(), win.supports_wintogo
+            ));
+        } else {
+            s.push_str("Is Windows:        False\n");
+        }
+        s
+    }
+    
+    fn __repr__(&self) -> String {
+        format!("<ImageStats volume_label='{}' size_bytes={}>", self.volume_label, self.size_bytes)
+    }
 }
 
 
@@ -78,9 +159,9 @@ fn scan_directory(
             continue;
         }
 
-        // FIX: Extract the true name using Rock Ridge or Joliet decoding!
+        // Extract the true name using Rock Ridge or Joliet decoding
         let mut name = if entry.record.is_joliet_name() {
-            entry.record.joliet_name() // Decodes Windows UTF-16
+            entry.record.joliet_name() // Decode Windows UTF-16
         } else {
             entry.display_name().into_owned() // Decodes Linux Rock Ridge or standard ASCII
         };
@@ -144,7 +225,7 @@ fn scan_directory(
 
 
 #[pyfunction]
-pub fn inspect_image(path: String) -> PyResult<ImageReport> {
+pub fn inspect_image(path: String) -> PyResult<ImageStats> {
     let file_path = Path::new(&path);
     
     if !file_path.exists() {
@@ -214,7 +295,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageReport> {
         None
     };
 
-    Ok(ImageReport {
+    Ok(ImageStats {
         file_path: path,
         size_bytes,
         volume_label,
