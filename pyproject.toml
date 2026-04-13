@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "libiso"
 dynamic = ["version"]
 description = "Cross-platform USB image burning library"
-readme = "Readme"
+readme = "Readme.md"
 requires-python = ">=3.12"
 
 
