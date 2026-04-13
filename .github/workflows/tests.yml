@@ -1,0 +1,88 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Linux, Windows, MacOS
+  test-standard:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.12', '3.13', '3.14', '3.14t']
+
+    steps:
+      - uses: actions/checkout@v6
+      
+      - name: Set up Rust
+        run: rustup update stable && rustup default stable
+        
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: pip install maturin
+
+      - name: Build Rust library and install
+        shell: bash
+        run: |
+          maturin build --release
+          pip install target/wheels/*.whl
+
+      - name: Run tests
+        run: |
+          cd tests
+          python -m unittest discover .
+
+  # Alpine Linux (Musl) 
+  test-alpine:
+    name: Test (Alpine/Musl)
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.14-alpine
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Alpine build deps
+        run: apk add --no-cache gcc musl-dev cargo patchelf
+        
+      - name: Install dependencies
+        run: pip install maturin
+      
+      - name: Build Rust library and install
+        run: |
+          maturin build --release
+          pip install target/wheels/*.whl
+
+      - name: Run tests
+        run: |
+          cd tests
+          python -m unittest discover .
+
+  #FreeBSD 
+  test-freebsd:
+    name: Test (FreeBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y rust python313 git
+          run: |
+            python3.14 -m venv venv
+            . venv/bin/activate
+            pip install maturin
+            maturin build --release
+            pip install target/wheels/*.whl
+            cd tests
+            python -m unittest discover .

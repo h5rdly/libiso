@@ -1,0 +1,36 @@
+[package]
+name = "libiso"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_libiso"
+crate-type = ["cdylib"]
+
+
+[dependencies]
+sysinfo = "0.38.1"
+hadris-iso = "1.1.0"
+pelite = "0.10.0"
+
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+
+
+[target.'cfg(target_os = "linux")'.dependencies]
+drives = "0.6.1"
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort" 
+strip = true 
+
+[profile.release-local]   # maturin develop --profile release-local  
+inherits = "release"
+opt-level = 1 
+lto = "off"   
+codegen-units = 16 
+strip = false
+debug = true 

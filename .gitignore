@@ -1,0 +1,14 @@
+# Rust dependencies and build artifacts
+Cargo.lock
+
+# Files and folders created by the library or the GUI rool
+libiso.log
+
+target/
+
+# Python cache files
+__pycache__/
+**/__pycache__/
+
+# Distribution/build folders
+dist/

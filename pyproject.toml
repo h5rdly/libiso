@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.13"]
+build-backend = "maturin"
+
+[project]
+name = "libiso"
+dynamic = ["version"]
+description = "Cross-platform USB image burning library"
+readme = "Readme"
+requires-python = ">=3.12"
+
+
+[tool.maturin]
+features = ["pyo3/extension-module", "pyo3/abi3-py312"]
+module-name = "libiso._libiso"

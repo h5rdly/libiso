@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_wheels:
+    name: Build wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: Linux x86
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: manylinux_2_28
+
+          - name: Musl x86
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: musllinux_1_2
+
+          - name: Linux ARM64
+            os: ubuntu-latest
+            target: aarch64
+            manylinux: manylinux_2_28
+         
+          - name: MacOS Universal
+            os: macos-latest
+            target: universal2-apple-darwin
+
+          - name: Windows
+            os: windows-latest
+            target: x64
+
+    steps:
+      - uses: actions/checkout@v6
+      
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --find-interpreter
+          sccache: 'true'
+      
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+
+  build_wheels_freebsd:
+    name: Build FreeBSD wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y rust python3 git
+          run: |
+            python3 -m venv venv
+            . venv/bin/activate
+            pip install maturin
+            maturin build --release --out dist --find-interpreter
+            
+      - name: Upload FreeBSD wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-freebsd
+          path: dist
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI + GitHub Release
+    needs: [build_wheels, build_sdist, build_wheels_freebsd]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write      
+      id-token: write      
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      # Explicit downloads - PyPI allowed platforms
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-Linux x86
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-Musl x86
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-Linux ARM64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-MacOS Universal
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-Windows
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      # Download FreeBSD AFTER PyPI publish so it only attaches to GitHub Release
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-freebsd
+          path: dist
+
+      # GitHub Release
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+          generate_release_notes: true
