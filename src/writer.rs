@@ -134,6 +134,7 @@ pub fn write_image_dd(
     }
 }
 
+
 fn copy_recursive<T: Read + Write + Seek>(
     fs_handle: &FatFs<T>,
     iso: &IsoImage<File>,
@@ -144,6 +145,10 @@ fn copy_recursive<T: Read + Write + Seek>(
     total_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = iso.open_dir(iso_dir_ref);
+
+    // PRE-ALLOCATE ONE REUSABLE BUFFER FOR THE ENTIRE EXTRACTION!
+    // This entirely diffuses the 4GB RAM bomb.
+    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
 
     for entry_res in dir.entries() {
         let entry = entry_res?;
@@ -158,29 +163,50 @@ fn copy_recursive<T: Read + Write + Seek>(
         } else {
             let file_entry = fs_handle.create_file(usb_dir, &name)?;
             let mut writer = fs_handle.write_file(&file_entry)?;
-            let file_data = iso.read_file(&entry)?; 
             
-            for chunk in file_data.chunks(CHUNK_SIZE) {
-                let mut pos = 0;
-                while pos < chunk.len() {
-                    let n = writer.write(&chunk[pos..])?;
-                    if n == 0 {
-                        return Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "failed to write data to USB"
-                        )));
+            // STREAMING MECHANISM: 
+            // Iterate over the physical extents of the file on the ISO.
+            // This handles both normal files and multi-extent files automatically.
+            for extent in entry.extents() {
+                let mut extent_offset = 0u64;
+                let extent_len = extent.length as u64;
+
+                while extent_offset < extent_len {
+                    // How much to read in this step (cap at our 4MB buffer limit)
+                    let read_size = (extent_len - extent_offset).min(CHUNK_SIZE as u64) as usize;
+                    
+                    // ISO sectors are 2048 bytes
+                    let byte_offset = (extent.sector.0 as u64 * 2048) + extent_offset;
+
+                    // Read a chunk directly from the ISO into our reusable buffer
+                    iso.read_bytes_at(byte_offset, &mut chunk_buf[..read_size])?;
+
+                    // Write the chunk to the USB drive
+                    let mut pos = 0;
+                    while pos < read_size {
+                        let n = writer.write(&chunk_buf[pos..read_size])?;
+                        if n == 0 {
+                            return Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "failed to write data to USB"
+                            )));
+                        }
+                        pos += n;
+                        *bytes_written += n as u64;
+                        let _ = tx.send((*bytes_written, total_bytes));
                     }
-                    pos += n;
-                    *bytes_written += n as u64;
-                    let _ = tx.send((*bytes_written, total_bytes));
+
+                    extent_offset += read_size as u64;
                 }
             }
 
+            // CRITICAL: Update the FAT size on disk
             writer.finish()?;
         }
     }
     Ok(())
 }
+
 
 #[pyfunction]
 pub fn write_image_iso(
