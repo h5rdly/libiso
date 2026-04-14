@@ -5,6 +5,8 @@ use std::io::{Read, Seek, SeekFrom};
 use hadris_iso::sync::IsoImage;
 use hadris_iso::directory::DirectoryRef;
 
+use pelite::pe64::{Pe, PeFile};
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -20,6 +22,8 @@ pub struct BootCapabilities {
     pub supports_uefi: bool,
     #[pyo3(get)]
     pub secure_boot_signed: bool,
+    #[pyo3(get)]
+    pub signature_size: usize, // NEW: Expose signature size
 }
 
 #[pyclass(from_py_object)]
@@ -56,7 +60,6 @@ pub struct ImageStats {
     pub windows_info: Option<WindowsMetadata>, 
 }
 
-
 #[pymethods]
 impl BootCapabilities {
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -65,6 +68,7 @@ impl BootCapabilities {
         dict.set_item("supports_bios", self.supports_bios)?;
         dict.set_item("supports_uefi", self.supports_uefi)?;
         dict.set_item("secure_boot_signed", self.secure_boot_signed)?;
+        dict.set_item("signature_size", self.signature_size)?;
         Ok(dict)
     }
 }
@@ -91,7 +95,6 @@ impl ImageStats {
         dict.set_item("is_isohybrid", self.is_isohybrid)?;
         dict.set_item("has_large_file", self.has_large_file)?;
         
-        // Nest the dictionaries
         dict.set_item("boot_info", self.boot_info.as_dict(py)?)?;
         
         if let Some(win_info) = &self.windows_info {
@@ -104,6 +107,12 @@ impl ImageStats {
     }
 
     fn __str__(&self) -> String {
+        let sb_str = if self.boot_info.secure_boot_signed {
+            format!("True ({} bytes)", self.boot_info.signature_size)
+        } else {
+            "False".to_string()
+        };
+
         let mut s = format!(
             "Volume Label:      {}\n\
              Size:              {} bytes\n\
@@ -114,7 +123,7 @@ impl ImageStats {
              Secure Boot:       {}\n",
             self.volume_label, self.size_bytes, self.is_isohybrid, self.has_large_file,
             self.boot_info.is_bootable, self.boot_info.supports_bios, self.boot_info.supports_uefi,
-            self.boot_info.secure_boot_signed
+            sb_str
         );
 
         s.push_str("\n--- Windows Metadata ---\n");
@@ -136,7 +145,6 @@ impl ImageStats {
     }
 }
 
-
 // Recursive Helper to Traverse the ISO Directory Tree
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
@@ -145,6 +153,7 @@ fn scan_directory(
     has_large_file: &mut bool,
     supports_uefi: &mut bool,
     secure_boot_signed: &mut bool,
+    signature_size: &mut usize,
     is_windows: &mut bool,
     is_windows_11: &mut bool,
     install_image_type: &mut String,
@@ -179,6 +188,7 @@ fn scan_directory(
                     has_large_file, 
                     supports_uefi, 
                     secure_boot_signed,
+                    signature_size,
                     is_windows,
                     is_windows_11,
                     install_image_type
@@ -195,10 +205,13 @@ fn scan_directory(
                 *supports_uefi = true;
 
                 if let Ok(efi_bytes) = iso.read_file(&entry) {
-                    if let Ok(pe) = pelite::PeFile::from_bytes(&efi_bytes) {
+                    // Use pelite::pe64::PeFile because UEFI bootloaders are usually 64-bit PE files
+                    if let Ok(pe) = PeFile::from_bytes(&efi_bytes) {
                         if let Ok(security) = pe.security() {
-                            if !security.certificate_data().is_empty() {
+                            let cert_data = security.certificate_data();
+                            if !cert_data.is_empty() {
                                 *secure_boot_signed = true;
+                                *signature_size = cert_data.len();
                             }
                         }
                     }
@@ -255,6 +268,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
     let mut has_large_file = false;
     let mut supports_uefi = false;
     let mut secure_boot_signed = false;
+    let mut signature_size = 0usize;
     let mut is_windows = false;
     let mut is_windows_11 = false;
     let mut install_image_type = String::new();
@@ -270,6 +284,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
             &mut has_large_file, 
             &mut supports_uefi, 
             &mut secure_boot_signed,
+            &mut signature_size,
             &mut is_windows,
             &mut is_windows_11,
             &mut install_image_type
@@ -281,6 +296,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
         supports_bios: is_isohybrid,
         supports_uefi,
         secure_boot_signed, 
+        signature_size,
     };
 
     let windows_info = if is_windows {
@@ -288,7 +304,6 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
             is_windows: true,
             is_windows_11,
             install_image_type: install_image_type.clone(),
-            // Windows To Go generally requires WIM or ESD images (SWM files are split and harder to apply)
             supports_wintogo: install_image_type == "wim" || install_image_type == "esd",
         })
     } else {

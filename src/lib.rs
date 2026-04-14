@@ -1,11 +1,12 @@
 use pyo3::prelude::*;
 
-mod removable_drives;
+mod drives;
 mod image_parser;
 mod test_utils;
-mod writer; 
+mod writer;
+mod signature;
 
-use removable_drives::{list_removable_drives, DriveInfo};
+use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};
 use test_utils::{create_mock_iso};
 use writer::{write_image_dd, write_image_iso};

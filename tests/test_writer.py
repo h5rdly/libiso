@@ -5,6 +5,10 @@ import unittest
 import libiso
 
 
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+    
 class TestWriterIso(unittest.TestCase):
 
     def setUp(self):
