@@ -5,10 +5,10 @@ use std::io::{Read, Seek, SeekFrom};
 use hadris_iso::sync::IsoImage;
 use hadris_iso::directory::DirectoryRef;
 
-use pelite::pe64::{Pe, PeFile};
-
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
+use crate::signature::inspect_secure_boot;
 
 
 #[pyclass(from_py_object)]
@@ -23,7 +23,9 @@ pub struct BootCapabilities {
     #[pyo3(get)]
     pub secure_boot_signed: bool,
     #[pyo3(get)]
-    pub signature_size: usize, // NEW: Expose signature size
+    pub is_microsoft_signed: bool, 
+    #[pyo3(get)]
+    pub signature_size: usize, 
 }
 
 #[pyclass(from_py_object)]
@@ -68,6 +70,7 @@ impl BootCapabilities {
         dict.set_item("supports_bios", self.supports_bios)?;
         dict.set_item("supports_uefi", self.supports_uefi)?;
         dict.set_item("secure_boot_signed", self.secure_boot_signed)?;
+        dict.set_item("is_microsoft_signed", self.is_microsoft_signed)?;
         dict.set_item("signature_size", self.signature_size)?;
         Ok(dict)
     }
@@ -106,9 +109,11 @@ impl ImageStats {
         Ok(dict)
     }
 
+    
     fn __str__(&self) -> String {
         let sb_str = if self.boot_info.secure_boot_signed {
-            format!("True ({} bytes)", self.boot_info.signature_size)
+            let ms_trust = if self.boot_info.is_microsoft_signed { "Microsoft Trusted" } else { "Unknown CA" };
+            format!("True ({} - {} bytes)", ms_trust, self.boot_info.signature_size)
         } else {
             "False".to_string()
         };
@@ -145,15 +150,14 @@ impl ImageStats {
     }
 }
 
+
 // Recursive Helper to Traverse the ISO Directory Tree
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
     iso: &IsoImage<File>, 
     dir_ref: DirectoryRef,
     has_large_file: &mut bool,
-    supports_uefi: &mut bool,
-    secure_boot_signed: &mut bool,
-    signature_size: &mut usize,
+    supports_uefi: &mut bool, 
     is_windows: &mut bool,
     is_windows_11: &mut bool,
     install_image_type: &mut String,
@@ -182,42 +186,26 @@ fn scan_directory(
 
         if entry.is_directory() {
             if let Ok(sub_dir_ref) = entry.as_dir_ref(iso) {
+                // Recursive call with the updated signature
                 scan_directory(
                     iso, 
                     sub_dir_ref, 
                     has_large_file, 
-                    supports_uefi, 
-                    secure_boot_signed,
-                    signature_size,
+                    supports_uefi,
                     is_windows,
                     is_windows_11,
                     install_image_type
                 );
             }
         } else {
+            // Check for >4GB files
             if entry.total_size() >= 4_000_000_000 {
                 *has_large_file = true;
             }
 
             let file_name = name.to_uppercase();
-            
-            if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
-                *supports_uefi = true;
 
-                if let Ok(efi_bytes) = iso.read_file(&entry) {
-                    // Use pelite::pe64::PeFile because UEFI bootloaders are usually 64-bit PE files
-                    if let Ok(pe) = PeFile::from_bytes(&efi_bytes) {
-                        if let Ok(security) = pe.security() {
-                            let cert_data = security.certificate_data();
-                            if !cert_data.is_empty() {
-                                *secure_boot_signed = true;
-                                *signature_size = cert_data.len();
-                            }
-                        }
-                    }
-                }
-            }
-
+            // Check for Windows installation media types
             if file_name == "INSTALL.WIM" {
                 *is_windows = true;
                 *install_image_type = "wim".to_string();
@@ -229,8 +217,13 @@ fn scan_directory(
                 *install_image_type = "swm".to_string();
             }
 
+            // Check for Windows 11 specific indicator
             if file_name == "APPRAISERRES.DLL" {
                 *is_windows_11 = true;
+            }
+
+            if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
+                *supports_uefi = true;
             }
         }
     }
@@ -269,6 +262,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
     let mut supports_uefi = false;
     let mut secure_boot_signed = false;
     let mut signature_size = 0usize;
+    let mut is_microsoft_signed = false; // Need this declared out here!
     let mut is_windows = false;
     let mut is_windows_11 = false;
     let mut install_image_type = String::new();
@@ -276,26 +270,34 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
     file.seek(SeekFrom::Start(0))?;
 
     if let Ok(iso) = IsoImage::open(file) {
+        
+        // 1. Run the Antivirus inspection!
+        let sb_status = inspect_secure_boot(&iso);
+        supports_uefi = sb_status.has_efi_bootloader;
+        secure_boot_signed = sb_status.is_signed;
+        is_microsoft_signed = sb_status.is_microsoft_signed;
+        signature_size = sb_status.signature_size;
+
         let root = iso.root_dir();
         
+        // 2. Scan the rest of the directory
         scan_directory(
             &iso, 
             root.dir_ref(), 
             &mut has_large_file, 
-            &mut supports_uefi, 
-            &mut secure_boot_signed,
-            &mut signature_size,
+            &mut supports_uefi,
             &mut is_windows,
             &mut is_windows_11,
             &mut install_image_type
         );
-    }
+    } // <-- THIS WAS THE MISSING BRACE!
 
     let boot_info = BootCapabilities {
         is_bootable: is_isohybrid || supports_uefi,
         supports_bios: is_isohybrid,
         supports_uefi,
         secure_boot_signed, 
+        is_microsoft_signed, 
         signature_size,
     };
 
