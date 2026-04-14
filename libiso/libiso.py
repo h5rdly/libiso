@@ -76,6 +76,27 @@ def ensure_uefi_bridge(cache_dir='.'):
     return local_path
 
 
+def minify_revocation_dbx(dbx_json_path: str, output_path: str):
+
+    with open(dbx_json_path, 'r') as f:
+        data = json.load(f)
+
+    flat_hashes = set()
+    for arch, images in data.get('images', {}).items():
+        for image in images:
+            flat_hash = image.get('flatHash', '').strip().upper()
+            flat_hashes.add(flat_hash)
+    
+    if '' in flat_hashes: flat_hashes.remove('')
+    sorted_hashes = sorted(list(flat_hashes))
+
+    with open(output_path, 'w') as f:
+        for h in sorted_hashes:
+            f.write(f'{h}\n')
+
+    print(f'Extracted {len(sorted_hashes)} unique flat hashes to {output_file}')
+
+
 def _progress_bar(written: int, total: int):
     
     if total == 0:
@@ -92,6 +113,8 @@ def _progress_bar(written: int, total: int):
     if written >= total:
         sys.stdout.write('\n')
 
+
+## -- Python wrappers
 
 def burn_image(
     image_path: str, 
@@ -151,7 +174,3 @@ def burn_image(
         return
 
     raise ValueError(f"Unknown method: '{method}'. Use 'iso' or 'dd'")
-
-
-
-

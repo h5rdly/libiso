@@ -5,6 +5,7 @@ mod image_parser;
 mod test_utils;
 mod writer;
 mod signature;
+mod io;
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};

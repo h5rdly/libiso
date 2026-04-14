@@ -16,11 +16,12 @@ use hadris_iso::directory::DirectoryRef;
 
 use pyo3::prelude::*;
 
+use crate::io::sys::DriveLocker;
+
+
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
 
-// -----------------------------------------------------------------------------------
-// PROGRESS STREAM (PYTHON ITERATOR)
-// -----------------------------------------------------------------------------------
+
 #[pyclass]
 pub struct ProgressStream {
     rx: kanal::Receiver<Result<(u64, u64), String>>,
@@ -33,7 +34,7 @@ impl ProgressStream {
     }
 
     fn __next__(&self, py: Python) -> PyResult<Option<(u64, u64)>> {
-        // py.detach allows Python to handle Ctrl+C or other threads while waiting!
+        // py.detach allows Python to handle Ctrl+C or other threads while waiting
         match py.detach(|| self.rx.recv()) {
             Ok(Ok((written, total))) => Ok(Some((written, total))),
             Ok(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(e)), // Thread threw an error
@@ -42,9 +43,6 @@ impl ProgressStream {
     }
 }
 
-// -----------------------------------------------------------------------------------
-// PARTITION WRAPPER
-// -----------------------------------------------------------------------------------
 pub struct PartitionWrapper<T: Read + Write + Seek> {
     pub inner: T,
     pub offset: u64,
@@ -81,9 +79,7 @@ impl<T: Read + Write + Seek> Seek for PartitionWrapper<T> {
     }
 }
 
-// -----------------------------------------------------------------------------------
-// RAW DD WRITER
-// -----------------------------------------------------------------------------------
+
 #[pyfunction]
 pub fn write_image_dd(
     image_path: String,
@@ -94,6 +90,10 @@ pub fn write_image_dd(
     if !iso_path.exists() {
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!("Image file not found: {}", image_path)));
     }
+
+    let _locker = DriveLocker::new(&device_path).map_err(|e| {
+        pyo3::exceptions::PyPermissionError::new_err(e)
+    })?;
 
     let mut src_file = File::open(iso_path)?;
     let total_bytes = src_file.metadata()?.len();
@@ -135,9 +135,8 @@ pub fn write_image_dd(
     Ok(ProgressStream { rx })
 }
 
-// -----------------------------------------------------------------------------------
-// FAT32 EXTRACTION LOGIC
-// -----------------------------------------------------------------------------------
+
+// FAT32 extraction
 fn copy_recursive<T: Read + Write + Seek>(
     fs_handle: &FatFs<T>,
     iso: &IsoImage<File>,
@@ -191,9 +190,7 @@ fn copy_recursive<T: Read + Write + Seek>(
 }
 
 
-// -----------------------------------------------------------------------------------
-// EXFAT EXTRACTION LOGIC
-// -----------------------------------------------------------------------------------
+// EXFAT extraction 
 fn copy_recursive_exfat<T: Read + Write + Seek>(
     fs_handle: &ExFatFs<T>,
     iso: &IsoImage<File>,
@@ -246,6 +243,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
     Ok(())
 }
 
+
 #[pyfunction]
 #[pyo3(signature = (image_path, device_path, has_large_file, uefi_ntfs_path=None))]
 pub fn write_image_iso(
@@ -259,6 +257,10 @@ pub fn write_image_iso(
     if !iso_path.exists() {
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err("ISO not found"));
     }
+
+    let _locker = DriveLocker::new(&device_path).map_err(|e| {
+        pyo3::exceptions::PyPermissionError::new_err(e)
+    })?;
 
     let mut dest_file = OpenOptions::new()
         .read(true)

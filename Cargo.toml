@@ -19,6 +19,7 @@ hadris-part = "1.1.0"
 kanal = "0.1.1"
 pelite = "0.10.0"
 x509-parser = "0.18.1"
+sha2 = "0.11"
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 

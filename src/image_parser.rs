@@ -25,6 +25,8 @@ pub struct BootCapabilities {
     #[pyo3(get)]
     pub is_microsoft_signed: bool, 
     #[pyo3(get)]
+    pub is_revoked: bool,
+    #[pyo3(get)]
     pub signature_size: usize, 
 }
 
@@ -71,6 +73,7 @@ impl BootCapabilities {
         dict.set_item("supports_uefi", self.supports_uefi)?;
         dict.set_item("secure_boot_signed", self.secure_boot_signed)?;
         dict.set_item("is_microsoft_signed", self.is_microsoft_signed)?;
+        dict.set_item("is_revoked", self.is_revoked)?;
         dict.set_item("signature_size", self.signature_size)?;
         Ok(dict)
     }
@@ -109,11 +112,11 @@ impl ImageStats {
         Ok(dict)
     }
 
-    
     fn __str__(&self) -> String {
         let sb_str = if self.boot_info.secure_boot_signed {
             let ms_trust = if self.boot_info.is_microsoft_signed { "Microsoft Trusted" } else { "Unknown CA" };
-            format!("True ({} - {} bytes)", ms_trust, self.boot_info.signature_size)
+            let revoked = if self.boot_info.is_revoked { " [VULNERABLE/REVOKED!]" } else { "" };
+            format!("True ({} - {} bytes){}", ms_trust, self.boot_info.signature_size, revoked)
         } else {
             "False".to_string()
         };
@@ -150,8 +153,7 @@ impl ImageStats {
     }
 }
 
-
-// Recursive Helper to Traverse the ISO Directory Tree
+// Traverse the ISO Directory Tree
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
     iso: &IsoImage<File>, 
@@ -167,45 +169,43 @@ fn scan_directory(
     for entry_res in dir.entries() {
         let Ok(entry) = entry_res else { continue };
         
-        // Skip current (.) and parent (..) directory markers
         if entry.record.name() == b"\x00" || entry.record.name() == b"\x01" {
             continue;
         }
 
-        // Extract the true name using Rock Ridge or Joliet decoding
         let mut name = if entry.record.is_joliet_name() {
-            entry.record.joliet_name() // Decode Windows UTF-16
+            entry.record.joliet_name()
         } else {
-            entry.display_name().into_owned() // Decodes Linux Rock Ridge or standard ASCII
+            entry.display_name().into_owned()
         };
 
-        // Remove the ISO9660 version suffix (e.g. ";1")
         if let Some(pos) = name.rfind(';') {
             name.truncate(pos);
         }
 
         if entry.is_directory() {
             if let Ok(sub_dir_ref) = entry.as_dir_ref(iso) {
-                // Recursive call with the updated signature
                 scan_directory(
                     iso, 
                     sub_dir_ref, 
                     has_large_file, 
-                    supports_uefi,
+                    supports_uefi, // Recursive pass
                     is_windows,
                     is_windows_11,
                     install_image_type
                 );
             }
         } else {
-            // Check for >4GB files
             if entry.total_size() >= 4_000_000_000 {
                 *has_large_file = true;
             }
 
             let file_name = name.to_uppercase();
 
-            // Check for Windows installation media types
+            if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
+                *supports_uefi = true;
+            }
+
             if file_name == "INSTALL.WIM" {
                 *is_windows = true;
                 *install_image_type = "wim".to_string();
@@ -217,13 +217,8 @@ fn scan_directory(
                 *install_image_type = "swm".to_string();
             }
 
-            // Check for Windows 11 specific indicator
             if file_name == "APPRAISERRES.DLL" {
                 *is_windows_11 = true;
-            }
-
-            if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
-                *supports_uefi = true;
             }
         }
     }
@@ -262,7 +257,8 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
     let mut supports_uefi = false;
     let mut secure_boot_signed = false;
     let mut signature_size = 0usize;
-    let mut is_microsoft_signed = false; // Need this declared out here!
+    let mut is_microsoft_signed = false; 
+    let mut is_revoked = false;
     let mut is_windows = false;
     let mut is_windows_11 = false;
     let mut install_image_type = String::new();
@@ -271,16 +267,15 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
 
     if let Ok(iso) = IsoImage::open(file) {
         
-        // 1. Run the Antivirus inspection!
         let sb_status = inspect_secure_boot(&iso);
         supports_uefi = sb_status.has_efi_bootloader;
         secure_boot_signed = sb_status.is_signed;
         is_microsoft_signed = sb_status.is_microsoft_signed;
+        is_revoked = sb_status.is_revoked;
         signature_size = sb_status.signature_size;
 
         let root = iso.root_dir();
         
-        // 2. Scan the rest of the directory
         scan_directory(
             &iso, 
             root.dir_ref(), 
@@ -290,7 +285,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
             &mut is_windows_11,
             &mut install_image_type
         );
-    } // <-- THIS WAS THE MISSING BRACE!
+    }
 
     let boot_info = BootCapabilities {
         is_bootable: is_isohybrid || supports_uefi,
@@ -298,6 +293,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
         supports_uefi,
         secure_boot_signed, 
         is_microsoft_signed, 
+        is_revoked,
         signature_size,
     };
 
