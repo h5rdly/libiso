@@ -36,8 +36,9 @@ pub mod sys {
     const FSCTL_UNLOCK_VOLUME: DWORD = 0x0009001C;
     const FSCTL_DISMOUNT_VOLUME: DWORD = 0x00090020;
 
+    
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn CreateFileW(
             lpFileName: LPCWSTR,
             dwDesiredAccess: DWORD,
