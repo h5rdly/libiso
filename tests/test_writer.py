@@ -1,4 +1,4 @@
-import os, tempfile
+import os, time, tempfile
 
 import unittest
 
@@ -22,37 +22,47 @@ class TestWriterIso(unittest.TestCase):
         self.source_fd.close()
         self.source_path = self.source_fd.name
 
+        # Create a 50MB dummy file for DD streaming test
+        self.large_source_fd = tempfile.NamedTemporaryFile(delete=False)
+        self.large_source_fd.write(os.urandom(50 * 1024 * 1024))
+        self.large_source_fd.close()
+        self.large_source_path = self.large_source_fd.name
+
 
     def tearDown(self):
-
-        if os.path.exists(self.dest_path):
-            os.remove(self.dest_path)
-        if os.path.exists(self.source_path):
-            os.remove(self.source_path)
+        for path in [self.dest_path, self.source_path, self.large_source_path]:
+            if os.path.exists(path):
+                os.remove(path)
 
 
     def test_iso_extraction_full_cycle(self):
 
-        def progress(written, total):
-            pass  
-
+        print("\n--- Testing ISO Extraction (exFAT) ---")
+        
         # dummy 1MB UEFI bridge image for the test
         uefi_fd = tempfile.NamedTemporaryFile(delete=False)
         uefi_fd.write(b'\x00' * (1024 * 1024)) # 1MB of zeros
         uefi_fd.close()
         uefi_path = uefi_fd.name
 
-        # Trigger the exFAT route by passing True and the uefi_path
-        try:
-            libiso.write_image_iso(
-                self.source_path, 
-                self.dest_path, 
-                True,  # Force exFAT
-                progress,
-                uefi_ntfs_path=uefi_path
-            )
-        except Exception as e:
-            self.fail(f"write_image_iso raised exception: {e}")
+        stream = libiso.write_image_iso(
+            self.source_path, 
+            self.dest_path, 
+            True,  # Force exFAT
+            uefi_ntfs_path=uefi_path
+        )
+
+        for written, total in stream:
+            # slow down the loop so the human eye can see it.
+            # This triggers backpressure on the Rust thread
+            time.sleep(0.05) 
+            
+            percent = (written / total) * 100 if total > 0 else 0
+            bar = '█' * int(40 * written / total)
+            bar = bar.ljust(40, '-')
+            print(f"\r\033[KISO Extraction: |{bar}| {percent:.1f}%", end="")
+        
+        print("\nExtraction Complete!")
 
         if os.path.exists(uefi_path):
             os.remove(uefi_path)
@@ -61,6 +71,27 @@ class TestWriterIso(unittest.TestCase):
             first_chunk = f.read(512)
             # MBR signature 0x55AA should be at the end of sector 0
             self.assertEqual(first_chunk[510:], b"\x55\xAA")
+
+
+    def test_dd_write_large_file(self):
+
+        print("\n--- Testing DD Raw Write (50MB) ---")
+        
+        stream = libiso.write_image_dd(
+            self.large_source_path,
+            self.dest_path
+        )
+
+        for written, total in stream:
+            # Sleep just enough to watch the 4MB chunks fly by
+            time.sleep(0.1)
+            
+            percent = (written / total) * 100 if total > 0 else 0
+            bar = '█' * int(40 * written / total)
+            bar = bar.ljust(40, '-')
+            print(f"\r\033[KDD Mode Write:  |{bar}| {percent:.1f}% ({written}/{total} bytes)", end="")
+        
+        print("\nDD Write Complete!")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ use hadris_part::scheme_io::DiskPartitionSchemeWriteExt;
 use hadris_fat::sync::{FatFs, FatFsWriteExt};
 use hadris_fat::sync::dir::FatDir;
 use hadris_fat::sync::format::{FatVolumeFormatter, FormatOptions, FatTypeSelection};
+use hadris_fat::exfat::{ExFatFs, ExFatDir};
 
 use hadris_iso::sync::IsoImage;
 use hadris_iso::directory::DirectoryRef;
@@ -17,6 +18,33 @@ use pyo3::prelude::*;
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
 
+// -----------------------------------------------------------------------------------
+// PROGRESS STREAM (PYTHON ITERATOR)
+// -----------------------------------------------------------------------------------
+#[pyclass]
+pub struct ProgressStream {
+    rx: kanal::Receiver<Result<(u64, u64), String>>,
+}
+
+#[pymethods]
+impl ProgressStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python) -> PyResult<Option<(u64, u64)>> {
+        // py.detach allows Python to handle Ctrl+C or other threads while waiting!
+        match py.detach(|| self.rx.recv()) {
+            Ok(Ok((written, total))) => Ok(Some((written, total))),
+            Ok(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(e)), // Thread threw an error
+            Err(_) => Ok(None), // Channel closed (StopIteration in Python)
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------
+// PARTITION WRAPPER
+// -----------------------------------------------------------------------------------
 pub struct PartitionWrapper<T: Read + Write + Seek> {
     pub inner: T,
     pub offset: u64,
@@ -53,13 +81,14 @@ impl<T: Read + Write + Seek> Seek for PartitionWrapper<T> {
     }
 }
 
+// -----------------------------------------------------------------------------------
+// RAW DD WRITER
+// -----------------------------------------------------------------------------------
 #[pyfunction]
 pub fn write_image_dd(
-    py: Python,
     image_path: String,
     device_path: String,
-    callback: Py<PyAny>, 
-) -> PyResult<()> {
+) -> PyResult<ProgressStream> {
     
     let iso_path = Path::new(&image_path);
     if !iso_path.exists() {
@@ -75,39 +104,35 @@ pub fn write_image_dd(
         Err(e) => return Err(pyo3::exceptions::PyPermissionError::new_err(format!("Failed to open device '{}'. Error: {}", device_path, e))),
     };
 
-    let (tx, rx) = kanal::bounded::<(u64, u64)>(100);
+    let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
 
-    let handle = thread::spawn(move || -> std::io::Result<()> {
+    thread::spawn(move || {
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut bytes_written = 0u64;
 
         loop {
-            let bytes_read = src_file.read(&mut buffer)?;
+            let bytes_read = match src_file.read(&mut buffer) {
+                Ok(n) => n,
+                Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
+            };
+            
             if bytes_read == 0 { break; }
-            dest_file.write_all(&buffer[..bytes_read])?;
+            
+            if let Err(e) = dest_file.write_all(&buffer[..bytes_read]) {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+            
             bytes_written += bytes_read as u64;
-            if tx.send((bytes_written, total_bytes)).is_err() { break; }
+            if tx.send(Ok((bytes_written, total_bytes))).is_err() { break; }
         }
-        dest_file.sync_all()?;
-        Ok(())
+        
+        if let Err(e) = dest_file.sync_all() {
+            let _ = tx.send(Err(e.to_string()));
+        }
     });
 
-    loop {
-        let msg = py.detach(|| rx.recv());
-        match msg {
-            Ok((written, total)) => {
-                let _ = callback.call1(py, (written, total));
-                py.check_signals()?;
-            }
-            Err(_) => break,
-        }
-    }
-
-    match handle.join() {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(format!("I/O Error: {}", e))),
-        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Thread panicked")),
-    }
+    Ok(ProgressStream { rx })
 }
 
 // -----------------------------------------------------------------------------------
@@ -118,7 +143,7 @@ fn copy_recursive<T: Read + Write + Seek>(
     iso: &IsoImage<File>,
     iso_dir_ref: DirectoryRef,
     usb_dir: &mut FatDir<T>,
-    tx: &kanal::Sender<(u64, u64)>,
+    tx: &kanal::Sender<Result<(u64, u64), String>>,
     bytes_written: &mut u64,
     total_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,7 +179,7 @@ fn copy_recursive<T: Read + Write + Seek>(
                         if n == 0 { return Err(Box::new(std::io::Error::new(std::io::ErrorKind::WriteZero, "USB write failure"))); }
                         pos += n;
                         *bytes_written += n as u64;
-                        let _ = tx.send((*bytes_written, total_bytes));
+                        let _ = tx.send(Ok((*bytes_written, total_bytes)));
                     }
                     extent_offset += read_size as u64;
                 }
@@ -165,17 +190,16 @@ fn copy_recursive<T: Read + Write + Seek>(
     Ok(())
 }
 
+
 // -----------------------------------------------------------------------------------
 // EXFAT EXTRACTION LOGIC
 // -----------------------------------------------------------------------------------
-use hadris_fat::exfat::{ExFatFs, ExFatDir};
-
 fn copy_recursive_exfat<T: Read + Write + Seek>(
     fs_handle: &ExFatFs<T>,
     iso: &IsoImage<File>,
     iso_dir_ref: DirectoryRef,
     usb_dir: &ExFatDir<'_, T>,
-    tx: &kanal::Sender<(u64, u64)>,
+    tx: &kanal::Sender<Result<(u64, u64), String>>,
     bytes_written: &mut u64,
     total_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -211,7 +235,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
                         if n == 0 { return Err(Box::new(std::io::Error::new(std::io::ErrorKind::WriteZero, "USB write failure"))); }
                         pos += n;
                         *bytes_written += n as u64;
-                        let _ = tx.send((*bytes_written, total_bytes));
+                        let _ = tx.send(Ok((*bytes_written, total_bytes)));
                     }
                     extent_offset += read_size as u64;
                 }
@@ -223,15 +247,13 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, callback, uefi_ntfs_path=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, uefi_ntfs_path=None))]
 pub fn write_image_iso(
-    py: Python,
     image_path: String,
     device_path: String,
     has_large_file: bool,
-    callback: Py<PyAny>,
     uefi_ntfs_path: Option<String>,
-) -> PyResult<()> {
+) -> PyResult<ProgressStream> {
     
     let iso_path = Path::new(&image_path);
     if !iso_path.exists() {
@@ -254,9 +276,7 @@ pub fn write_image_iso(
     let start_lba = 2048; 
     let end_lba = total_sectors - 34; 
 
-    // ---------------------------------------------------------
-    // PHASE 1: DUAL PARTITIONING
-    // ---------------------------------------------------------
+    // Dual partitioning
     let partition_offset_bytes: u64;
     let partition_size_bytes: u64;
     let mut dest_file_for_uefi = dest_file.try_clone()?; // Clone handle to write UEFI bridge later
@@ -268,7 +288,6 @@ pub fn write_image_iso(
 
         // Partition 1: The Main Data Partition (exFAT)
         let part1 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::default(), start_lba, part1_end_lba);
-        
         // Partition 2: The Bridge Partition (FAT12 - UEFI:NTFS)
         let part2 = GptPartitionEntry::new(Guid::EFI_SYSTEM, Guid::default(), part2_start_lba, end_lba);
 
@@ -306,12 +325,10 @@ pub fn write_image_iso(
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to open ISO: {:?}", e))
     })?;
 
-    let (tx, rx) = kanal::bounded::<(u64, u64)>(100);
+    let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
     let total_size = Path::new(&iso_path_clone).metadata()?.len();
 
-    // ---------------------------------------------------------
-    // PHASE 2 & 3: ROUTING (exFAT + Bridge vs FAT32)
-    // ---------------------------------------------------------
+    // Routing - exFAT + Bridge vs FAT32
     if has_large_file {
         let uefi_path = uefi_ntfs_path.ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("uefi_ntfs_path must be provided for large files (exFAT mode)")
@@ -324,8 +341,6 @@ pub fn write_image_iso(
         let exfat_fs = format_exfat(wrapped_partition, partition_size_bytes, &options).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("exFAT Format failed: {:?}", e))
         })?;
-        
-        println!("Phase 2 Complete: exFAT Filesystem formatted on Partition 1!");
 
         // Inject the UEFI:NTFS/exFAT bridge into Partition 2
         let mut uefi_file = File::open(&uefi_path)?;
@@ -335,15 +350,13 @@ pub fn write_image_iso(
         std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
         dest_file_for_uefi.sync_all()?;
 
-        println!("Phase 2.5 Complete: UEFI:NTFS bridge written to Partition 2!");
-
         thread::spawn(move || {
             let mut written = 0u64;
             let root = iso_img.root_dir();
             let usb_root = exfat_fs.root_dir(); 
             
             if let Err(e) = copy_recursive_exfat(&exfat_fs, &iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size) {
-                eprintln!("Extraction error: {:?}", e);
+                let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
             }
         });
     } else {
@@ -357,12 +370,10 @@ pub fn write_image_iso(
             pyo3::exceptions::PyRuntimeError::new_err(format!("FAT32 Format failed: {:?}", e))
         })?;
 
-        // MANUAL PATCH: Force the Boot Signature
+        // Force the Boot Signature
         wrapped_partition.seek(SeekFrom::Start(510))?;
         wrapped_partition.write_all(&[0x55, 0xAA])?;
         wrapped_partition.flush()?;
-
-        println!("Phase 2 Complete: FAT32 Filesystem formatted!");
 
         wrapped_partition.seek(SeekFrom::Start(0))?;
         let usb_fs = FatFs::open(wrapped_partition).map_err(|e| {
@@ -375,23 +386,10 @@ pub fn write_image_iso(
             let mut usb_root = usb_fs.root_dir(); 
             
             if let Err(e) = copy_recursive(&usb_fs, &iso_img, root.dir_ref(), &mut usb_root, &tx, &mut written, total_size) {
-                eprintln!("Extraction error: {:?}", e);
+                let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
             }
         });
     }
 
-    loop {
-        let msg = py.detach(|| rx.recv());
-        match msg {
-            Ok((written, total)) => {
-                let _ = callback.call1(py, (written, total));
-                if py.check_signals().is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    Ok(())
+    Ok(ProgressStream { rx })
 }
