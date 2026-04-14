@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 
 #[pyclass(from_py_object)]
@@ -17,11 +18,31 @@ pub struct DriveInfo {
 
 #[pymethods]
 impl DriveInfo {
+
     #[new]
     pub fn new(display_name: String, device_path: String, total_space_bytes: u64) -> Self {
         DriveInfo {
             display_name, device_path, total_space_bytes,
         }
+    }
+
+    pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("display_name", &self.display_name)?;
+        dict.set_item("device_path", &self.device_path)?;
+        dict.set_item("total_space_bytes", self.total_space_bytes)?;
+        Ok(dict)
+    }
+
+    fn __str__(&self) -> String {
+        format!(
+            "Name:  {}\nPath:  {}\nSize:  {} bytes",
+            self.display_name, self.device_path, self.total_space_bytes
+        )
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<DriveInfo: {} ({})>", self.display_name, self.device_path)
     }
 }
 

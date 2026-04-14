@@ -24,15 +24,14 @@ The `.so` size on linux is ~`0.8Mb`, no external dependencies.
 import libiso
 
 for drive in libiso.list_removable_drives():
-   print(f"Name:  {drive.display_name}")
-   print(f"Path:  {drive.device_path}")
-   print(f"Size:  {drive.total_space_bytes} bytes\n")
+   # Summary - drive.device_path, drive.display_name, drive.total_space_bytes
+   print(drive)   
 
 # Name:  USB Flash Disk - 239 GB (/dev/sda)
 # Path:  /dev/sda
 # Size:  256691404800 bytes
 
-stats = libiso.inspect_image('/path/to/manjaro-kde-26.0.4-260327-linux618.iso'
+stats = libiso.inspect_image('/path/to/manjaro-kde-26.0.4-260327-linux618.iso')
 print(stats)
 
 # Volume Label:      MANJARO_KDE_2604

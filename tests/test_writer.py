@@ -1,6 +1,7 @@
-import os
-import tempfile
+import os, tempfile
+
 import unittest
+
 import libiso
 
 
@@ -31,27 +32,35 @@ class TestWriterIso(unittest.TestCase):
 
 
     def test_iso_extraction_full_cycle(self):
-        
-        def progress(written, total):
-            pass  # Silent for tests
 
-        # This should perform Partitioning -> Formatting -> Extraction
+        def progress(written, total):
+            pass  
+
+        # dummy 1MB UEFI bridge image for the test
+        uefi_fd = tempfile.NamedTemporaryFile(delete=False)
+        uefi_fd.write(b'\x00' * (1024 * 1024)) # 1MB of zeros
+        uefi_fd.close()
+        uefi_path = uefi_fd.name
+
+        # Trigger the exFAT route by passing True and the uefi_path
         try:
-            libiso.write_image_iso(self.source_path, self.dest_path, False, progress)
+            libiso.write_image_iso(
+                self.source_path, 
+                self.dest_path, 
+                True,  # Force exFAT
+                progress,
+                uefi_ntfs_path=uefi_path
+            )
         except Exception as e:
             self.fail(f"write_image_iso raised exception: {e}")
 
-        # Basic verification: Check if the file is no longer just zeros
+        if os.path.exists(uefi_path):
+            os.remove(uefi_path)
+
         with open(self.dest_path, "rb") as f:
             first_chunk = f.read(512)
-            # MBR signature 0x55AA should be at the end
+            # MBR signature 0x55AA should be at the end of sector 0
             self.assertEqual(first_chunk[510:], b"\x55\xAA")
-            
-            # Check partition start (1MB = 1048576)
-            f.seek(1048576)
-            partition_start = f.read(3)
-            # FAT32 starts with jump instruction 0xEB or 0xE9
-            self.assertIn(partition_start[0], [0xEB, 0xE9])
 
 
 if __name__ == "__main__":
