@@ -1,4 +1,4 @@
-import os, time, tempfile
+import os, sys, time, tempfile
 
 import unittest
 
