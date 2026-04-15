@@ -22,7 +22,8 @@ der = { version = "0.7", features = ["alloc", "derive"] }
 sha1 = "0.11"
 sha2 = "0.11"
 
-ext4-lwext4 = "0.1.2"
+arcbox-ext4 = "0.1"
+tempfile = "3.10"
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 

@@ -7,7 +7,6 @@ mod writer;
 mod signature;
 mod io;
 mod dbx;
-mod ext4;
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};

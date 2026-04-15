@@ -17,8 +17,8 @@ use hadris_iso::directory::DirectoryRef;
 use pyo3::prelude::*;
 
 use crate::io::sys::DriveLocker;
-use crate::ext4::PartitionBlockDevice;
-
+use tempfile::NamedTempFile;
+use arcbox_ext4::Formatter as Ext4Formatter;
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
 
@@ -390,22 +390,38 @@ pub fn write_image_iso(
     if let Some((start, sectors)) = persistence_part {
         let ext4_offset = start * 512;
         let ext4_size = sectors * 512;
-        let dest_file_for_ext4 = dest_file.try_clone()?;
         
-        // Pass to your custom wrapper
-        let ext4_device = PartitionBlockDevice::new(dest_file_for_ext4, ext4_offset, ext4_size);
-        
-        use ext4_lwext4::{mkfs, MkfsOptions};
-        let opts = MkfsOptions::ext4().with_label("writable"); // Ubuntu looks for the "writable" label!
-        
-        mkfs(ext4_device, &opts).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to format ext4 persistence: {:?}", e))
+        let temp_ext4 = NamedTempFile::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create temp file: {:?}", e))
         })?;
+
+        let fmt = Ext4Formatter::new(temp_ext4.path(), 4096, ext4_size).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to init ext4 formatter: {:?}", e))
+        })?;
+        
+        // Finalize the filesystem
+        fmt.close().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to finalize ext4 formatting: {:?}", e))
+        })?;
+
+        // Patch the volume label to "writable" (Ubuntu persistence standard)
+        // Superblock is at offset 1024. volume_name is at offset 0x78 (120). 1024 + 120 = 1144.
+        let mut temp_file = OpenOptions::new().read(true).write(true).open(temp_ext4.path())?;
+        temp_file.seek(SeekFrom::Start(1144))?;
+        let mut label = [0u8; 16];
+        label[..8].copy_from_slice(b"writable"); // Padded with zeros natively
+        temp_file.write_all(&label)?;
+
+        // Copy the completed ext4 image into our USB partition
+        temp_file.seek(SeekFrom::Start(0))?;
+        dest_file.seek(SeekFrom::Start(ext4_offset))?;
+        std::io::copy(&mut temp_file, &mut dest_file)?;
+        dest_file.sync_all()?;
     }
 
     // FAT32 / EXFAT main extraction
     let mut dest_file_for_uefi = dest_file.try_clone()?;
-    
+
     let mut wrapped_partition = PartitionWrapper {
         inner: dest_file,
         offset: partition_offset_bytes,
