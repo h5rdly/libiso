@@ -1,4 +1,4 @@
-import os, sys, importlib.util
+import os, sys, importlib.util, tempfile
 from typing import Callable
 
 
@@ -133,11 +133,10 @@ def write_image_iso(
     image_path: str,
     device_path: str,
     has_large_file: bool,
-    partition_scheme: str = 'GPT',
+    partition_scheme: str = 'gpt',
     uefi_ntfs_path: str = None,
     persistence_size_mb: int = None
 ):
-
     ext4_temp_path = None
     
     if persistence_size_mb:
@@ -159,8 +158,13 @@ def write_image_iso(
             os.remove(ext4_temp_path)
 
 
-def burn_image(image_path: str, device_path: str, method: str = 'ISO'):
-
+def burn_image(
+    image_path: str, 
+    device_path: str, 
+    method: str = 'ISO',
+    partition_scheme: str = None,     
+    persistence_size_mb: int = None   
+):
     if not os.path.exists(image_path):
         raise FileNotFoundError(f'Image not found: {image_path}')
 
@@ -175,15 +179,26 @@ def burn_image(image_path: str, device_path: str, method: str = 'ISO'):
         print(f'Inspecting ISO: {image_path}')
         stats = _libiso.inspect_image(image_path)
         has_large_file = stats.has_large_file
-        uefi_path = ensure_uefi_bridge() if has_large_file else None
+        
+        if partition_scheme is None:
+            # If we detect UEFI, use GPT. Otherwise, fallback to MBR.
+            # Using getattr is a safe way to check properties without crashing!
+            partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
 
+        uefi_path = ensure_uefi_bridge() if has_large_file else None
+        
         print(f'Starting ISO filesystem extraction ({partition_scheme.upper()}) to {device_path}...')       
-        stream = _libiso.write_image_iso(
-            image_path, device_path, has_large_file, partition_scheme, uefi_path, persistence_size_mb
+        stream = write_image_iso(
+            image_path, 
+            device_path, 
+            has_large_file, 
+            partition_scheme, 
+            uefi_path, 
+            persistence_size_mb
         )
 
     for written, total in stream:
         _progress_bar(written, total)
             
-    print('\n{method} burning complete!')
+    print(f'\n{method} burning complete!') 
     return

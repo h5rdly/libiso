@@ -18,7 +18,7 @@ pub mod sys {
     use std::os::windows::ffi::OsStrExt;
     use std::os::raw::c_void;
 
-    // --- Minimal Win32 FFI Definitions ---
+    // Minimal Win32 FFI Definitions
     type HANDLE = *mut c_void;
     type DWORD = u32;
     type BOOL = i32;
@@ -83,7 +83,7 @@ pub mod sys {
                 .chain(std::iter::once(0))
                 .collect();
 
-            // 2. Get a handle to the volume/device
+            // Get a handle to the volume/device
             let handle = unsafe {
                 CreateFileW(
                     wide_path.as_ptr(),
@@ -102,7 +102,6 @@ pub mod sys {
 
             let mut bytes_returned = 0;
 
-            // 3. Lock the Volume (Blocks other processes)
             let lock_success = unsafe {
                 DeviceIoControl(
                     handle,
@@ -121,7 +120,6 @@ pub mod sys {
                 return Err(format!("Failed to acquire FSCTL_LOCK_VOLUME on {}. Ensure no other programs are using the drive.", volume_path));
             }
 
-            // 4. Dismount the Volume (Flushes OS cache & unmounts)
             let dismount_success = unsafe {
                 DeviceIoControl(
                     handle,
@@ -143,7 +141,6 @@ pub mod sys {
         }
     }
 
-    // 5. Auto-Unlock on scope drop
     impl Drop for DriveLocker {
         fn drop(&mut self) {
             // Only attempt to unlock and close if we actually locked a raw device!

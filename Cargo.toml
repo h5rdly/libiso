@@ -22,7 +22,7 @@ der = { version = "0.7", features = ["alloc", "derive"] }
 sha1 = "0.11"
 sha2 = "0.11"
 
-arcbox-ext4 = "0.1.1"
+arcbox-ext4 = "0.1.1"   # https://github.com/arcboxlabs/ext4-rs
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 
