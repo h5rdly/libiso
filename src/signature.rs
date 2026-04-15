@@ -1,21 +1,21 @@
 use std::io::{Read, Seek};
+
 use hadris_iso::sync::IsoImage;
 use pelite::pe64::{Pe, PeFile};
-use x509_parser::prelude::*;
+use sha1::Sha1;
 use sha2::{Sha256, Digest};
 
+use cms::content_info::ContentInfo;
+use cms::signed_data::SignedData;
+use der::{Decode, Encode};
 
-const TRUSTED_MS_CA_THUMBPRINTS: &[&str] = &[
-    "AEFC5FBBBE055D8F8DAA585473499417AB5A5272", 
-    "81AA6B3244C935BCE0D6628AF39827421E32497D",
-    "A92902398E16C49778CD90F99E4F9AE17C55AF50",
-    "13ADBF4309BD82709C8CD54F316ED522988A1BD4E", 
-];
+use crate::dbx::{TRUSTED_MS_CA_THUMBPRINTS, DBX_HASHES};
 
-// const DBX_REVOCATION_JSON: &str = include_str!("../libiso/dbx_info_msft_latest.json");
 
-pub fn read_file_from_iso<T: Read + Seek>(iso: &IsoImage<T>, path: &str,) -> Option<Vec<u8>> {
-    
+pub fn read_file_from_iso<T: Read + Seek>(
+    iso: &IsoImage<T>,
+    path: &str,
+) -> Option<Vec<u8>> {
     let mut current_dir = iso.root_dir().dir_ref();
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -59,6 +59,7 @@ pub fn read_file_from_iso<T: Read + Seek>(iso: &IsoImage<T>, path: &str,) -> Opt
     None
 }
 
+
 pub struct SecureBootStatus {
     pub has_efi_bootloader: bool,
     pub is_signed: bool,
@@ -77,20 +78,24 @@ pub fn inspect_secure_boot<T: Read + Seek>(iso: &IsoImage<T>) -> SecureBootStatu
         signature_size: 0,
     };
 
-    let efi_bytes = match read_file_from_iso(iso, "EFI/BOOT/BOOTX64.EFI") {
+    let efi_bytes = match read_file_from_iso(iso, "EFI/BOOT/BOOTX64.EFI")
+        .or_else(|| read_file_from_iso(iso, "BOOTX64.EFI")) 
+    {
         Some(bytes) => bytes,
         None => return status,
     };
 
     status.has_efi_bootloader = true;
 
-    // Check flat hash against the JSON revocation list
+    // Hash the bootloader
     let mut image_hasher = Sha256::new();
     image_hasher.update(&efi_bytes);
     let flat_hash: String = image_hasher.finalize().iter().map(|b| format!("{:02X}", b)).collect();
-    // if DBX_REVOCATION_JSON.to_uppercase().contains(&flat_hash) {
-    //     status.is_revoked = true;
-    // }
+    
+    // Binary Search against the sorted array
+    if DBX_HASHES.binary_search(&flat_hash.as_str()).is_ok() {
+        status.is_revoked = true;
+    }
 
     let pe = match PeFile::from_bytes(&efi_bytes) {
         Ok(pe) => pe,
@@ -104,25 +109,40 @@ pub fn inspect_secure_boot<T: Read + Seek>(iso: &IsoImage<T>) -> SecureBootStatu
             status.is_signed = true;
             status.signature_size = cert_data.len();
 
-            let mut offset = 0;
-            while offset < cert_data.len() {
-                if cert_data[offset] == 0x30 {
-                    if let Ok((_, cert)) = X509Certificate::from_der(&cert_data[offset..]) {
-                        
-                        let mut cert_hasher = Sha256::new();
-                        cert_hasher.update(cert.as_raw());
-                        let thumbprint: String = cert_hasher.finalize().iter().map(|b| format!("{:02X}", b)).collect();
-                        
-                        if TRUSTED_MS_CA_THUMBPRINTS.contains(&thumbprint.as_str()) {
-                            status.is_microsoft_signed = true;
-                            break; 
+            // Decode the PKCS#7 CMS ContentInfo envelope directly
+            if let Ok(content_info) = ContentInfo::from_der(cert_data) {
+                
+                // Extract the underlying SignedData structure safely
+                if let Ok(signed_data) = content_info.content.decode_as::<SignedData>() {
+                    
+                    // Navigate directly to the certificates set (no brute-force scanning!)
+                    if let Some(certs) = signed_data.certificates {
+                        for cert_choice in certs.0.iter() {
+                            
+                            // Ensure the choice is actually an X.509 Certificate
+                            if let cms::cert::CertificateChoices::Certificate(cert) = cert_choice {
+                                
+                                // Hash the fully validated, raw certificate bytes
+                                if let Ok(raw_cert) = cert.to_der() {
+                                    let mut cert_hasher = Sha1::new();
+                                    cert_hasher.update(&raw_cert);
+                                    let thumbprint: String = cert_hasher.finalize()
+                                        .iter()
+                                        .map(|b| format!("{:02X}", b))
+                                        .collect();
+                                    
+                                    if TRUSTED_MS_CA_THUMBPRINTS.contains(&thumbprint.as_str()) {
+                                        status.is_microsoft_signed = true;
+                                        break; 
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                offset += 1;
             }
         }
     }
-
+    
     status
 }

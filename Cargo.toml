@@ -12,13 +12,14 @@ crate-type = ["cdylib"]
 sysinfo = "0.38.1"
 
 hadris-iso = "1.1.0"
-# hadris-fat = {version = "1.1.0", features = ["exfat"]} # exfat has a compilation bug on the version branch
-hadris-fat = { git = "https://github.com/hxyulin/hadris.git", branch = "main", features = ["exfat"] }
+hadris-fat = {version = "1.1.2", features = ["exfat"]} 
 hadris-part = "1.1.0"
 
 kanal = "0.1.1"
 pelite = "0.10.0"
-x509-parser = "0.18.1"
+cms = "0.2.3"
+der = { version = "0.7", features = ["alloc", "derive"] } 
+sha1 = "0.11"
 sha2 = "0.11"
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
