@@ -32,11 +32,15 @@ pub fn create_mock_iso(volume_name: String, files: Vec<String>, is_isohybrid: bo
 
     let options = FormatOptions {
         volume_name,
-        system_id: None, volume_set_id: None, publisher_id: None,
-        preparer_id: None, application_id: None,
+        system_id: None,
+        volume_set_id: None,
+        publisher_id: None,
+        preparer_id: None,
+        application_id: None,
         sector_size: 2048,
-        path_separator: PathSeparator::ForwardSlash,
         features,
+        path_separator: PathSeparator::ForwardSlash,
+        strict_charset: false, 
     };
 
     let mut buffer = Cursor::new(vec![0u8; 2 * 1024 * 1024]);
