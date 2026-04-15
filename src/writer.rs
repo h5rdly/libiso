@@ -17,6 +17,7 @@ use hadris_iso::directory::DirectoryRef;
 use pyo3::prelude::*;
 
 use crate::io::sys::DriveLocker;
+use crate::ext4::PartitionBlockDevice;
 
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
@@ -244,15 +245,54 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
 }
 
 
+// Hand-roll a 512-byte Master Boot Record (MBR) supporting up to 3 partitions
+fn create_legacy_mbr(
+    p1: (u32, u32, u8, bool), // (start, size, type, is_active)
+    p2: Option<(u32, u32, u8)>,
+    p3: Option<(u32, u32, u8)>,
+) -> [u8; 512] {
+    let mut mbr = [0u8; 512];
+
+    let mut write_part = |offset: usize, start: u32, size: u32, ptype: u8, active: bool| {
+        mbr[offset] = if active { 0x80 } else { 0x00 };
+        mbr[offset + 1..offset + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        mbr[offset + 4] = ptype;
+        mbr[offset + 5..offset + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        mbr[offset + 8..offset + 12].copy_from_slice(&start.to_le_bytes());
+        mbr[offset + 12..offset + 16].copy_from_slice(&size.to_le_bytes());
+    };
+
+    write_part(446, p1.0, p1.1, p1.2, p1.3);
+    
+    let mut next_offset = 462;
+    if let Some((start, size, ptype)) = p2 {
+        write_part(next_offset, start, size, ptype, false);
+        next_offset += 16;
+    }
+    if let Some((start, size, ptype)) = p3 {
+        write_part(next_offset, start, size, ptype, false);
+    }
+
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    mbr
+}
+
+
+
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, uefi_ntfs_path=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
     has_large_file: bool,
+    partition_scheme: Option<String>, 
     uefi_ntfs_path: Option<String>,
+    persistence_size_mb: Option<u64>, 
 ) -> PyResult<ProgressStream> {
     
+    let scheme = partition_scheme.unwrap_or_else(|| "gpt".to_string());
+
     let iso_path = Path::new(&image_path);
     if !iso_path.exists() {
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err("ISO not found"));
@@ -274,47 +314,98 @@ pub fn write_image_iso(
     }
 
     let total_sectors = dest_size / 512;
-    let mut gpt = GptDisk::new(total_sectors, 512);
+    if total_sectors > 0xFFFF_FFFF && scheme.eq_ignore_ascii_case("mbr") {
+        return Err(pyo3::exceptions::PyValueError::new_err("MBR partition scheme does not support drives larger than 2TB."));
+    }
+
+    // Dynamic layout
     let start_lba = 2048; 
     let end_lba = total_sectors - 34; 
 
-    // Dual partitioning
-    let partition_offset_bytes: u64;
-    let partition_size_bytes: u64;
-    let mut dest_file_for_uefi = dest_file.try_clone()?; // Clone handle to write UEFI bridge later
+    let persistence_sectors = persistence_size_mb.unwrap_or(0) * 2048; // 1 MB = 2048 blocks of 512 bytes
+    let efi_sectors = if has_large_file { 2048 } else { 0 };
 
-    if has_large_file {
-        let efi_sectors = 2048; // 1 MB bridge partition
-        let part1_end_lba = end_lba - efi_sectors;
-        let part2_start_lba = part1_end_lba + 1;
+    // Part 1 shrinks to make room for Part 2 (EFI) and Part 3 (Ext4)
+    let part1_sectors = (end_lba - start_lba + 1).saturating_sub(efi_sectors + persistence_sectors);
+    let part1_end_lba = start_lba + part1_sectors - 1;
+    let partition_offset_bytes = start_lba * 512;
+    let partition_size_bytes = part1_sectors * 512;
 
-        // Partition 1: The Main Data Partition (exFAT)
-        let part1 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::default(), start_lba, part1_end_lba);
-        // Partition 2: The Bridge Partition (FAT12 - UEFI:NTFS)
-        let part2 = GptPartitionEntry::new(Guid::EFI_SYSTEM, Guid::default(), part2_start_lba, end_lba);
+    let mut next_lba = part1_end_lba + 1;
 
-        gpt.add_partition(part1).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 1 err: {:?}", e)))?;
-        gpt.add_partition(part2).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 2 err: {:?}", e)))?;
+    let efi_part = if has_large_file {
+        let part = (next_lba, efi_sectors);
+        next_lba += efi_sectors;
+        Some(part)
+    } else { None };
 
-        partition_offset_bytes = start_lba * 512;
-        partition_size_bytes = (part1_end_lba - start_lba + 1) * 512;
+    let persistence_part = if persistence_sectors > 0 {
+        Some((next_lba, persistence_sectors))
+    } else { None };
+
+    // GPT / MBR table routing
+    if scheme.eq_ignore_ascii_case("mbr") {
+        dest_file.seek(SeekFrom::Start(512))?;
+        dest_file.write_all(&[0u8; 512])?;
+        dest_file.seek(SeekFrom::Start((total_sectors - 1) * 512))?;
+        dest_file.write_all(&[0u8; 512])?;
+
+        let part1_type = if has_large_file { 0x07 } else { 0x0C }; // 0x07 = exFAT, 0x0C = FAT32 LBA
+        let p1 = (start_lba as u32, part1_sectors as u32, part1_type, true);
+        
+        let p2 = efi_part.map(|(start, size)| (start as u32, size as u32, 0xEF)); // 0xEF = EFI System Partition
+        let p3 = persistence_part.map(|(start, size)| (start as u32, size as u32, 0x83)); // 0x83 = Linux Native (ext4)
+        
+        let mbr_bytes = create_legacy_mbr(p1, p2, p3);
+        dest_file.seek(SeekFrom::Start(0))?;
+        dest_file.write_all(&mbr_bytes)?;
+        dest_file.sync_all()?;
     } else {
-        // Single Partition layout
-        let partition = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::default(), start_lba, end_lba);
-        gpt.add_partition(partition).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part err: {:?}", e)))?;
+        let mut gpt = GptDisk::new(total_sectors, 512);
+        
+        let part1 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::default(), start_lba, part1_end_lba);
+        gpt.add_partition(part1).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 1 err: {:?}", e)))?;
+        
+        if let Some((start, size)) = efi_part {
+            let part2 = GptPartitionEntry::new(Guid::EFI_SYSTEM, Guid::default(), start, start + size - 1);
+            gpt.add_partition(part2).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 2 err: {:?}", e)))?;
+        }
+        
+        if let Some((start, size)) = persistence_part {
+            // Using Basic Data GUID for ext4 on USB
+            let part3 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::default(), start, start + size - 1);
+            gpt.add_partition(part3).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 3 err: {:?}", e)))?;
+        }
 
-        partition_offset_bytes = start_lba * 512;
-        partition_size_bytes = (end_lba - start_lba + 1) * 512;
+        let protective_mbr = gpt.create_protective_mbr();
+        let scheme = DiskPartitionScheme::Gpt { protective_mbr, gpt };
+
+        DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to write GPT: {:?}", e))
+        })?;
+        dest_file.sync_all()?;
     }
 
-    let protective_mbr = gpt.create_protective_mbr();
-    let scheme = DiskPartitionScheme::Gpt { protective_mbr, gpt };
+    // EXT4 persistence partition
+    if let Some((start, sectors)) = persistence_part {
+        let ext4_offset = start * 512;
+        let ext4_size = sectors * 512;
+        let dest_file_for_ext4 = dest_file.try_clone()?;
+        
+        // Pass to your custom wrapper
+        let ext4_device = PartitionBlockDevice::new(dest_file_for_ext4, ext4_offset, ext4_size);
+        
+        use ext4_lwext4::{mkfs, MkfsOptions};
+        let opts = MkfsOptions::ext4().with_label("writable"); // Ubuntu looks for the "writable" label!
+        
+        mkfs(ext4_device, &opts).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to format ext4 persistence: {:?}", e))
+        })?;
+    }
 
-    DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("Failed to write GPT: {:?}", e))
-    })?;
-    dest_file.sync_all()?;
-
+    // FAT32 / EXFAT main extraction
+    let mut dest_file_for_uefi = dest_file.try_clone()?;
+    
     let mut wrapped_partition = PartitionWrapper {
         inner: dest_file,
         offset: partition_offset_bytes,
@@ -330,7 +421,6 @@ pub fn write_image_iso(
     let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
     let total_size = Path::new(&iso_path_clone).metadata()?.len();
 
-    // Routing - exFAT + Bridge vs FAT32
     if has_large_file {
         let uefi_path = uefi_ntfs_path.ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("uefi_ntfs_path must be provided for large files (exFAT mode)")
@@ -346,11 +436,12 @@ pub fn write_image_iso(
 
         // Inject the UEFI:NTFS/exFAT bridge into Partition 2
         let mut uefi_file = File::open(&uefi_path)?;
-        let efi_sectors = 2048; 
-        let part2_start_lba = end_lba - efi_sectors + 1;
-        dest_file_for_uefi.seek(SeekFrom::Start(part2_start_lba * 512))?;
-        std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
-        dest_file_for_uefi.sync_all()?;
+        
+        if let Some((start, _)) = efi_part {
+            dest_file_for_uefi.seek(SeekFrom::Start(start * 512))?;
+            std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
+            dest_file_for_uefi.sync_all()?;
+        }
 
         thread::spawn(move || {
             let mut written = 0u64;
@@ -372,7 +463,6 @@ pub fn write_image_iso(
             pyo3::exceptions::PyRuntimeError::new_err(format!("FAT32 Format failed: {:?}", e))
         })?;
 
-        // Force the Boot Signature
         wrapped_partition.seek(SeekFrom::Start(510))?;
         wrapped_partition.write_all(&[0x55, 0xAA])?;
         wrapped_partition.flush()?;

@@ -52,7 +52,8 @@ class TestWriterIso(unittest.TestCase):
         stream = libiso.write_image_iso(
             self.source_path, 
             self.dest_path, 
-            True,  # Force exFAT
+            True,  # has_large_file - Force exFAT
+            'GPT',
             uefi_ntfs_path=uefi_path
         )
 
