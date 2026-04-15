@@ -17,7 +17,6 @@ use hadris_iso::directory::DirectoryRef;
 use pyo3::prelude::*;
 
 use crate::io::sys::DriveLocker;
-use tempfile::NamedTempFile;
 use arcbox_ext4::Formatter as Ext4Formatter;
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
@@ -281,7 +280,7 @@ fn create_legacy_mbr(
 
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
@@ -289,6 +288,7 @@ pub fn write_image_iso(
     partition_scheme: Option<String>, 
     uefi_ntfs_path: Option<String>,
     persistence_size_mb: Option<u64>, 
+    ext4_temp_path: Option<String>,
 ) -> PyResult<ProgressStream> {
     
     let scheme = partition_scheme.unwrap_or_else(|| "gpt".to_string());
@@ -391,11 +391,11 @@ pub fn write_image_iso(
         let ext4_offset = start * 512;
         let ext4_size = sectors * 512;
         
-        let temp_ext4 = NamedTempFile::new().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create temp file: {:?}", e))
+        let temp_path_str = ext4_temp_path.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ext4_temp_path must be provided if persistence_size_mb is set")
         })?;
-
-        let fmt = Ext4Formatter::new(temp_ext4.path(), 4096, ext4_size).map_err(|e| {
+        let temp_ext4 = Path::new(&temp_path_str);
+        let fmt = Ext4Formatter::new(temp_ext4, 4096, ext4_size).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to init ext4 formatter: {:?}", e))
         })?;
         
@@ -406,7 +406,7 @@ pub fn write_image_iso(
 
         // Patch the volume label to "writable" (Ubuntu persistence standard)
         // Superblock is at offset 1024. volume_name is at offset 0x78 (120). 1024 + 120 = 1144.
-        let mut temp_file = OpenOptions::new().read(true).write(true).open(temp_ext4.path())?;
+        let mut temp_file = OpenOptions::new().read(true).write(true).open(temp_ext4)?;
         temp_file.seek(SeekFrom::Start(1144))?;
         let mut label = [0u8; 16];
         label[..8].copy_from_slice(b"writable"); // Padded with zeros natively

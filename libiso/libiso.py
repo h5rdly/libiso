@@ -53,8 +53,8 @@ def _load_rust_pip_or_dev(_rust_lib_name: str = '_libiso', module_dev_path: str 
 
     raise ImportError(f'Could not find Rust binary. Tried local dir and {dev_path}')
 
-_rust_lib = _load_rust_pip_or_dev()
-globals().update({k: v for k, v in vars(_rust_lib).items() if not k.startswith('__')})
+_libiso = _load_rust_pip_or_dev()
+globals().update({k: v for k, v in vars(_libiso).items() if not k.startswith('__')})
 
 
 
@@ -129,7 +129,37 @@ def _progress_bar(written: int, total: int):
 
 ## -- Python wrappers
 
-def burn_image(image_path: str, device_path: str, method: str = 'iso'):
+def write_image_iso(
+    image_path: str,
+    device_path: str,
+    has_large_file: bool,
+    partition_scheme: str = 'GPT',
+    uefi_ntfs_path: str = None,
+    persistence_size_mb: int = None
+):
+
+    ext4_temp_path = None
+    
+    if persistence_size_mb:
+        fd, ext4_temp_path = tempfile.mkstemp(suffix=".ext4")
+        os.close(fd)
+
+    try:
+        return _libiso.write_image_iso(
+            image_path,
+            device_path,
+            has_large_file,
+            partition_scheme,
+            uefi_ntfs_path,
+            persistence_size_mb,
+            ext4_temp_path
+        )
+    finally:
+        if ext4_temp_path and os.path.exists(ext4_temp_path):
+            os.remove(ext4_temp_path)
+
+
+def burn_image(image_path: str, device_path: str, method: str = 'ISO'):
 
     if not os.path.exists(image_path):
         raise FileNotFoundError(f'Image not found: {image_path}')
@@ -139,22 +169,19 @@ def burn_image(image_path: str, device_path: str, method: str = 'iso'):
 
     if method == 'DD':
         print(f'Starting raw DD write from {image_path} to {device_path}...')
-        stream = libiso.write_image_dd(image_path, device_path)
+        stream = _libiso.write_image_dd(image_path, device_path)
         
     if method == 'ISO':
         print(f'Inspecting ISO: {image_path}')
-        stats = libiso.inspect_image(image_path)
-        
+        stats = _libiso.inspect_image(image_path)
         has_large_file = stats.has_large_file
-        
-        uefi_path = None
-        if has_large_file:
-            print('Large file (>4GB) detected! Ensuring UEFI:NTFS bridge is present...')
-            uefi_path = ensure_uefi_bridge() 
+        uefi_path = ensure_uefi_bridge() if has_large_file else None
 
-        print(f'Starting ISO filesystem extraction to {device_path}...')
-        stream = libiso.write_image_iso(image_path, device_path, has_large_file, uefi_path)
-        
+        print(f'Starting ISO filesystem extraction ({partition_scheme.upper()}) to {device_path}...')       
+        stream = _libiso.write_image_iso(
+            image_path, device_path, has_large_file, partition_scheme, uefi_path, persistence_size_mb
+        )
+
     for written, total in stream:
         _progress_bar(written, total)
             
