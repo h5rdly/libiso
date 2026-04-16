@@ -2,12 +2,15 @@ import os, sys, importlib.util, tempfile
 from typing import Callable
 
 # TUI imports
-import threading, queue, time, select
+import threading, queue, time
+
 if sys.platform == 'win32':
-    import ctypes
-    from ctypes import wintypes
+    import msvcrt
+    # import ctypes
+    # from ctypes import wintypes
 else:
-    import termios, tty
+    import termios, tty #, select
+
 
 
 
@@ -230,8 +233,7 @@ def burn_image(
     return
 
 
-## --  TUI
-
+## --  TUI & Cross-Platform Input
 
 # --- ANSI Escape Sequences ---
 CLEAR_SCREEN = '\033[2J'
@@ -244,108 +246,222 @@ COLOR_RESET = '\033[0m'
 COLOR_TITLE = '\033[1;36m'   # Bold Cyan
 COLOR_SUCCESS = '\033[1;32m' # Bold Green
 COLOR_WARNING = '\033[1;33m' # Bold Yellow
+COLOR_DANGER = '\033[1;31m'  # Bold Red
 COLOR_BAR = '\033[38;5;39m'  # Rich-style blueish bar
+COLOR_SELECT = '\033[7m'     # Inverted colors for selection
 
 
 def move_cursor(row: int, col: int) -> str:
     return f'\033[{row};{col}H'
 
 
-def draw_static_ui():
-    ''' Draw the retained parts of the UI once '''
+def read_key_nonblocking() -> str:
+    ''' Cross-platform non-blocking keystroke reader '''
+
+    if os.name == 'nt':
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+            if key in (b'\x00', b'\xe0'): # Special keys (arrows)
+                key = msvcrt.getch()
+                if key == b'H': return 'UP'
+                if key == b'P': return 'DOWN'
+            elif key == b'\r': return 'ENTER'
+            elif key in (b'q', b'Q', b'\x1b'): return 'QUIT'
+            return key.decode('utf-8', 'ignore')
+        return None
+    else:
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if rlist:
+            key = sys.stdin.read(1)
+            if key == '\x1b': # Escape sequence
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if rlist:
+                    sys.stdin.read(1) # Skip '['
+                    arr = sys.stdin.read(1)
+                    if arr == 'A': return 'UP'
+                    if arr == 'B': return 'DOWN'
+                return 'QUIT' # Raw ESC
+            elif key in ('\r', '\n'): return 'ENTER'
+            elif key in ('q', 'Q'): return 'QUIT'
+            return key
+        return None
+
+
+def draw_static_ui(drives: list, selected_idx: int, stats, mode: str, verify: bool):
+    ''' Draws the interactive menu and ISO metadata '''
 
     sys.stdout.write(CLEAR_SCREEN + CURSOR_HOME)
     
-    # Draw header and fake dropdowns
-    sys.stdout.write(move_cursor(2, 4) + f'{COLOR_TITLE}╔══════════════════════════════════════════════════╗{COLOR_RESET}')
-    sys.stdout.write(move_cursor(3, 4) + f'{COLOR_TITLE}║{COLOR_RESET}               libiso USB Flasher                 {COLOR_TITLE}║{COLOR_RESET}')
-    sys.stdout.write(move_cursor(4, 4) + f'{COLOR_TITLE}╚══════════════════════════════════════════════════╝{COLOR_RESET}')
+    # Header
+    sys.stdout.write(move_cursor(2, 4) + f'{COLOR_TITLE}╔══════════════════════════════════════════════════════════╗{COLOR_RESET}')
+    sys.stdout.write(move_cursor(3, 4) + f'{COLOR_TITLE}║{COLOR_RESET}                    libiso USB Flasher                    {COLOR_TITLE}║{COLOR_RESET}')
+    sys.stdout.write(move_cursor(4, 4) + f'{COLOR_TITLE}╚══════════════════════════════════════════════════════════╝{COLOR_RESET}')
     
-    sys.stdout.write(move_cursor(6, 6) + 'Target Device : [ /dev/sdb - 32GB Flash Drive ]')
-    sys.stdout.write(move_cursor(7, 6) + 'Source ISO    : [ ubuntu-24.04-desktop.iso  ]')
+    # ISO Inspection Stats
+    iso_name = os.path.basename(stats.file_path)
+    size_mb = stats.size_bytes / (1024 * 1024)
+    boot_str = f'{COLOR_SUCCESS}Yes{COLOR_RESET}' if stats.boot_info.is_bootable else f'{COLOR_DANGER}No{COLOR_RESET}'
+    win_str = f'{COLOR_SUCCESS}Yes{COLOR_RESET}' if stats.windows_info else 'No'
     
-    # Draw controls
-    sys.stdout.write(move_cursor(10, 6) + f'''{COLOR_SUCCESS}[ Press ENTER to START ]{COLOR_RESET}    {COLOR_WARNING}[ Press 'q' to QUIT ]{COLOR_RESET}''')
+    sys.stdout.write(move_cursor(6, 6) + f'Source ISO : [ {iso_name} ] ({size_mb:.1f} MB)')
+    sys.stdout.write(move_cursor(7, 6) + f'Bootable   : {boot_str} (Windows: {win_str}, ISOHybrid: {stats.is_isohybrid})')
+    sys.stdout.write(move_cursor(8, 6) + f'Settings   : Mode: {mode} | Verify: {verify}')
+    
+    # Drive Selection
+    sys.stdout.write(move_cursor(10, 6) + 'Select Target Device (Up/Down Arrows):')
+    
+    for i, drive in enumerate(drives):
+        row = 12 + i
+        prefix = ' > ' if i == selected_idx else '   '
+        color = COLOR_SELECT if i == selected_idx else COLOR_RESET
+        sys.stdout.write(move_cursor(row, 6) + f'{prefix}{color}[ {drive.display_name} ]{COLOR_RESET}')
+
+    # Controls
+    controls_row = 14 + len(drives)
+    sys.stdout.write(move_cursor(controls_row, 6) + f'{COLOR_SUCCESS}[ ENTER to START ]{COLOR_RESET}    {COLOR_WARNING}[ q to QUIT ]{COLOR_RESET}')
     sys.stdout.flush()
 
 
-def draw_progress(written: int, total: int):
+def draw_progress(row: int, phase: str, written: int, total: int):
 
     width = 40
-    percent = written / total if total > 0 else 0
+    percent = (written / total) if total > 0 else 0
     filled_chars = int(width * percent)
     
-    # Unicode block characters for a smooth, Rich-like look
     bar = '█' * filled_chars + '░' * (width - filled_chars)
-    
-    # Jump to row 12, col 6 and draw the updated line
-    sys.stdout.write(move_cursor(12, 6) + f'Progress: {COLOR_BAR}|{bar}|{COLOR_RESET} {percent*100:5.1f}%')
+    # \033[K clears the rest of the line so text doesn't ghost
+    sys.stdout.write(move_cursor(row, 6) + f'\033[K{COLOR_WARNING}{phase:<15}:{COLOR_RESET} {COLOR_BAR}|{bar}|{COLOR_RESET} {percent*100:5.1f}%')
     sys.stdout.flush()
 
 
-def libiso_burn_worker(ui_queue: queue.Queue):
-
-    # Placeholder burn sim
-    total_bytes = 1000
-    for i in range(total_bytes + 1):
-        # Push progress to the UI thread
-        ui_queue.put(('PROGRESS', i, total_bytes))
-        time.sleep(0.005) # Simulate heavy I/O
-        
-    ui_queue.put(('DONE',))
-
-
-def tui_loop():
-
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    
-    ui_queue = queue.Queue()
-    is_burning = False
+def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode: str, verify: bool, stats):
+    ''' Background thread routing the configuration to the Rust backend '''
     
     try:
+        highest_written = 0
+        phase = 'Writing'
+        
+        if mode == 'DD':
+            ui_queue.put(('PHASE', 'Raw DD Write'))
+            stream = _libiso.write_image_dd(iso_path, device_path, verify)
+        else:
+            ui_queue.put(('PHASE', 'ISO Extraction'))
+            has_large_file = stats.has_large_file
+            
+            # Auto-detect partition scheme
+            partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
+            uefi_path = ensure_uefi_bridge() if has_large_file else None
+            
+            stream = _libiso.write_image_iso(
+                iso_path, device_path, has_large_file, 
+                partition_scheme, uefi_path, None, None, verify
+            )
+        
+        for written, total in stream:
+            if written < highest_written:
+                phase = 'Verifying Data'
+                ui_queue.put(('PHASE', phase))
+                highest_written = 0
+                
+            highest_written = written
+            ui_queue.put(('PROGRESS', written, total))
+            
+        ui_queue.put(('DONE', 'Burn and Verification Complete!'))
+    except Exception as e:
+        ui_queue.put(('ERROR', str(e)))
+
+
+def tui_loop(iso_path: str, mode: str, verify: bool):
+
+    try:
+        stats = _libiso.inspect_image(iso_path)
+    except Exception as e:
+        print(f'Error inspecting ISO: {e}')
+        return
+
+    drives = _libiso.list_removable_drives()
+    if not drives:
+        print('No removable USB drives detected! Please insert a drive and try again.')
+        return
+
+    fd = sys.stdin.fileno()
+    if os.name != 'nt':
+        old_settings = termios.tcgetattr(fd)
         tty.setraw(fd)
+    
+    selected_idx = 0
+    ui_queue = queue.Queue()
+    is_burning = False
+    current_phase = 'Waiting'
+    
+    try:
         sys.stdout.write(HIDE_CURSOR)
-        draw_static_ui()
+        draw_static_ui(drives, selected_idx, stats, mode, verify)
+        progress_row = 16 + len(drives)
         
         while True:
-            # Process any pending messages from the background Rust worker
+            # Process backend messages
             while not ui_queue.empty():
                 msg = ui_queue.get()
-                if msg == 'PROGRESS':
-                    draw_progress(msg[1], msg[2])
-                elif msg == 'DONE':
+                if msg[0] == 'PHASE':
+                    current_phase = msg[1]
+                elif msg[0] == 'PROGRESS':
+                    draw_progress(progress_row, current_phase, msg[1], msg[2])
+                elif msg[0] == 'DONE':
                     is_burning = False
-                    sys.stdout.write(move_cursor(14, 6) + f'{COLOR_SUCCESS}Burn Complete! Ready for another drive.{COLOR_RESET}')
+                    sys.stdout.write(move_cursor(progress_row + 2, 6) + f'\033[K{COLOR_SUCCESS}{msg[1]}{COLOR_RESET}')
+                    sys.stdout.flush()
+                elif msg[0] == 'ERROR':
+                    is_burning = False
+                    sys.stdout.write(move_cursor(progress_row + 2, 6) + f'\033[K{COLOR_DANGER}Error: {msg[1]}{COLOR_RESET}')
                     sys.stdout.flush()
 
-            # Wait up to 0.05 seconds for keyboard input (60 FPS refresh rate)
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+            # Handle Input
+            key = read_key_nonblocking()
+            if key == 'QUIT':
+                break
             
-            if rlist:
-                key = sys.stdin.read(1)
-                
-                # Quit if 'q' or 'ESC' (\x1b) is pressed
-                if key in ('q', '\x1b'):
-                    break
-                
-                # Start the burn if 'Enter' (\r or \n) is pressed
-                elif key in ('\r', '\n') and not is_burning:
+            if not is_burning:
+                if key == 'UP':
+                    selected_idx = max(0, selected_idx - 1)
+                    draw_static_ui(drives, selected_idx, stats, mode, verify)
+                elif key == 'DOWN':
+                    selected_idx = min(len(drives) - 1, selected_idx + 1)
+                    draw_static_ui(drives, selected_idx, stats, mode, verify)
+                elif key == 'ENTER':
                     is_burning = True
-                    # Clear any previous completion message
-                    sys.stdout.write(move_cursor(14, 6) + '                                       ') 
-                    # Spawn the worker thread
-                    threading.Thread(target=libiso_burn_worker, args=(ui_queue,), daemon=True).start()
+                    target_device = drives[selected_idx].device_path
                     
+                    sys.stdout.write(move_cursor(progress_row + 2, 6) + '\033[K') # Clear msgs
+                    threading.Thread(
+                        target=tui_burn_worker, 
+                        args=(ui_queue, iso_path, target_device, mode, verify, stats), 
+                        daemon=True
+                    ).start()
+                    
+            if os.name != 'nt': time.sleep(0.01) # Prevent CPU pegging on Unix
+
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if os.name != 'nt':
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         sys.stdout.write(SHOW_CURSOR)
-        # Move cursor below our UI so the bash prompt doesn't overwrite it
-        sys.stdout.write(move_cursor(16, 1)) 
+        sys.stdout.write(move_cursor(20 + len(drives), 1)) 
         sys.stdout.flush()
 
 
 if __name__ == '__main__':
 
-    if len(sys.args) == 1:
-        tui_loop()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='libiso - Cross-platform USB image flasher')
+    parser.add_argument('iso_path', type=str, help='Path to the source ISO file')
+    parser.add_argument('--mode', type=str, choices=['ISO', 'DD'], default='ISO', help='Write method (ISO extraction or Raw DD)')
+    parser.add_argument('--verify', action='store_true', help='Perform a byte-for-byte verification pass after writing')
+    
+    args = parser.parse_args()
+
+    if not os.path.exists(args.iso_path):
+        print(f'''Error: ISO file not found at '{args.iso_path}' ''')
+        sys.exit(1)
+
+    tui_loop(args.iso_path, args.mode, args.verify)
