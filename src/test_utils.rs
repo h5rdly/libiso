@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write, Seek, SeekFrom};
 
 use hadris_iso::write::{IsoImageWriter, InputFiles, File as IsoFile};
 use hadris_iso::write::options::{FormatOptions, CreationFeatures, BaseIsoLevel};
@@ -57,4 +57,118 @@ pub fn create_mock_iso(volume_name: String, files: Vec<String>, is_isohybrid: bo
     }
 
     Ok(bytes)
+}
+
+
+#[pyclass]
+pub struct FakeDrive {
+    memory: Vec<u8>,
+    #[pyo3(get)]
+    pub real_capacity: u64,
+    #[pyo3(get)]
+    pub fake_capacity: u64,
+    #[pyo3(get)]
+    pub cursor: u64,
+}
+
+#[pymethods]
+impl FakeDrive {
+
+    #[new]
+    pub fn new(real_capacity: u64, fake_capacity: u64) -> Self {
+        Self {
+            memory: vec![0; real_capacity as usize],
+            real_capacity,
+            fake_capacity,
+            cursor: 0,
+        }
+    }
+
+    pub fn read(&mut self, size: usize) -> PyResult<Vec<u8>> {
+        let available = (self.fake_capacity - self.cursor) as usize;
+        let to_read = std::cmp::min(size, available);
+        let mut buf = vec![0u8; to_read];
+
+        for i in 0..to_read {
+            let wrapped_pos = ((self.cursor + i as u64) % self.real_capacity) as usize;
+            buf[i] = self.memory[wrapped_pos];
+        }
+        self.cursor += to_read as u64;
+        
+        Ok(buf) 
+    }
+
+    /// Write method exposed directly to Python
+    pub fn write(&mut self, buf: &[u8]) -> PyResult<usize> {
+        let available = (self.fake_capacity - self.cursor) as usize;
+        let to_write = std::cmp::min(buf.len(), available);
+
+        for i in 0..to_write {
+            let wrapped_pos = ((self.cursor + i as u64) % self.real_capacity) as usize;
+            self.memory[wrapped_pos] = buf[i];
+        }
+        self.cursor += to_write as u64;
+        Ok(to_write)
+    }
+
+    // Seek method mimicking Python's os.SEEK_SET, os.SEEK_CUR, os.SEEK_END
+    pub fn seek(&mut self, pos: i64, whence: u8) -> PyResult<u64> {
+        let new_pos = match whence {
+            0 => pos,                                    // SEEK_SET
+            1 => self.cursor as i64 + pos,               // SEEK_CUR
+            2 => self.fake_capacity as i64 + pos,        // SEEK_END
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid whence")),
+        };
+
+        if new_pos < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("Invalid seek position"));
+        }
+
+        self.cursor = new_pos as u64;
+        Ok(self.cursor)
+    }
+
+    pub fn tell(&self) -> PyResult<u64> {
+        Ok(self.cursor)
+    }
+}
+
+// Keep the standard Rust I/O traits so our verification algorithm can use it!
+impl Read for FakeDrive {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = self.read(buf.len()).unwrap();
+        let len = bytes.len();
+        buf[..len].copy_from_slice(&bytes);
+        Ok(len)
+    }
+}
+
+impl Write for FakeDrive {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(self.write(buf).unwrap())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+impl Seek for FakeDrive {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let (offset, whence) = match pos {
+            SeekFrom::Start(p) => (p as i64, 0),
+            SeekFrom::Current(p) => (p, 1),
+            SeekFrom::End(p) => (p, 2),
+        };
+        self.seek(offset, whence).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
+    }
+}
+
+// Using PyRefMut to borrow the Python object safely without moving it into a thread
+#[pyfunction]
+pub fn test_verify_fake_drive_sync(mut drive: PyRefMut<'_, FakeDrive>) -> PyResult<()> {
+    // Create a dummy channel that we won't actually read from since this is synchronous
+    let (tx, _rx) = kanal::unbounded();
+    let fake_cap = drive.fake_capacity;
+    
+    // Dereference `drive` to access the Rust struct inside the Python wrapper
+    crate::verify::verify_hardware_capacity(&mut *drive, fake_cap, &tx, |_| Ok(()))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }

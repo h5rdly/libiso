@@ -26,7 +26,7 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 #[pyclass]
 pub struct ProgressStream {
-    rx: kanal::Receiver<Result<(u64, u64), String>>,
+    pub(crate) rx: kanal::Receiver<Result<(u64, u64), String>>,
 }
 
 

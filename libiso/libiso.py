@@ -347,4 +347,5 @@ def tui_loop():
 
 if __name__ == '__main__':
 
-    tui_loop()
+    if len(sys.args) == 1:
+        tui_loop()
