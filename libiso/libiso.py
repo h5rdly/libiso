@@ -232,13 +232,6 @@ def burn_image(
 
 ## --  TUI
 
-import sys
-import threading
-import queue
-import time
-import select
-import termios
-import tty
 
 # --- ANSI Escape Sequences ---
 CLEAR_SCREEN = '\033[2J'
