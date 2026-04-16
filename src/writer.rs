@@ -14,10 +14,12 @@ use hadris_fat::exfat::{ExFatFs, ExFatDir};
 use hadris_iso::sync::IsoImage;
 use hadris_iso::directory::DirectoryRef;
 
+use arcbox_ext4::Formatter as Ext4Formatter;
+
 use pyo3::prelude::*;
 
 use crate::io::sys::DriveLocker;
-use arcbox_ext4::Formatter as Ext4Formatter;
+
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
 
@@ -26,6 +28,7 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub struct ProgressStream {
     rx: kanal::Receiver<Result<(u64, u64), String>>,
 }
+
 
 #[pymethods]
 impl ProgressStream {
@@ -81,54 +84,94 @@ impl<T: Read + Write + Seek> Seek for PartitionWrapper<T> {
 
 
 #[pyfunction]
+#[pyo3(signature = (image_path, device_path, verify_written=false))]
 pub fn write_image_dd(
-    image_path: String,
-    device_path: String,
+    image_path: String, device_path: String, verify_written: bool,
 ) -> PyResult<ProgressStream> {
-    
+
     let iso_path = Path::new(&image_path);
     if !iso_path.exists() {
-        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!("Image file not found: {}", image_path)));
+        return Err(pyo3::exceptions::PyFileNotFoundError::new_err("Image not found"));
     }
-
-    let _locker = DriveLocker::new(&device_path).map_err(|e| {
-        pyo3::exceptions::PyPermissionError::new_err(e)
-    })?;
-
-    let mut src_file = File::open(iso_path)?;
-    let total_bytes = src_file.metadata()?.len();
-
-    let dest_file_res = OpenOptions::new().write(true).open(&device_path);
-    let mut dest_file = match dest_file_res {
-        Ok(f) => f,
-        Err(e) => return Err(pyo3::exceptions::PyPermissionError::new_err(format!("Failed to open device '{}'. Error: {}", device_path, e))),
-    };
+    let total_size = iso_path.metadata()?.len();
 
     let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
 
     thread::spawn(move || {
-        let mut buffer = vec![0u8; CHUNK_SIZE];
-        let mut bytes_written = 0u64;
 
-        loop {
-            let bytes_read = match src_file.read(&mut buffer) {
-                Ok(n) => n,
-                Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
-            };
-            
-            if bytes_read == 0 { break; }
-            
-            if let Err(e) = dest_file.write_all(&buffer[..bytes_read]) {
-                let _ = tx.send(Err(e.to_string()));
-                return;
+        // Write
+        let mut f_iso = match File::open(&image_path) {
+            Ok(f) => f,
+            Err(e) => { let _ = tx.send(Err(format!("Open ISO err: {}", e))); return; }
+        };
+        let mut f_dev = match OpenOptions::new().write(true).open(&device_path) {
+            Ok(f) => f,
+            Err(e) => { let _ = tx.send(Err(format!("Open device err: {}", e))); return; }
+        };
+
+        let chunk_size = 4 * 1024 * 1024; // 4MB chunks
+        let mut buf = vec![0u8; chunk_size];
+        let mut written = 0u64;
+
+        while written < total_size {
+            let to_read = std::cmp::min(chunk_size as u64, total_size - written) as usize;
+            if let Err(e) = f_iso.read_exact(&mut buf[..to_read]) {
+                let _ = tx.send(Err(format!("Read err: {}", e))); return;
+            }
+            if let Err(e) = f_dev.write_all(&buf[..to_read]) {
+                let _ = tx.send(Err(format!("Write err: {}", e))); return;
             }
             
-            bytes_written += bytes_read as u64;
-            if tx.send(Ok((bytes_written, total_bytes))).is_err() { break; }
+            // Sync periodically to ensure writes hit the metal
+            let _ = f_dev.sync_all();
+
+            written += to_read as u64;
+            if tx.send(Ok((written, total_size))).is_err() {
+                return; // Python disconnected
+            }
         }
-        
-        if let Err(e) = dest_file.sync_all() {
-            let _ = tx.send(Err(e.to_string()));
+
+        // Verify
+        if verify_written {
+            // Drop the write handle so the OS completely flushes it
+            drop(f_dev); 
+
+            let mut v_iso = match File::open(&image_path) {
+                Ok(f) => f,
+                Err(e) => { let _ = tx.send(Err(format!("Verify open ISO err: {}", e))); return; }
+            };
+            let mut v_dev = match File::open(&device_path) {
+                Ok(f) => f,
+                Err(e) => { let _ = tx.send(Err(format!("Verify open device err: {}", e))); return; }
+            };
+
+            let mut buf_iso = vec![0u8; chunk_size];
+            let mut buf_dev = vec![0u8; chunk_size];
+            let mut verified = 0u64;
+
+            // Signal to Python that verification has started by sending a 0
+            let _ = tx.send(Ok((0, total_size)));
+
+            while verified < total_size {
+                let to_read = std::cmp::min(chunk_size as u64, total_size - verified) as usize;
+
+                if let Err(e) = v_iso.read_exact(&mut buf_iso[..to_read]) {
+                    let _ = tx.send(Err(format!("Verify ISO read err: {}", e))); return;
+                }
+                if let Err(e) = v_dev.read_exact(&mut buf_dev[..to_read]) {
+                    let _ = tx.send(Err(format!("Verify device read err: {}", e))); return;
+                }
+
+                if buf_iso[..to_read] != buf_dev[..to_read] {
+                    let _ = tx.send(Err(format!("Data corruption detected at byte offset {}! The USB drive may be failing.", verified)));
+                    return;
+                }
+
+                verified += to_read as u64;
+                if tx.send(Ok((verified, total_size))).is_err() {
+                    return; // Python disconnected
+                }
+            }
         }
     });
 
@@ -244,7 +287,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
 }
 
 
-// Hand-roll a 512-byte Master Boot Record (MBR) supporting up to 3 partitions
+// a 512-byte Master Boot Record (MBR) supporting up to 3 partitions
 fn create_legacy_mbr(
     p1: (u32, u32, u8, bool), // (start, size, type, is_active)
     p2: Option<(u32, u32, u8)>,
@@ -280,7 +323,7 @@ fn create_legacy_mbr(
 
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
@@ -289,6 +332,7 @@ pub fn write_image_iso(
     uefi_ntfs_path: Option<String>,
     persistence_size_mb: Option<u64>, 
     ext4_temp_path: Option<String>,
+    verify_written: bool, 
 ) -> PyResult<ProgressStream> {
     
     let scheme = partition_scheme.unwrap_or_else(|| "gpt".to_string());
@@ -322,10 +366,9 @@ pub fn write_image_iso(
     let start_lba = 2048; 
     let end_lba = total_sectors - 34; 
 
-    let persistence_sectors = persistence_size_mb.unwrap_or(0) * 2048; // 1 MB = 2048 blocks of 512 bytes
+    let persistence_sectors = persistence_size_mb.unwrap_or(0) * 2048; 
     let efi_sectors = if has_large_file { 2048 } else { 0 };
 
-    // Part 1 shrinks to make room for Part 2 (EFI) and Part 3 (Ext4)
     let part1_sectors = (end_lba - start_lba + 1).saturating_sub(efi_sectors + persistence_sectors);
     let part1_end_lba = start_lba + part1_sectors - 1;
     let partition_offset_bytes = start_lba * 512;
@@ -350,11 +393,11 @@ pub fn write_image_iso(
         dest_file.seek(SeekFrom::Start((total_sectors - 1) * 512))?;
         dest_file.write_all(&[0u8; 512])?;
 
-        let part1_type = if has_large_file { 0x07 } else { 0x0C }; // 0x07 = exFAT, 0x0C = FAT32 LBA
+        let part1_type = if has_large_file { 0x07 } else { 0x0C }; 
         let p1 = (start_lba as u32, part1_sectors as u32, part1_type, true);
         
-        let p2 = efi_part.map(|(start, size)| (start as u32, size as u32, 0xEF)); // 0xEF = EFI System Partition
-        let p3 = persistence_part.map(|(start, size)| (start as u32, size as u32, 0x83)); // 0x83 = Linux Native (ext4)
+        let p2 = efi_part.map(|(start, size)| (start as u32, size as u32, 0xEF)); 
+        let p3 = persistence_part.map(|(start, size)| (start as u32, size as u32, 0x83)); 
         
         let mbr_bytes = create_legacy_mbr(p1, p2, p3);
         dest_file.seek(SeekFrom::Start(0))?;
@@ -372,7 +415,6 @@ pub fn write_image_iso(
         }
         
         if let Some((start, size)) = persistence_part {
-            // Using Basic Data GUID for ext4 on USB
             let part3 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::default(), start, start + size - 1);
             gpt.add_partition(part3).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 3 err: {:?}", e)))?;
         }
@@ -399,20 +441,16 @@ pub fn write_image_iso(
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to init ext4 formatter: {:?}", e))
         })?;
         
-        // Finalize the filesystem
         fmt.close().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to finalize ext4 formatting: {:?}", e))
         })?;
 
-        // Patch the volume label to "writable" (Ubuntu persistence standard)
-        // Superblock is at offset 1024. volume_name is at offset 0x78 (120). 1024 + 120 = 1144.
         let mut temp_file = OpenOptions::new().read(true).write(true).open(temp_ext4)?;
         temp_file.seek(SeekFrom::Start(1144))?;
         let mut label = [0u8; 16];
-        label[..8].copy_from_slice(b"writable"); // Padded with zeros natively
+        label[..8].copy_from_slice(b"writable"); 
         temp_file.write_all(&label)?;
 
-        // Copy the completed ext4 image into our USB partition
         temp_file.seek(SeekFrom::Start(0))?;
         dest_file.seek(SeekFrom::Start(ext4_offset))?;
         std::io::copy(&mut temp_file, &mut dest_file)?;
@@ -450,9 +488,7 @@ pub fn write_image_iso(
             pyo3::exceptions::PyRuntimeError::new_err(format!("exFAT Format failed: {:?}", e))
         })?;
 
-        // Inject the UEFI:NTFS/exFAT bridge into Partition 2
         let mut uefi_file = File::open(&uefi_path)?;
-        
         if let Some((start, _)) = efi_part {
             dest_file_for_uefi.seek(SeekFrom::Start(start * 512))?;
             std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
@@ -464,8 +500,21 @@ pub fn write_image_iso(
             let root = iso_img.root_dir();
             let usb_root = exfat_fs.root_dir(); 
             
+            // Extraction
             if let Err(e) = copy_recursive_exfat(&exfat_fs, &iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size) {
                 let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
+                return;
+            }
+
+            // Verification
+            if verify_written {
+                let _ = tx.send(Ok((0, total_size)));
+                let mut verified = 0u64;
+                let iso_verify_root = iso_img.root_dir();
+                let usb_verify_root = exfat_fs.root_dir();
+                if let Err(e) = crate::verify::verify_recursive_exfat(&exfat_fs, &iso_img, iso_verify_root.dir_ref(), &usb_verify_root, &tx, &mut verified, total_size) {
+                    let _ = tx.send(Err(format!("Verification error: {}", e)));
+                }
             }
         });
     } else {
@@ -493,8 +542,21 @@ pub fn write_image_iso(
             let root = iso_img.root_dir();
             let mut usb_root = usb_fs.root_dir(); 
             
+            // Extraction
             if let Err(e) = copy_recursive(&usb_fs, &iso_img, root.dir_ref(), &mut usb_root, &tx, &mut written, total_size) {
                 let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
+                return; // <--- IMPORTANT: Abort if extraction failed
+            }
+
+            // Verification
+            if verify_written {
+                let _ = tx.send(Ok((0, total_size)));
+                let mut verified = 0u64;
+                let iso_verify_root = iso_img.root_dir();
+                let mut usb_verify_root = usb_fs.root_dir();
+                if let Err(e) = crate::verify::verify_recursive(&usb_fs, &iso_img, iso_verify_root.dir_ref(), &mut usb_verify_root, &tx, &mut verified, total_size) {
+                    let _ = tx.send(Err(format!("Verification error: {}", e)));
+                }
             }
         });
     }

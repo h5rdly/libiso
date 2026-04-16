@@ -1,6 +1,15 @@
 import os, sys, importlib.util, tempfile
 from typing import Callable
 
+# TUI imports
+import threading, queue, time, select
+if sys.platform == 'win32':
+    import ctypes
+    from ctypes import wintypes
+else:
+    import termios, tty
+
+
 
 UEFI_BRIDGE_NAME = 'uefi-ntfs.img'
 UEFI_BRIDGE_DOWNLOAD_URL = f'https://raw.githubusercontent.com/pbatard/rufus/master/res/uefi/{UEFI_BRIDGE_NAME}'
@@ -99,23 +108,23 @@ def generate_dbx_rust_arrays(dbx_json_url: str = DBX_REVOCATION_URL, output_path
         f.writelines('\n'.join(
 '''
 pub const TRUSTED_MS_CA_THUMBPRINTS: &[&str] = &[
-    "AEFC5FBBBE055D8F8DAA585473499417AB5A5272", 
-    "81AA6B3244C935BCE0D6628AF39827421E32497D",
-    "A92902398E16C49778CD90F99E4F9AE17C55AF50",
-    "13ADBF4309BD82709C8CD54F316ED522988A1BD4E", 
+    'AEFC5FBBBE055D8F8DAA585473499417AB5A5272', 
+    '81AA6B3244C935BCE0D6628AF39827421E32497D',
+    'A92902398E16C49778CD90F99E4F9AE17C55AF50',
+    '13ADBF4309BD82709C8CD54F316ED522988A1BD4E', 
 ];
 '''.split('\n')))
         f.write(f'\n\n// Via -\n')
         f.write(f'// {DBX_REVOCATION_URL}\n\n')
         f.write('pub const DBX_HASHES: &[&str] = &[\n')
         for h in sorted_hashes:
-            f.write(f'    "{h}",\n')
+            f.write(f'''    '{h}',\n''')
         f.write('];\n')
 
     print(f'Extracted {len(sorted_hashes)} flat hashes to {output_path}')
 
 
-def _progress_bar(written: int, total: int):
+def _progress_bar(written: int, total: int, prefix: str = 'Progress'):
 
     percent = (written / total) * 100 if total > 0 else 0
     bar_len = 40
@@ -140,7 +149,7 @@ def write_image_iso(
     ext4_temp_path = None
     
     if persistence_size_mb:
-        fd, ext4_temp_path = tempfile.mkstemp(suffix=".ext4")
+        fd, ext4_temp_path = tempfile.mkstemp(suffix='.ext4')
         os.close(fd)
 
     try:
@@ -163,8 +172,10 @@ def burn_image(
     device_path: str, 
     method: str = 'ISO',
     partition_scheme: str = None,     
-    persistence_size_mb: int = None   
+    persistence_size_mb: int = None,
+    verify_written: bool = False   
 ):
+
     if not os.path.exists(image_path):
         raise FileNotFoundError(f'Image not found: {image_path}')
 
@@ -173,8 +184,23 @@ def burn_image(
 
     if method == 'DD':
         print(f'Starting raw DD write from {image_path} to {device_path}...')
-        stream = _libiso.write_image_dd(image_path, device_path)
+        stream = _libiso.write_image_dd(image_path, device_path, verify_written)
         
+        phase = 'DD Write'
+        highest_written = 0
+        
+        for written, total in stream:
+            # Check if Rust has entered the verification loop
+            if written < highest_written:
+                phase = 'Verifying'
+                print('\nWrite complete! Starting bit-for-bit verification...')
+                highest_written = 0
+                
+            highest_written = written
+            _progress_bar(written, total, prefix=phase)
+            
+        print(f'\n{phase} Complete!')
+
     if method == 'ISO':
         print(f'Inspecting ISO: {image_path}')
         stats = _libiso.inspect_image(image_path)
@@ -186,7 +212,7 @@ def burn_image(
             partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
 
         uefi_path = ensure_uefi_bridge() if has_large_file else None
-        
+
         print(f'Starting ISO filesystem extraction ({partition_scheme.upper()}) to {device_path}...')       
         stream = write_image_iso(
             image_path, 
@@ -202,3 +228,130 @@ def burn_image(
             
     print(f'\n{method} burning complete!') 
     return
+
+
+## --  TUI
+
+import sys
+import threading
+import queue
+import time
+import select
+import termios
+import tty
+
+# --- ANSI Escape Sequences ---
+CLEAR_SCREEN = '\033[2J'
+CURSOR_HOME = '\033[H'
+HIDE_CURSOR = '\033[?25l'
+SHOW_CURSOR = '\033[?25h'
+
+# Colors
+COLOR_RESET = '\033[0m'
+COLOR_TITLE = '\033[1;36m'   # Bold Cyan
+COLOR_SUCCESS = '\033[1;32m' # Bold Green
+COLOR_WARNING = '\033[1;33m' # Bold Yellow
+COLOR_BAR = '\033[38;5;39m'  # Rich-style blueish bar
+
+
+def move_cursor(row: int, col: int) -> str:
+    return f'\033[{row};{col}H'
+
+
+def draw_static_ui():
+    ''' Draw the retained parts of the UI once '''
+
+    sys.stdout.write(CLEAR_SCREEN + CURSOR_HOME)
+    
+    # Draw header and fake dropdowns
+    sys.stdout.write(move_cursor(2, 4) + f'{COLOR_TITLE}╔══════════════════════════════════════════════════╗{COLOR_RESET}')
+    sys.stdout.write(move_cursor(3, 4) + f'{COLOR_TITLE}║{COLOR_RESET}               libiso USB Flasher                 {COLOR_TITLE}║{COLOR_RESET}')
+    sys.stdout.write(move_cursor(4, 4) + f'{COLOR_TITLE}╚══════════════════════════════════════════════════╝{COLOR_RESET}')
+    
+    sys.stdout.write(move_cursor(6, 6) + 'Target Device : [ /dev/sdb - 32GB Flash Drive ]')
+    sys.stdout.write(move_cursor(7, 6) + 'Source ISO    : [ ubuntu-24.04-desktop.iso  ]')
+    
+    # Draw controls
+    sys.stdout.write(move_cursor(10, 6) + f'''{COLOR_SUCCESS}[ Press ENTER to START ]{COLOR_RESET}    {COLOR_WARNING}[ Press 'q' to QUIT ]{COLOR_RESET}''')
+    sys.stdout.flush()
+
+
+def draw_progress(written: int, total: int):
+
+    width = 40
+    percent = written / total if total > 0 else 0
+    filled_chars = int(width * percent)
+    
+    # Unicode block characters for a smooth, Rich-like look
+    bar = '█' * filled_chars + '░' * (width - filled_chars)
+    
+    # Jump to row 12, col 6 and draw the updated line
+    sys.stdout.write(move_cursor(12, 6) + f'Progress: {COLOR_BAR}|{bar}|{COLOR_RESET} {percent*100:5.1f}%')
+    sys.stdout.flush()
+
+
+def libiso_burn_worker(ui_queue: queue.Queue):
+
+    # Placeholder burn sim
+    total_bytes = 1000
+    for i in range(total_bytes + 1):
+        # Push progress to the UI thread
+        ui_queue.put(('PROGRESS', i, total_bytes))
+        time.sleep(0.005) # Simulate heavy I/O
+        
+    ui_queue.put(('DONE',))
+
+
+def tui_loop():
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    
+    ui_queue = queue.Queue()
+    is_burning = False
+    
+    try:
+        tty.setraw(fd)
+        sys.stdout.write(HIDE_CURSOR)
+        draw_static_ui()
+        
+        while True:
+            # Process any pending messages from the background Rust worker
+            while not ui_queue.empty():
+                msg = ui_queue.get()
+                if msg == 'PROGRESS':
+                    draw_progress(msg[1], msg[2])
+                elif msg == 'DONE':
+                    is_burning = False
+                    sys.stdout.write(move_cursor(14, 6) + f'{COLOR_SUCCESS}Burn Complete! Ready for another drive.{COLOR_RESET}')
+                    sys.stdout.flush()
+
+            # Wait up to 0.05 seconds for keyboard input (60 FPS refresh rate)
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+            
+            if rlist:
+                key = sys.stdin.read(1)
+                
+                # Quit if 'q' or 'ESC' (\x1b) is pressed
+                if key in ('q', '\x1b'):
+                    break
+                
+                # Start the burn if 'Enter' (\r or \n) is pressed
+                elif key in ('\r', '\n') and not is_burning:
+                    is_burning = True
+                    # Clear any previous completion message
+                    sys.stdout.write(move_cursor(14, 6) + '                                       ') 
+                    # Spawn the worker thread
+                    threading.Thread(target=libiso_burn_worker, args=(ui_queue,), daemon=True).start()
+                    
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write(SHOW_CURSOR)
+        # Move cursor below our UI so the bash prompt doesn't overwrite it
+        sys.stdout.write(move_cursor(16, 1)) 
+        sys.stdout.flush()
+
+
+if __name__ == '__main__':
+
+    tui_loop()
