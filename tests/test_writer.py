@@ -61,7 +61,7 @@ class TestWriterIso(unittest.TestCase):
         for written, total in stream:
             # slow down the loop so the human eye can see it
             # This triggers backpressure on the Rust thread
-            time.sleep(0.05) 
+            time.sleep(10** -4) 
             
             percent = (written / total) * 100 if total > 0 else 0
             bar = '█' * int(40 * written / total)

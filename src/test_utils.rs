@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 pub fn create_mock_iso(
     volume_name: String, files: Vec<String>, is_isohybrid: bool, dummy_file_size_mb: usize
 ) -> PyResult<Vec<u8>> {
-    
+
     let mut iso_files = Vec::new();
     
     let file_content = vec![0u8; dummy_file_size_mb * 1024 * 1024];
@@ -78,18 +78,21 @@ pub struct FakeDrive {
     pub fake_capacity: u64,
     #[pyo3(get)]
     pub cursor: u64,
+    pub strict_alignment: bool,
 }
 
 #[pymethods]
 impl FakeDrive {
 
     #[new]
-    pub fn new(real_capacity: u64, fake_capacity: u64) -> Self {
+    #[pyo3(signature = (real_capacity, fake_capacity, strict_alignment=true))]
+    pub fn new(real_capacity: u64, fake_capacity: u64, strict_alignment: bool) -> Self {
         Self {
             memory: vec![0; real_capacity as usize],
             real_capacity,
             fake_capacity,
             cursor: 0,
+            strict_alignment,
         }
     }
 
@@ -109,6 +112,15 @@ impl FakeDrive {
 
     /// Write method exposed directly to Python
     pub fn write(&mut self, buf: &[u8]) -> PyResult<usize> {
+
+        if self.strict_alignment {
+            if buf.len() % 512 != 0 || self.cursor % 512 != 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("ERROR_INVALID_PARAMETER: Unbuffered I/O requires 512-byte sector alignment. Attempted to write {} bytes at offset {}.", buf.len(), self.cursor)
+                ));
+            }
+        }
+
         let available = (self.fake_capacity - self.cursor) as usize;
         let to_write = std::cmp::min(buf.len(), available);
 
@@ -154,7 +166,8 @@ impl Read for FakeDrive {
 
 impl Write for FakeDrive {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(self.write(buf).unwrap())
+        self.write(buf).map_err(|e| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, e.to_string()))
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }

@@ -12,7 +12,9 @@ use hadris_fat::exfat::{ExFatFs, ExFatDir, ExFatFileReader};
 
 use pyo3::prelude::*;
 
-use crate::writer::ProgressStream;
+use crate::writer::{ProgressStream, DD_CHUNK_SIZE};
+use crate::io::{AlignedBuffer };
+
 
 
 // Wrapper to make hadris_fat's FAT32 FileReader implement std::io::Read
@@ -36,9 +38,9 @@ pub fn verify_file_chunks(
     total_size: u64,
 ) -> Result<(), String> {
 
-    let chunk_size = 1024 * 1024; // 1MB chunks
-    let mut buf_iso = vec![0u8; chunk_size];
-    let mut buf_usb = vec![0u8; chunk_size];
+    let chunk_size = DD_CHUNK_SIZE;
+    let mut buf_iso = AlignedBuffer::new(chunk_size);
+    let mut buf_usb = AlignedBuffer::new(chunk_size);
     let mut read_so_far = 0u64;
 
     while read_so_far < file_size {
@@ -152,8 +154,8 @@ pub fn verify_hardware_capacity<T: Read + Write + Seek>(
     mut sync_fn: impl FnMut(&mut T) -> Result<(), String>, 
 ) -> Result<(), String> {
 
-    let chunk_size = std::cmp::min(4 * 1024 * 1024, total_size as usize); // 4MB chunks
-    let mut buf = vec![0u8; chunk_size];
+    let chunk_size = std::cmp::min(DD_CHUNK_SIZE, total_size as usize);
+    let mut buf = AlignedBuffer::new(chunk_size);
     
     // A magic 64-bit number to XOR against the offset
     let magic: u64 = 0xAA55AA55_DEADBEEF;

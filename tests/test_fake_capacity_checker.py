@@ -8,7 +8,7 @@ class TestHardwareVerification(unittest.TestCase):
     def test_python_fakedrive_interaction(self):
 
         # 10 bytes of real RAM, but claims to be 100 bytes
-        drive = libiso.FakeDrive(10, 100) 
+        drive = libiso.FakeDrive(10, 100, False) 
         
         drive.write(b"ABCDEFGHIJ")
         self.assertEqual(drive.tell(), 10)

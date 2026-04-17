@@ -18,10 +18,12 @@ use arcbox_ext4::Formatter as Ext4Formatter;
 
 use pyo3::prelude::*;
 
-use crate::io::sys::DriveLocker;
+use crate::io::{AlignedBuffer, sys::DriveLocker};
 
 
-const CHUNK_SIZE: usize = 4 * 1024 * 1024; 
+pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;   // Optimize for raw throughput in DD mode
+pub const ISO_CHUNK_SIZE: usize = 100 * 1024;        // Optimize for fast file-by-file extraction
+
 
 
 #[pyclass]
@@ -122,8 +124,8 @@ pub fn write_image_dd(
             Err(e) => { let _ = tx.send(Err(format!("Open device err: {}", e))); return; }
         };
 
-        let chunk_size = 4 * 1024 * 1024; // 4MB chunks
-        let mut buf = vec![0u8; chunk_size];
+        let chunk_size = DD_CHUNK_SIZE;
+        let mut buf = AlignedBuffer::new(chunk_size);
         let mut written = 0u64;
 
         while written < total_size {
@@ -203,7 +205,7 @@ fn copy_recursive<T: Read + Write + Seek>(
     total_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = iso.open_dir(iso_dir_ref);
-    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+    let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
 
     for entry_res in dir.entries() {
         let entry = entry_res?;
@@ -224,7 +226,7 @@ fn copy_recursive<T: Read + Write + Seek>(
                 let extent_len = extent.length as u64;
 
                 while extent_offset < extent_len {
-                    let read_size = (extent_len - extent_offset).min(CHUNK_SIZE as u64) as usize;
+                    let read_size = (extent_len - extent_offset).min(ISO_CHUNK_SIZE as u64) as usize;
                     let byte_offset = (extent.sector.0 as u64 * 2048) + extent_offset;
                     iso.read_bytes_at(byte_offset, &mut chunk_buf[..read_size])?;
 
@@ -257,7 +259,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
     total_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = iso.open_dir(iso_dir_ref);
-    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+    let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
 
     for entry_res in dir.entries() {
         let entry = entry_res?;
@@ -278,7 +280,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
                 let extent_len = extent.length as u64;
 
                 while extent_offset < extent_len {
-                    let read_size = (extent_len - extent_offset).min(CHUNK_SIZE as u64) as usize;
+                    let read_size = (extent_len - extent_offset).min(ISO_CHUNK_SIZE as u64) as usize;
                     let byte_offset = (extent.sector.0 as u64 * 2048) + extent_offset;
                     iso.read_bytes_at(byte_offset, &mut chunk_buf[..read_size])?;
 

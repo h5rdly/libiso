@@ -1,4 +1,58 @@
-// Low level controls for Windows to allow locking the USB for the eneded work
+use std::ops::{Deref, DerefMut};
+
+
+// -- A page-aligned memory buffer for bypassing the OS cache
+
+#[allow(dead_code)]    // Dead code analyzer doesn't pick up unsafe pointer casts
+#[repr(align(4096))]
+#[derive(Clone)]
+struct Align4K([u8; 4096]);
+
+pub struct AlignedBuffer {
+    _storage: Vec<Align4K>,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    // The actual memory allocated will be rounded up to the nearest 4096 bytes.
+    pub fn new(capacity_bytes: usize) -> Self {
+        // ensure we always allocate enough 4K chunks to fit the requested bytes
+        let chunks = capacity_bytes.div_ceil(4096);
+        Self {
+            _storage: vec![Align4K([0u8; 4096]); chunks],
+            len: capacity_bytes,
+        }
+    }
+}
+
+// Traits to allow the struct to pass as a standard byte slice
+impl Deref for AlignedBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            std::slice::from_raw_parts(
+                self._storage.as_ptr() as *const u8,
+                self.len,
+            )
+        }
+    }
+}
+
+impl DerefMut for AlignedBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self._storage.as_mut_ptr() as *mut u8,
+                self.len,
+            )
+        }
+    }
+}
+
+
+
+// -- Low level controls for Windows to allow locking the USB for the eneded work
 
 
 #[cfg(not(windows))]
