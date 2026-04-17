@@ -95,6 +95,19 @@ pub fn write_image_dd(
     }
     let total_size = iso_path.metadata()?.len();
 
+    // Size check
+    let dest_file = OpenOptions::new().write(true).open(&device_path)
+        .map_err(|e| pyo3::exceptions::PyPermissionError::new_err(format!("Open device err: {}", e)))?;
+    let dest_size = dest_file.metadata()?.len();
+    
+    if total_size > dest_size {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Target device ({} bytes) is too small for this image ({} bytes).", 
+            dest_size, total_size
+        )));
+    }
+    drop(dest_file);
+
     let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
 
     thread::spawn(move || {
@@ -342,6 +355,7 @@ pub fn write_image_iso(
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err("ISO not found"));
     }
 
+    let total_size = iso_path.metadata()?.len();
     let _locker = DriveLocker::new(&device_path).map_err(|e| {
         pyo3::exceptions::PyPermissionError::new_err(e)
     })?;
@@ -355,6 +369,13 @@ pub fn write_image_iso(
     let dest_size = dest_file.metadata()?.len();
     if dest_size == 0 {
         return Err(pyo3::exceptions::PyIOError::new_err("Destination device has 0 bytes."));
+    }
+
+    if total_size > dest_size {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Target device ({} bytes) is too small for this image ({} bytes).", 
+            dest_size, total_size
+        )));
     }
 
     let total_sectors = dest_size / 512;
@@ -506,6 +527,8 @@ pub fn write_image_iso(
                 return;
             }
 
+            let _ = tx.send(Ok((total_size, total_size))); // Snap extraction progress to 100%
+
             // Verification
             if verify_written {
                 let _ = tx.send(Ok((0, total_size)));
@@ -545,8 +568,10 @@ pub fn write_image_iso(
             // Extraction
             if let Err(e) = copy_recursive(&usb_fs, &iso_img, root.dir_ref(), &mut usb_root, &tx, &mut written, total_size) {
                 let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
-                return; // <--- IMPORTANT: Abort if extraction failed
+                return; // Abort if extraction failed
             }
+
+            let _ = tx.send(Ok((total_size, total_size))); // Snap extraction progress to 100%
 
             // Verification
             if verify_written {

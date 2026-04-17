@@ -21,7 +21,7 @@ class TestWriterIso(unittest.TestCase):
         self.dest_path = self.dest_fd.name
 
         # Create a real small ISO for extraction testing
-        self.iso_content = libiso.create_mock_iso('TEST_ISO', ['EFI/BOOT/BOOTX64.EFI', 'KERNEL.BIN'], True)
+        self.iso_content = libiso.create_mock_iso('TEST_ISO', ['EFI/BOOT/BOOTX64.EFI', 'KERNEL.BIN'], True, 10)
         self.source_fd = tempfile.NamedTemporaryFile(delete=False)
         self.source_fd.write(self.iso_content)
         self.source_fd.close()
@@ -59,7 +59,7 @@ class TestWriterIso(unittest.TestCase):
         )
 
         for written, total in stream:
-            # slow down the loop so the human eye can see it.
+            # slow down the loop so the human eye can see it
             # This triggers backpressure on the Rust thread
             time.sleep(0.05) 
             

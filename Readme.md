@@ -19,7 +19,6 @@ The `.so` size on linux is ~`0.8Mb`, no external dependencies.
 
 ##  Usage
 
-
 ```python
 import libiso
 
@@ -45,5 +44,56 @@ print(stats)
 #
 # --- Windows Metadata ---
 # Is Windows:        False
+
+
+import tempfile, os, time 
+
+'''
+- Unix and Windows treat physical block devices as files (e.g., /dev/sdb)
+- libiso's Rust writing backend is abstracted via standard Read/Write/Seek traits
+- These snippets use Tempfiles for demonstartion purposes, as do the tests
+'''
+
+with (tempfile.NamedTemporaryFile(delete=False) as dest_fd, 
+      tempfile.NamedTemporaryFile(delete=False) as source_fd):
+   dest_fd.write(b'\x00' * (128 * 1024 * 1024)) 
+   source_fd.write(os.urandom(100 * 1024 * 1024))
+
+
+def show_progress(total, written, mode, sleep_interval=0.05):
+
+   time.sleep(0.05)   # For visual effect
+   percent = (written / total) * 100 if total > 0 else 0
+   bar = ('█' * int(40 * written / total)).ljust(40, '-')
+   print(f'\r\033[K{mode} Mode Write:  |{bar}| {percent:.1f}% ({written}/{total} bytes)', end='')
+
+# Writing in DD mode
+for written, total in libiso.write_image_dd(source_fd.name, dest_fd.name):
+    show_progress(total, written, 'DD')
+
+# DD Mode Write:  |████████████████████████████████████████| 100.0% (209715200/209715200 bytes)
+
+
+'''
+           ---- Writing in ISO mode  ---
+- has_large_file = True makes libiso utilize FAT32 + exFAT setup
+- Pulling uefi-ntfs.img
+-  libiso places the UEFI bridge image int the small FAT32 partition, that then loads the actual exFAT partition with the ISO
+'''
+
+with (tempfile.NamedTemporaryFile(delete=False) as dest_fd, 
+      tempfile.NamedTemporaryFile(delete=False) as source_fd):
+   dest_fd.write(b'\x00' * (128 * 1024 * 1024)) 
+   source_fd.write(libiso.create_mock_iso(
+      'TEST_ISO', ['EFI/BOOT/BOOTX64.EFI', 'KERNEL.BIN'], True, 50))   # 50Mb for each of the 2 files
+
+uefi_bridge_path = libiso.ensure_uefi_bridge()
+for written, total in libiso.write_image_iso(
+   source_fd.name, dest_fd.name, True, 'GPT', uefi_bridge_path
+   ):   
+   show_progress(total, written, 'ISO')
+
+# ISO Mode Write:  |████████████████████████████████████████| 100.0% (109051904/109051904 bytes)
+
 ```
-- Writing the image - in progress for `v0.1.0`
+

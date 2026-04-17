@@ -19,21 +19,23 @@ use verify::{destructive_verify_usb_size};
 #[pymodule]
 fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
+    // Inspection
     m.add_class::<DriveInfo>()?;
-    m.add_function(wrap_pyfunction!(list_removable_drives, m)?)?;
-    
     m.add_class::<BootCapabilities>()?;
     m.add_class::<WindowsMetadata>()?;
     m.add_class::<ImageStats>()?;
+    m.add_function(wrap_pyfunction!(list_removable_drives, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_image, m)?)?;
+    m.add_function(wrap_pyfunction!(destructive_verify_usb_size, m)?)?; 
     
+    // Writing
     m.add_function(wrap_pyfunction!(write_image_dd, m)?)?; 
     m.add_function(wrap_pyfunction!(write_image_iso, m)?)?; 
-    m.add_function(wrap_pyfunction!(destructive_verify_usb_size, m)?)?; 
 
+    // Testing
+    m.add_class::<FakeDrive>()?;
     m.add_function(wrap_pyfunction!(create_mock_iso, m)?)?; 
     m.add_function(wrap_pyfunction!(test_verify_fake_drive_sync, m)?)?; 
-    m.add_class::<FakeDrive>()?;
 
     Ok(())
 }

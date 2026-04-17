@@ -227,6 +227,7 @@ fn scan_directory(
 
 #[pyfunction]
 pub fn inspect_image(path: String) -> PyResult<ImageStats> {
+
     let file_path = Path::new(&path);
     
     if !file_path.exists() {
@@ -277,8 +278,7 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
         let root = iso.root_dir();
         
         scan_directory(
-            &iso, 
-            root.dir_ref(), 
+            &iso, root.dir_ref(), 
             &mut has_large_file, 
             &mut supports_uefi,
             &mut is_windows,

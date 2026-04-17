@@ -9,13 +9,19 @@ use pyo3::prelude::*;
 
 
 #[pyfunction]
-pub fn create_mock_iso(volume_name: String, files: Vec<String>, is_isohybrid: bool) -> PyResult<Vec<u8>> {
+#[pyo3(signature = (volume_name, files, is_isohybrid, dummy_file_size_mb=1))]
+pub fn create_mock_iso(
+    volume_name: String, files: Vec<String>, is_isohybrid: bool, dummy_file_size_mb: usize
+) -> PyResult<Vec<u8>> {
+    
     let mut iso_files = Vec::new();
     
-    for name in files {
+    let file_content = vec![0u8; dummy_file_size_mb * 1024 * 1024];
+    
+    for name in &files {
         iso_files.push(IsoFile::File {
-            name: Arc::new(name),
-            contents: b"mock_data".to_vec(),
+            name: Arc::new(name.clone()),
+            contents: file_content.clone(),
         });
     }
 
@@ -43,7 +49,10 @@ pub fn create_mock_iso(volume_name: String, files: Vec<String>, is_isohybrid: bo
         strict_charset: false, 
     };
 
-    let mut buffer = Cursor::new(vec![0u8; 2 * 1024 * 1024]);
+    // Pre-allocate and zero-fill the buffer.
+    // The ISO writer expects a physical-disk-like canvas to seek around on.
+    let total_size = (files.len() * dummy_file_size_mb * 1024 * 1024) + (4 * 1024 * 1024);
+    let mut buffer = Cursor::new(vec![0u8; total_size]);
     
     IsoImageWriter::format_new(&mut buffer, input_files, options)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("ISO creation failed: {:?}", e)))?;

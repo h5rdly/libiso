@@ -1,6 +1,7 @@
 use std::io::{Read, Seek};
 
 use hadris_iso::sync::IsoImage;
+
 use pelite::pe64::{Pe, PeFile};
 use sha1::Sha1;
 use sha2::{Sha256, Digest};
@@ -12,10 +13,8 @@ use der::{Decode, Encode};
 use crate::dbx::{TRUSTED_MS_CA_THUMBPRINTS, DBX_HASHES};
 
 
-pub fn read_file_from_iso<T: Read + Seek>(
-    iso: &IsoImage<T>,
-    path: &str,
-) -> Option<Vec<u8>> {
+pub fn read_file_from_iso<T: Read + Seek>(iso: &IsoImage<T>, path: &str, ) -> Option<Vec<u8>> {
+    
     let mut current_dir = iso.root_dir().dir_ref();
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 

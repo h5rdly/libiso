@@ -50,13 +50,12 @@ impl DriveInfo {
 #[cfg(target_os = "linux")]
 #[pyfunction]
 pub fn list_removable_drives() -> Vec<DriveInfo> {
+
     let mut available_drives = Vec::new();
     let hardware_devices = drives::get_devices().unwrap_or_default();
 
     for device in hardware_devices {
-        if !device.is_removable {
-            continue;
-        }
+        if !device.is_removable { continue; }
 
         let hw_name = device.model.unwrap_or_else(|| "Generic USB Drive".to_string());
         let device_path = format!("/dev/{}", device.name);

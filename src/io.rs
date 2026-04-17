@@ -1,3 +1,5 @@
+// Low level controls for Windows to allow locking the USB for the eneded work
+
 
 #[cfg(not(windows))]
 pub mod sys {
@@ -65,14 +67,14 @@ pub mod sys {
     // -------------------------------------
 
     pub struct DriveLocker {
-        // We wrap the handle in an Option so we can hold 'None' if it's just a file.
+        // 'None' if it's just a file.
         handle: Option<HANDLE>,
     }
 
     impl DriveLocker {
         pub fn new(volume_path: &str) -> Result<Self, String> {
-            // 1. The Bypass: If the path doesn't start with the Windows device namespace (\\.\),
-            // it's a standard file (like our Python tempfile tests). Skip locking!
+            // If the path doesn't start with the Windows device namespace (\\.\),
+            // it's a standard file - skip locking
             if !volume_path.starts_with("\\\\.\\") {
                 return Ok(Self { handle: None });
             }

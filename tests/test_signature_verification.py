@@ -9,7 +9,7 @@ class TestSignatureVerification(unittest.TestCase):
 
     def _generate_mock_iso_and_test(self, files: list[str]):
 
-        iso_bytes = libiso.create_mock_iso('SECURE_MOCK', files, False)
+        iso_bytes = libiso.create_mock_iso('SECURE_MOCK', files, False, 10)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix='.iso') as tmp:
             tmp.write(iso_bytes)
