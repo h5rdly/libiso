@@ -152,9 +152,28 @@ impl FakeDrive {
     pub fn tell(&self) -> PyResult<u64> {
         Ok(self.cursor)
     }
+
+    pub fn simulate_os_interference(&mut self) -> PyResult<()> {
+        // Windows typically drops this near the start of the disk 
+        // after the boot sector (e.g., offset 8192)
+        let interference_offset = 8192;
+        
+        if self.real_capacity < interference_offset + 512 {
+            return Ok(()); // Drive too small to care
+        }
+
+        let garbage_data = b"SYSTEM_VOLUME_INFORMATION_CORRUPTION_GHOST_DATA";
+        
+        for (i, &byte) in garbage_data.iter().enumerate() {
+            let pos = ((interference_offset + i as u64) % self.real_capacity) as usize;
+            self.memory[pos] = byte;
+        }
+        
+        Ok(())
+    }
 }
 
-// Keep the standard Rust I/O traits so our verification algorithm can use it!
+// Keeping the standard Rust I/O traits so our verification algorithm can use it
 impl Read for FakeDrive {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let bytes = self.read(buf.len()).unwrap();

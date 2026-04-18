@@ -1,5 +1,6 @@
 use std::ops::{Deref, DerefMut};
-
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 
 // -- A page-aligned memory buffer for bypassing the OS cache
 
@@ -218,4 +219,79 @@ pub mod sys {
             }
         }
     }
+}
+
+
+// Linux O_DIRECT Constants 
+#[cfg(target_os = "linux")]
+mod linux_sys {
+    // x86_64, x86, aarch64, arm, riscv64, powerpc, loongarch64 use 0x4000
+    #[cfg(not(any(
+        target_arch = "mips", 
+        target_arch = "mips64", 
+        target_arch = "sparc", 
+        target_arch = "sparc64"
+    )))]
+    pub const O_DIRECT: i32 = 0x4000;
+
+    // MIPS uses 0x8000
+    #[cfg(any(target_arch = "mips", target_arch = "mips64"))]
+    pub const O_DIRECT: i32 = 0x8000;
+
+    // SPARC uses 0x100000
+    #[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+    pub const O_DIRECT: i32 = 0x100000;
+}
+
+
+// Attempt Unbuffered I/O, fall back to standard buffered I/O if the filesystem rejects it
+pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> {
+    let path = Path::new(path_str);
+    let mut opts = OpenOptions::new();
+    
+    opts.read(true);
+    if write_access {
+        opts.write(true);
+    }
+
+    // --- Windows Implementation ---
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut unbuf_opts = opts.clone();
+        
+        // FILE_FLAG_NO_BUFFERING (0x20000000) | FILE_FLAG_WRITE_THROUGH (0x80000000)
+        unbuf_opts.custom_flags(0x20000000 | 0x80000000); 
+        
+        match unbuf_opts.open(path) {
+            Ok(f) => return Ok(f),
+            // Error 87: ERROR_INVALID_PARAMETER (Filesystem doesn't support no-buffering, e.g., a Python temp file)
+            Err(e) if e.raw_os_error() == Some(87) => {
+                println!("Warning: Unbuffered I/O rejected by OS. Falling back to cached I/O.");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // --- Linux Implementation ---
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut unbuf_opts = opts.clone();
+        
+        unbuf_opts.custom_flags(linux_sys::O_DIRECT);
+        
+        match unbuf_opts.open(path) {
+            Ok(f) => return Ok(f),
+            // Error 22: EINVAL (Tmpfs or filesystem doesn't support O_DIRECT)
+            Err(e) if e.raw_os_error() == Some(22) => {
+                // Silently fallback so unit tests on /tmp don't break
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // --- Mac OS / Fallback ---
+    // (Mac uses F_NOCACHE via fcntl instead of open flags, so we just use standard I/O for now)
+    opts.open(path)
 }

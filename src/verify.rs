@@ -1,5 +1,4 @@
 use std::io::Read;
-use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::thread;
 
@@ -219,14 +218,11 @@ pub fn verify_hardware_capacity<T: Read + Write + Seek>(
 }
 
 
-// The physical wrapper used by the PyO3 binding
+// Used by the PyO3 binding
 pub fn verify_usb_size(
     device_path: &str, tx: &kanal::Sender<Result<(u64, u64), String>>,) -> Result<(), String> {
     
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device_path)
+    let mut file = crate::io::open_device(device_path, true)
         .map_err(|e| format!("Failed to open device for hardware verification: {}", e))?;
 
     let total_size = file.seek(SeekFrom::End(0)).map_err(|e| format!("Seek err: {}", e))?;

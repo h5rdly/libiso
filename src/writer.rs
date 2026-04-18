@@ -18,7 +18,7 @@ use arcbox_ext4::Formatter as Ext4Formatter;
 
 use pyo3::prelude::*;
 
-use crate::io::{AlignedBuffer, sys::DriveLocker};
+use crate::io::{AlignedBuffer, sys::DriveLocker, open_device};
 
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;   // Optimize for raw throughput in DD mode
@@ -119,7 +119,7 @@ pub fn write_image_dd(
             Ok(f) => f,
             Err(e) => { let _ = tx.send(Err(format!("Open ISO err: {}", e))); return; }
         };
-        let mut f_dev = match OpenOptions::new().write(true).open(&device_path) {
+        let mut f_dev = match open_device(&device_path, true) {
             Ok(f) => f,
             Err(e) => { let _ = tx.send(Err(format!("Open device err: {}", e))); return; }
         };
@@ -155,7 +155,7 @@ pub fn write_image_dd(
                 Ok(f) => f,
                 Err(e) => { let _ = tx.send(Err(format!("Verify open ISO err: {}", e))); return; }
             };
-            let mut v_dev = match File::open(&device_path) {
+            let mut v_dev = match crate::io::open_device(&device_path, false) { // false = read-only
                 Ok(f) => f,
                 Err(e) => { let _ = tx.send(Err(format!("Verify open device err: {}", e))); return; }
             };
