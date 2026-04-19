@@ -2,7 +2,7 @@
 name = "libiso"
 version = "0.0.8"
 edition = "2024"
-rust-version = "1.95"
+# rust-version = "1.95"   # The stabilized MaybeUninit<[T; N]> can allow skipping zero-filling
 
 [lib]
 name = "_libiso"
