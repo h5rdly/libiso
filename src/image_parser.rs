@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -9,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::signature::inspect_secure_boot;
-
+use crate::esd::{parse_wim_xml};
 
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug)]
@@ -41,6 +40,11 @@ pub struct WindowsMetadata {
     pub install_image_type: String, 
     #[pyo3(get)]
     pub supports_wintogo: bool,
+    // --- NEW FIELDS ---
+    #[pyo3(get)]
+    pub architecture: String,
+    #[pyo3(get)]
+    pub editions: Vec<String>,
 }
 
 #[pyclass(from_py_object)]
@@ -87,6 +91,8 @@ impl WindowsMetadata {
         dict.set_item("is_windows_11", self.is_windows_11)?;
         dict.set_item("install_image_type", &self.install_image_type)?;
         dict.set_item("supports_wintogo", self.supports_wintogo)?;
+        dict.set_item("architecture", &self.architecture)?;
+        dict.set_item("editions", &self.editions)?;
         Ok(dict)
     }
 }
@@ -139,8 +145,12 @@ impl ImageStats {
             s.push_str(&format!(
                 "Is Windows:        Yes (Win 11: {})\n\
                  Image Type:        {}\n\
+                 Architecture:      {}\n\
+                 Editions:          {}\n\
                  WinToGo Supported: {}\n",
-                win.is_windows_11, win.install_image_type.to_uppercase(), win.supports_wintogo
+                win.is_windows_11, win.install_image_type.to_uppercase(), 
+                win.architecture.to_uppercase(), win.editions.join(", "), 
+                win.supports_wintogo
             ));
         } else {
             s.push_str("Is Windows:        False\n");
@@ -189,7 +199,7 @@ fn scan_directory(
                     iso, 
                     sub_dir_ref, 
                     has_large_file, 
-                    supports_uefi, // Recursive pass
+                    supports_uefi,
                     is_windows,
                     is_windows_11,
                     install_image_type
@@ -226,19 +236,52 @@ fn scan_directory(
 
 
 #[pyfunction]
-pub fn inspect_image(path: String) -> PyResult<ImageStats> {
+pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
+    let mut file = File::open(&file_path)?;
+    let total_size = file.metadata()?.len();
 
-    let file_path = Path::new(&path);
-    
-    if !file_path.exists() {
-        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-            "Image file not found: {}", path
-        )));
+    // 1. MAGIC NUMBER ROUTING
+    // Read the first 8 bytes to check if it's a WIM or ESD file
+    let mut magic = [0u8; 8];
+    if file.read_exact(&mut magic).is_ok() {
+        if &magic == b"MSWIM\x00\x00\x00" || &magic == b"WLPWM\x00\x00\x00" {
+            // It's a WIM/ESD! Parse the XML metadata.
+            if let Some(wim_info) = parse_wim_xml(total_size, |buf, offset| {
+                file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(buf).is_ok()
+            }) {
+                return Ok(ImageStats {
+                    file_path, 
+                    size_bytes: total_size,
+                    volume_label: "WIM/ESD Archive".to_string(), // Dummy label for standalone archives
+                    is_isohybrid: false,
+                    has_large_file: true, // WIMs are basically guaranteed to have large solid chunks
+                    boot_info: BootCapabilities {
+                        is_bootable: false,
+                        supports_bios: false,
+                        supports_uefi: false,
+                        secure_boot_signed: false, 
+                        is_microsoft_signed: false,
+                        is_revoked: false,
+                        signature_size: 0,
+                    },
+                    windows_info: Some(WindowsMetadata {
+                        is_windows: true,
+                        is_windows_11: false, // appraiserres.dll isn't inside the WIM
+                        install_image_type: "ESD/WIM".to_string(),
+                        supports_wintogo: true,
+                        architecture: wim_info.architecture.unwrap_or_else(|| "Unknown".to_string()),
+                        editions: wim_info.editions,
+                    }),
+                });
+            } else {
+                return Err(pyo3::exceptions::PyValueError::new_err("Invalid or corrupted WIM/ESD file"));
+            }
+        }
     }
 
-    let metadata = std::fs::metadata(file_path)?;
-    let size_bytes = metadata.len();
-    let mut file = File::open(file_path)?;
+    // 2. FALLBACK TO ISO9660 PARSING
+    // Rewind the file back to 0 so we don't mess up our sector alignments
+    file.seek(SeekFrom::Start(0))?;
 
     let mut boot_sector = [0u8; 512];
     file.read_exact(&mut boot_sector)?;
@@ -303,14 +346,18 @@ pub fn inspect_image(path: String) -> PyResult<ImageStats> {
             is_windows_11,
             install_image_type: install_image_type.clone(),
             supports_wintogo: install_image_type == "wim" || install_image_type == "esd",
+            // Since we don't parse the internal WIM XML during a full ISO scan (for speed), 
+            // these are left empty/unknown for ISO files.
+            architecture: String::new(), 
+            editions: Vec::new(),
         })
     } else {
         None
     };
 
     Ok(ImageStats {
-        file_path: path,
-        size_bytes,
+        file_path,
+        size_bytes: total_size,
         volume_label,
         is_isohybrid,
         has_large_file, 

@@ -1,4 +1,4 @@
-import os, sys, importlib.util, tempfile
+import os, sys, importlib.util, tempfile, struct, xml.etree.ElementTree as ET
 from typing import Callable
 
 # TUI imports
@@ -233,9 +233,10 @@ def burn_image(
     return
 
 
-## --  TUI & Cross-Platform Input
 
-# --- ANSI Escape Sequences ---
+## --  TUI 
+
+# ANSI Escape Sequences 
 CLEAR_SCREEN = '\033[2J'
 CURSOR_HOME = '\033[H'
 HIDE_CURSOR = '\033[?25l'
@@ -291,104 +292,102 @@ def read_key_nonblocking() -> str:
 
 
 def draw_wizard_ui(
-    iso_name: str, 
-    drives: list, 
-    step: int, 
-    sel_drive: int, 
-    sel_mode: int, 
-    sel_verify: int, 
-    stats
+    iso_name: str, drives: list, step: int, sel_drive: int, sel_mode: int, sel_verify: int, stats,
+    base_col: int, text_col: int
 ):
     ''' Draws the sequential configuration wizard '''
+
     sys.stdout.write(CLEAR_SCREEN + CURSOR_HOME)
     
-    # --- Header ---
-    sys.stdout.write(move_cursor(2, 4) + f'{COLOR_TITLE}╔══════════════════════════════════════════════════════════╗{COLOR_RESET}')
-    sys.stdout.write(move_cursor(3, 4) + f'{COLOR_TITLE}║{COLOR_RESET}                    libiso USB Flasher                    {COLOR_TITLE}║{COLOR_RESET}')
-    sys.stdout.write(move_cursor(4, 4) + f'{COLOR_TITLE}╚══════════════════════════════════════════════════════════╝{COLOR_RESET}')
+    # Header 
+    sys.stdout.write(move_cursor(2, base_col) + f'{COLOR_TITLE}╔══════════════════════════════════════════════════════════╗{COLOR_RESET}')
+    sys.stdout.write(move_cursor(3, base_col) + f'{COLOR_TITLE}║{COLOR_RESET}                    libiso USB Flasher                    {COLOR_TITLE}║{COLOR_RESET}')
+    sys.stdout.write(move_cursor(4, base_col) + f'{COLOR_TITLE}╚══════════════════════════════════════════════════════════╝{COLOR_RESET}')
     
     size_mb = stats.size_bytes / (1024 * 1024)
     boot_str = f'{COLOR_SUCCESS}Yes{COLOR_RESET}' if stats.boot_info.is_bootable else f'{COLOR_DANGER}No{COLOR_RESET}'
     
-    sys.stdout.write(move_cursor(6, 6) + f'Source ISO : [ {iso_name} ] ({size_mb:.1f} MB)')
-    sys.stdout.write(move_cursor(7, 6) + f'Bootable   : {boot_str}')
+    sys.stdout.write(move_cursor(6, text_col) + f'Source ISO : [ {iso_name} ] ({size_mb:.1f} MB)')
+    sys.stdout.write(move_cursor(7, text_col) + f'Bootable   : {boot_str}')
     
     row = 9
     
-    # --- Step 1: Drive Selection ---
+    # Drive Selection 
     color = COLOR_TITLE if step == 0 else (COLOR_RESET if step > 0 else COLOR_DIM)
-    sys.stdout.write(move_cursor(row, 6) + f'{color}[Step 1] Select Target Device:{COLOR_RESET}')
+    sys.stdout.write(move_cursor(row, text_col) + f'{color}[Step 1] Select Target Device:{COLOR_RESET}')
     row += 1
     
     if step == 0:
         for i, drive in enumerate(drives):
             prefix = ' > ' if i == sel_drive else '   '
             item_color = COLOR_SELECT if i == sel_drive else COLOR_RESET
-            sys.stdout.write(move_cursor(row, 6) + f'{prefix}{item_color}[ {drive.display_name} ]{COLOR_RESET}')
+            sys.stdout.write(move_cursor(row, text_col) + f'{prefix}{item_color}[ {drive.display_name} ]{COLOR_RESET}')
             row += 1
     else:
-        sys.stdout.write(move_cursor(row, 6) + f'    [ {drives[sel_drive].display_name} ]')
+        sys.stdout.write(move_cursor(row, text_col) + f'    [ {drives[sel_drive].display_name} ]')
         row += 1
         
     row += 1
 
-    # --- Step 2: Mode Selection ---
+    # Mode Selection 
     modes = ['ISO - Extract files to FAT32/exFAT', 'DD - Raw sector-by-sector clone']
     color = COLOR_TITLE if step == 1 else (COLOR_RESET if step > 1 else COLOR_DIM)
-    sys.stdout.write(move_cursor(row, 6) + f'{color}[Step 2] Select Write Mode:{COLOR_RESET}')
+    sys.stdout.write(move_cursor(row, text_col) + f'{color}[Step 2] Select Write Mode:{COLOR_RESET}')
     row += 1
     
     if step == 1:
         for i, m in enumerate(modes):
             prefix = ' > ' if i == sel_mode else '   '
             item_color = COLOR_SELECT if i == sel_mode else COLOR_RESET
-            sys.stdout.write(move_cursor(row, 6) + f'{prefix}{item_color}[ {m} ]{COLOR_RESET}')
+            sys.stdout.write(move_cursor(row, text_col) + f'{prefix}{item_color}[ {m} ]{COLOR_RESET}')
             row += 1
     elif step > 1:
-        sys.stdout.write(move_cursor(row, 6) + f'    [ {modes[sel_mode]} ]')
+        sys.stdout.write(move_cursor(row, text_col) + f'    [ {modes[sel_mode]} ]')
         row += 1
         
     row += 1
 
-    # --- Step 3: Verify Selection ---
+    # Verify Selection
     verifies = ['No - Faster', 'Yes - Cryptographic byte-for-byte check']
     color = COLOR_TITLE if step == 2 else (COLOR_RESET if step > 2 else COLOR_DIM)
-    sys.stdout.write(move_cursor(row, 6) + f'{color}[Step 3] Verify Data After Write?{COLOR_RESET}')
+    sys.stdout.write(move_cursor(row, text_col) + f'{color}[Step 3] Verify Data After Write?{COLOR_RESET}')
     row += 1
     
     if step == 2:
         for i, v in enumerate(verifies):
             prefix = ' > ' if i == sel_verify else '   '
             item_color = COLOR_SELECT if i == sel_verify else COLOR_RESET
-            sys.stdout.write(move_cursor(row, 6) + f'{prefix}{item_color}[ {v} ]{COLOR_RESET}')
+            sys.stdout.write(move_cursor(row, text_col) + f'{prefix}{item_color}[ {v} ]{COLOR_RESET}')
             row += 1
     elif step > 2:
-        sys.stdout.write(move_cursor(row, 6) + f'    [ {verifies[sel_verify]} ]')
+        sys.stdout.write(move_cursor(row, text_col) + f'    [ {verifies[sel_verify]} ]')
         row += 1
         
-    row += 2
+    row += 1
 
-    # --- Step 4: Confirmation ---
+    # Confirmation Screen
     if step == 3:
-        sys.stdout.write(move_cursor(row, 6) + f'{COLOR_DANGER}╔════════════════════════════════════════════════════════╗{COLOR_RESET}')
-        sys.stdout.write(move_cursor(row+1, 6) + f'{COLOR_DANGER}║ WARNING: ALL DATA ON THE TARGET DEVICE WILL BE ERASED! ║{COLOR_RESET}')
-        sys.stdout.write(move_cursor(row+2, 6) + f'{COLOR_DANGER}╚════════════════════════════════════════════════════════╝{COLOR_RESET}')
-        sys.stdout.write(move_cursor(row+4, 6) + f'Are you absolutely sure? Type {COLOR_SUCCESS}[y]{COLOR_RESET} to start or {COLOR_WARNING}[n]{COLOR_RESET} to cancel.')
+        sys.stdout.write(move_cursor(row, text_col)   + f'{COLOR_DANGER}╔════════════════════════════════════════════════════════╗{COLOR_RESET}')
+        sys.stdout.write(move_cursor(row+1, text_col) + f'{COLOR_DANGER}║ WARNING: ALL DATA ON THE TARGET DEVICE WILL BE ERASED! ║{COLOR_RESET}')
+        sys.stdout.write(move_cursor(row+2, text_col) + f'{COLOR_DANGER}╚════════════════════════════════════════════════════════╝{COLOR_RESET}')
 
-    # --- Footer Controls ---
+    # Footer Controls 
     if step < 3:
-        sys.stdout.write(move_cursor(22, 6) + f'{COLOR_SUCCESS}[ ENTER to Continue ]{COLOR_RESET}    {COLOR_WARNING}[ q to QUIT ]{COLOR_RESET}')
+        sys.stdout.write(move_cursor(22, text_col) + f'{COLOR_SUCCESS}[ ENTER to Continue ]{COLOR_RESET}    {COLOR_WARNING}[ q to QUIT ]{COLOR_RESET}')
+    elif step == 3:
+        sys.stdout.write(move_cursor(22, text_col) + f'{COLOR_DANGER}[ y to Format and Burn ]{COLOR_RESET}    {COLOR_SUCCESS}[ n to Go Back ]{COLOR_RESET}    {COLOR_WARNING}[ q to QUIT ]{COLOR_RESET}')
+        
     sys.stdout.flush()
 
 
-def draw_progress(row: int, phase: str, written: int, total: int):
+def draw_progress(row: int, phase: str, written: int, total: int, text_col: int):
 
     width = 40
     percent = (written / total) if total > 0 else 0
     filled_chars = int(width * percent)
     
     bar = '█' * filled_chars + '░' * (width - filled_chars)
-    sys.stdout.write(move_cursor(row, 6) + f'\033[K{COLOR_WARNING}{phase:<15}:{COLOR_RESET} {COLOR_BAR}|{bar}|{COLOR_RESET} {percent*100:5.1f}%')
+    sys.stdout.write(move_cursor(row, text_col) + f'\033[K{COLOR_WARNING}{phase:<15}:{COLOR_RESET} {COLOR_BAR}|{bar}|{COLOR_RESET} {percent*100:5.1f}%')
     sys.stdout.flush()
 
 
@@ -426,7 +425,7 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
         ui_queue.put(('ERROR', str(e)))
 
 
-def tui_loop(iso_path: str):
+def tui_loop(iso_path: str, pre_mode: str = None, pre_verify: bool = None):
 
     try:
         stats = _libiso.inspect_image(iso_path)
@@ -444,71 +443,87 @@ def tui_loop(iso_path: str):
         old_settings = termios.tcgetattr(fd)
         tty.setraw(fd)
     
-    # State machine variables
-    step = 0  # 0: Drive, 1: Mode, 2: Verify, 3: Confirm, 4: Burning
+    # Dynamic Wizard sequence
+    # 0: Drive, 1: Mode, 2: Verify, 3: Confirm, 4: Burning
+    step_sequence = [0]
+    if pre_mode is None: step_sequence.append(1)
+    if pre_verify is None: step_sequence.append(2)
+    step_sequence.append(3) # Always show confirmation
+    
+    seq_idx = 0
+    step = step_sequence[seq_idx]
+    
     sel_drive = 0
-    sel_mode = 0
-    sel_verify = 0
+    # Pre-fill selections if provided via CLI
+    sel_mode = 1 if pre_mode == 'DD' else 0
+    sel_verify = 1 if pre_verify else 0
     
     ui_queue = queue.Queue()
+    is_burning = False
     current_phase = 'Waiting'
     
     try:
         sys.stdout.write(HIDE_CURSOR)
-        draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats)
         
         while True:
-            # Process backend messages if burning
+            # calculate the center of the terminal for every frame
+            cols, _ = os.get_terminal_size()
+            base_col = max(1, (cols - 60) // 2)
+            text_col = base_col + 2
+
+            # Redraw the UI if we aren't burning
+            if not is_burning:
+                draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats, base_col, text_col)
+
             while not ui_queue.empty():
                 msg = ui_queue.get()
-                progress_row = 20 # Fixed row for progress bar during burn
+                progress_row = 20 
                 if msg[0] == 'PHASE':
                     current_phase = msg[1]
                 elif msg[0] == 'PROGRESS':
-                    draw_progress(progress_row, current_phase, msg[1], msg[2])
+                    draw_progress(progress_row, current_phase, msg[1], msg[2], text_col)
                 elif msg[0] == 'DONE':
-                    step = 5 # Done
-                    sys.stdout.write(move_cursor(progress_row + 2, 6) + f'\033[K{COLOR_SUCCESS}Success: {msg[1]}{COLOR_RESET}')
+                    step = 5 
+                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_SUCCESS}Success: {msg[1]}{COLOR_RESET}')
                     sys.stdout.flush()
                 elif msg[0] == 'ERROR':
-                    step = 5 # Done (Error)
-                    sys.stdout.write(move_cursor(progress_row + 2, 6) + f'\033[K{COLOR_DANGER}Error: {msg[1]}{COLOR_RESET}')
+                    step = 5 
+                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_DANGER}Error: {msg[1]}{COLOR_RESET}')
                     sys.stdout.flush()
 
-            # Handle Input
             key = read_key_nonblocking()
             if key == 'QUIT':
                 break
             
-            if step < 4: # If not burning yet
+            if not is_burning and step < 4:
                 if key == 'UP':
                     if step == 0: sel_drive = max(0, sel_drive - 1)
                     elif step == 1: sel_mode = max(0, sel_mode - 1)
                     elif step == 2: sel_verify = max(0, sel_verify - 1)
-                    draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats)
                 
                 elif key == 'DOWN':
                     if step == 0: sel_drive = min(len(drives) - 1, sel_drive + 1)
                     elif step == 1: sel_mode = min(1, sel_mode + 1)
                     elif step == 2: sel_verify = min(1, sel_verify + 1)
-                    draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats)
                 
                 elif key == 'ENTER' and step < 3:
-                    step += 1
-                    draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats)
+                    seq_idx += 1
+                    step = step_sequence[seq_idx]
                 
                 elif step == 3: # Confirmation Step
                     if key == 'CONFIRM_NO':
-                        step = 0 # Reset to beginning
-                        draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats)
+                        seq_idx = 0 
+                        step = step_sequence[seq_idx]
+                    
                     elif key == 'CONFIRM_YES':
-                        step = 4 # Burning State
+                        is_burning = True # Stop the wizard from redrawing and clear the lower half
+                        step = 4 
                         target_device = drives[sel_drive].device_path
-                        mode_str = 'ISO' if sel_mode == 0 else 'DD'
+                        mode_str = 'DD' if sel_mode == 1 else 'ISO'
                         verify_bool = sel_verify == 1
                         
-                        sys.stdout.write(move_cursor(18, 6) + '\033[0J') # Clear confirmation prompt
-                        sys.stdout.write(move_cursor(20, 6) + f'{COLOR_TITLE}Starting deployment...{COLOR_RESET}')
+                        sys.stdout.write(move_cursor(18, text_col) + '\033[0J') 
+                        sys.stdout.write(move_cursor(20, text_col) + f'{COLOR_TITLE}Starting deployment...{COLOR_RESET}')
                         sys.stdout.flush()
                         
                         threading.Thread(
@@ -533,10 +548,15 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='libiso - Cross-platform USB image flasher')
     parser.add_argument('iso_path', type=str, help='Path to the source ISO file')
+    parser.add_argument('--mode', type=str, choices=['iso', 'ISO', 'dd', 'DD'], default=None, help='Write method (ISO extraction or Raw DD)')
+    # We use a custom flag for verify to support a tri-state (True, False, or None if omitted)
+    parser.add_argument('--verify', action='store_true', default=None, help='Enable verification')
+    parser.add_argument('--no-verify', dest='verify', action='store_false', help='Disable verification')
+
     args = parser.parse_args()
 
     if not os.path.exists(args.iso_path):
         print(f'''Error: ISO file not found at '{args.iso_path}' ''')
         sys.exit(1)
 
-    tui_loop(args.iso_path)
+    tui_loop(args.iso_path, args.mode, args.verify)

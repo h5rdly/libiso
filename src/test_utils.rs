@@ -213,3 +213,66 @@ pub fn test_verify_fake_drive_sync(mut drive: PyRefMut<'_, FakeDrive>) -> PyResu
     crate::verify::verify_hardware_capacity(&mut *drive, fake_cap, &tx, |_| Ok(()))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
+
+
+#[pyfunction]
+pub fn create_mock_esd() -> PyResult<Vec<u8>> {
+    let mut wim = vec![0u8; 152]; // 152-byte WIM Header
+    
+    // Signature
+    wim[0..8].copy_from_slice(b"MSWIM\x00\x00\x00");
+    // Header Size
+    wim[8..12].copy_from_slice(&152u32.to_le_bytes()); 
+    // Image Count
+    wim[44..48].copy_from_slice(&1u32.to_le_bytes()); 
+
+    // Build the XML Payload (UTF-16LE with BOM)
+    let xml_str = r#"<WIM>
+        <IMAGE INDEX="1">
+            <TOTALBYTES>987654321</TOTALBYTES>
+            <WINDOWS><ARCH>9</ARCH></WINDOWS>
+            <DISPLAYNAME>Windows 11 Pro</DISPLAYNAME>
+        </IMAGE>
+    </WIM>"#;
+    
+    let mut xml_data = vec![0xFF, 0xFE]; // BOM
+    for c in xml_str.encode_utf16() {
+        xml_data.extend_from_slice(&c.to_le_bytes());
+    }
+
+    let xml_size = xml_data.len() as u64;
+    let xml_offset = 1024u64; // Place XML at byte 1024
+    
+    // Inject XML Resource Header (Offset 72)
+    let mut xml_res = [0u8; 24];
+    // Write 7-byte size
+    xml_res[0..7].copy_from_slice(&xml_size.to_le_bytes()[0..7]);
+    xml_res[7] = 0x02; // Flags (Metadata)
+    // Write 8-byte offset
+    xml_res[8..16].copy_from_slice(&xml_offset.to_le_bytes());
+    wim[72..96].copy_from_slice(&xml_res);
+
+    // Solid Resource Header (Appended right after the 152-byte header) 
+    let solid_uncompressed_size = 65536u64;
+    let comp_format = 3u32; // 3 = LZMS
+    let solid_chunk_size = 32768u32;
+    
+    wim.extend_from_slice(&solid_uncompressed_size.to_le_bytes());
+    wim.extend_from_slice(&comp_format.to_le_bytes());
+    wim.extend_from_slice(&solid_chunk_size.to_le_bytes());
+
+    // Chunk offsets (2 chunks, 100 bytes each)
+    wim.extend_from_slice(&100u64.to_le_bytes());
+    wim.extend_from_slice(&200u64.to_le_bytes());
+
+    // Dummy compressed LZMS data (garbage bytes)
+    wim.extend(vec![0x42; 200]); 
+
+    // Pad with zeros up to the XML offset, then append the XML
+    if wim.len() < xml_offset as usize {
+        wim.resize(xml_offset as usize, 0);
+    }
+    wim.extend(xml_data);
+
+    Ok(wim)
+}

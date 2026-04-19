@@ -2,6 +2,7 @@
 name = "libiso"
 version = "0.0.8"
 edition = "2024"
+rust-version = "1.95"
 
 [lib]
 name = "_libiso"
