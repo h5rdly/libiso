@@ -15,15 +15,21 @@ sysinfo = "0.38.1"
 hadris-iso = "1.1.2"
 hadris-fat = {version = "1.1.2", features = ["exfat"]} 
 hadris-part = "1.1.2"
+arcbox-ext4 = "0.1.1"   # https://github.com/arcboxlabs/ext4-rs
+fatfs = { features = ["lfn", "std", "alloc"], git = "https://github.com/rafalh/rust-fatfs.git"}
 
 kanal = "0.1.1"
+
 pelite = "0.10.0"
 cms = "0.2.3"
 der = { version = "0.7", features = ["alloc", "derive"] } 
+
 sha1 = "0.11"
 sha2 = "0.11"
 
-arcbox-ext4 = "0.1.1"   # https://github.com/arcboxlabs/ext4-rs
+edera-sprout-parsing = {git = "https://github.com/edera-dev/sprout.git", version = "0.0.28" } 
+
+log = "0.4.1"
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 

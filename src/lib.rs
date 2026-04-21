@@ -11,12 +11,12 @@ mod verify;
 mod esd;
 mod lzms;
 mod lzms_arrays;
-
+mod bootloader;
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};
 use test_utils::{create_mock_iso, FakeDrive, test_verify_fake_drive_sync, create_mock_esd};
-use writer::{write_image_dd, write_image_iso};
+use writer::{write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition};
 use verify::{destructive_verify_usb_size};
 
 
@@ -33,6 +33,8 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(destructive_verify_usb_size, m)?)?; 
     
     // Writing
+    m.add_function(wrap_pyfunction!(inspect_usb_partition, m)?)?; 
+    m.add_function(wrap_pyfunction!(format_usb_drive, m)?)?; 
     m.add_function(wrap_pyfunction!(write_image_dd, m)?)?; 
     m.add_function(wrap_pyfunction!(write_image_iso, m)?)?; 
 
@@ -43,7 +45,6 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_mock_esd, m)?)?; 
 
     // Windows .esd file parsing
-    m.add_function(wrap_pyfunction!(lzms::decompress_esd_block, m)?)?;
     m.add_class::<esd::WimFileEntry>()?;
     m.add_class::<esd::EsdArchive>()?;
 

@@ -98,6 +98,14 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
 
         let hw_name = disk.name().to_string_lossy().into_owned();
         let device_path = disk.mount_point().to_string_lossy().into_owned();
+        #[cfg(target_os = "windows")]
+        {
+            // Convert "D:\" to "\\.\D:" for raw device access
+            if device_path.ends_with('\\') || device_path.ends_with('/') {
+                device_path.pop(); 
+            }
+            device_path = format!("\\\\.\\{}", device_path);
+        }
         
         let total_space_bytes = disk.total_space();
         let size_gb = total_space_bytes / (1024 * 1024 * 1024);

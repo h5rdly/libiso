@@ -1,6 +1,3 @@
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-
 use crate::lzms_arrays::{
     LZMS_LENGTH_SLOT_BASE, LZMS_EXTRA_LENGTH_BITS, LZMS_OFFSET_SLOT_BASE, LZMS_EXTRA_OFFSET_BITS,
 };
@@ -894,28 +891,3 @@ pub fn lzms_x86_filter(data: &mut [u8], last_target_usages: &mut [i32; 65536], u
 }
 
 
-// --  PY03 bindings
-
-
-#[pyfunction]
-#[pyo3(signature = (compressed_data, uncompressed_size))]
-pub fn decompress_esd_block<'py>(
-    py: Python<'py>, compressed_data: &[u8], uncompressed_size: usize
-) -> PyResult<Bound<'py, PyBytes>> {
-    
-    // new_with() allocates the memory internally in Python 
-    // gives a safe, mutable Rust slice
-    PyBytes::new_with(py, uncompressed_size, |out_slice| {
-        
-        let mut decompressor = LzmsDecompressor::new(compressed_data)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Invalid or truncated LZMS block"))?;
-            
-        decompressor.decompress_block(out_slice)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-            
-        let mut last_target_usages = Box::new([0i32; 65536]);
-        lzms_x86_filter(out_slice, &mut last_target_usages, true);
-            
-        Ok(())
-    })
-}
