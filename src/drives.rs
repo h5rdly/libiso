@@ -97,7 +97,7 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
         }
 
         let hw_name = disk.name().to_string_lossy().into_owned();
-        let device_path = disk.mount_point().to_string_lossy().into_owned();
+        let mut device_path = disk.mount_point().to_string_lossy().into_owned();
         #[cfg(target_os = "windows")]
         {
             // Convert "D:\" to "\\.\D:" for raw device access
