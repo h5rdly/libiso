@@ -231,7 +231,10 @@ def write_image_iso(
     usb_label: str,
     partition_scheme: str = 'gpt',
     uefi_ntfs_path: str = None,
-    persistence_size_mb: int = None
+    persistence_size_mb: int = None,
+    verify_written: bool = False,
+    unattend_xml_payload: str = None,
+    target_arch: str = None
 ):
     ''' To avoid using the tempfile crate, which pulls windows-sys, we use a Python wrapper 
         and utilize it's built in tempfile
@@ -245,7 +248,9 @@ def write_image_iso(
 
     try:
         return _libiso.write_image_iso(
-            image_path, device_path, has_large_file, usb_label, partition_scheme, uefi_ntfs_path, persistence_size_mb, ext4_temp_path
+            image_path, device_path, has_large_file, usb_label, 
+            partition_scheme, uefi_ntfs_path, persistence_size_mb, 
+            ext4_temp_path, verify_written, unattend_xml_payload, target_arch
         )
     finally:
         if ext4_temp_path and os.path.exists(ext4_temp_path):
@@ -494,9 +499,20 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
             partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
             uefi_path = ensure_uefi_bridge() if has_large_file else None
             
-            stream = _libiso.write_image_iso(
-                iso_path, device_path, has_large_file, 
-                partition_scheme, uefi_path, None, None, verify
+            # Extract the label so the TUI also gets the pretty USB name
+            iso_label = extract_iso_label(iso_path)
+            short_usb_label = iso_label[:11].replace(' ', '_').upper()
+            
+            # Call the Python wrapper instead of the raw _libiso module
+            stream = write_image_iso(
+                iso_path, 
+                device_path, 
+                has_large_file, 
+                short_usb_label,
+                partition_scheme, 
+                uefi_path, 
+                persistence_size_mb=None, 
+                verify_written=verify
             )
         
         for written, total in stream:
