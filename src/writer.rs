@@ -366,11 +366,12 @@ pub fn write_image_dd(
 
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, unattend_xml_payload=None, target_arch=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, usb_label, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, unattend_xml_payload=None, target_arch=None))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
     has_large_file: bool,
+    usb_label: &str,
     partition_scheme: Option<String>, 
     uefi_ntfs_path: Option<String>,
     persistence_size_mb: Option<u64>, 
@@ -528,7 +529,7 @@ pub fn write_image_iso(
         size: partition_size_bytes,
     };
 
-    format_partition(&mut wrapped_partition, has_large_file, "LIBISO_USB", start_lba)
+    format_partition(&mut wrapped_partition, has_large_file, usb_label, start_lba)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     
     let iso_path_clone = image_path.clone();

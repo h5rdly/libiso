@@ -54,6 +54,7 @@ class TestWriterIso(unittest.TestCase):
             self.source_path, 
             self.dest_path, 
             True,  # has_large_file - Force exFAT
+            'TEST LABEL',
             'GPT',
             uefi_ntfs_path=uefi_path
         )

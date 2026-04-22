@@ -128,13 +128,40 @@ pub const TRUSTED_MS_CA_THUMBPRINTS: &[&str] = &[
     print(f'Extracted {len(sorted_hashes)} flat hashes to {output_path}')
 
 
+def extract_iso_label(iso_path: str) -> str:
+    ''' 
+    Extracts the Volume Identifier directly from an ISO 9660 image's 
+    Primary Volume Descriptor (PVD).
+    '''
+
+    try:
+        with open(iso_path, 'rb') as f:
+            # ISO 9660 Volume Descriptors start at Sector 16 (16 * 2048 bytes)
+            f.seek(16 * 2048)
+            pvd = f.read(2048)
+            
+            # Check if it's a valid PVD: Type must be 1, ID must be 'CD001'
+            if pvd[0] == 1 and pvd[1:6] == b'CD001':
+                # The Volume Identifier is 32 bytes long, starting at offset 40
+                raw_label = pvd[40:72]
+                
+                # Decode and strip trailing spaces and null bytes
+                label = raw_label.decode('utf-8', errors='ignore').rstrip('\x00 ')
+                if label:
+                    return label
+    except Exception as e:
+        print(f'Warning: Failed to extract ISO label: {e}')
+        
+    return 'LIBISO_USB' # Fallback
+
+
 def _check_gpt_corruption(device_path):
     ''' Aux diagnostic function '''
     
     import zlib
 
     if not os.path.exists(device_path):
-        print(f"Cannot find {device_path}")
+        print(f'Cannot find {device_path}')
         return
 
     with open(device_path, 'rb') as f:
@@ -143,43 +170,43 @@ def _check_gpt_corruption(device_path):
         gpt_hdr = f.read(512)
         sig = gpt_hdr[:8]
         
-        print("\n--- PRIMARY GPT (LBA 1) ---")
+        print('\n--- PRIMARY GPT (LBA 1) ---')
         if sig != b'EFI PART':
-            print(f"[!] Signature Missing! Found: {sig.hex()}")
+            print(f'[!] Signature Missing! Found: {sig.hex()}')
         else:
-            print("[+] Signature 'EFI PART' Found")
+            print('''[+] Signature 'EFI PART' Found''')
             # Unpack the 92-byte header
             rev, hdr_size, crc, _, cur_lba, backup_lba, first_usable, last_usable, guid, part_start, num_parts, part_size, part_crc = struct.unpack('<IIIIQQQQ16sQIII', gpt_hdr[8:92])
             
-            print(f"    Current LBA: {cur_lba}")
-            print(f"    Backup LBA:  {backup_lba}")
-            print(f"    Header CRC:  {hex(crc)}")
+            print(f'    Current LBA: {cur_lba}')
+            print(f'    Backup LBA:  {backup_lba}')
+            print(f'    Header CRC:  {hex(crc)}')
             
             # To verify the CRC, we must zero out the 4-byte CRC field (bytes 16-19)
             zeroed_hdr = gpt_hdr[:16] + b'\x00\x00\x00\x00' + gpt_hdr[20:hdr_size]
             actual_crc = zlib.crc32(zeroed_hdr) & 0xFFFFFFFF
-            print(f"    Expected CRC: {hex(actual_crc)}")
+            print(f'    Expected CRC: {hex(actual_crc)}')
             
             if crc != actual_crc:
-                print("    [!] FATAL: CRC Mismatch! Bad CRC's")
+                print('''    [!] FATAL: CRC Mismatch! Bad CRC's''')
             elif crc == 0:
-                print("    [!] FATAL: CRC is 0x0! CRC calculation wasn't made")
+                print('''    [!] FATAL: CRC is 0x0! CRC calculation wasn't made''')
             else:
-                print("    [+] CRC Matches!")
+                print('    [+] CRC Matches!')
 
         # Check Backup GPT Header (Last LBA)
         f.seek(0, os.SEEK_END)
         total_sectors = f.tell() // 512
         backup_offset = (total_sectors - 1) * 512
         
-        print(f"\n--- BACKUP GPT (LBA {total_sectors - 1}) ---")
+        print(f'\n--- BACKUP GPT (LBA {total_sectors - 1}) ---')
         f.seek(backup_offset)
         backup_hdr = f.read(512)
         
         if backup_hdr[:8] != b'EFI PART':
-            print(f"[!] Backup Signature Missing! The Rust crate wrote it to the wrong place.")
+            print(f'[!] Backup Signature Missing! The Rust crate wrote it to the wrong place.')
         else:
-            print(f"[+] Backup Signature Found!")
+            print(f'[+] Backup Signature Found!')
 
 
 
@@ -201,6 +228,7 @@ def write_image_iso(
     image_path: str,
     device_path: str,
     has_large_file: bool,
+    usb_label: str,
     partition_scheme: str = 'gpt',
     uefi_ntfs_path: str = None,
     persistence_size_mb: int = None
@@ -217,7 +245,7 @@ def write_image_iso(
 
     try:
         return _libiso.write_image_iso(
-            image_path, device_path, has_large_file, partition_scheme, uefi_ntfs_path, persistence_size_mb, ext4_temp_path
+            image_path, device_path, has_large_file, usb_label, partition_scheme, uefi_ntfs_path, persistence_size_mb, ext4_temp_path
         )
     finally:
         if ext4_temp_path and os.path.exists(ext4_temp_path):
@@ -239,6 +267,10 @@ def burn_image(
 
     if (method := method.upper()) not in ('ISO', 'DD'):
         raise ValueError(f'Unknown method: {method}. Use iso or dd')
+
+    iso_label = extract_iso_label(image_path)
+    short_usb_label = iso_label[:11].replace(' ', '_').upper()
+    print(f"Detected ISO Label: '{iso_label}' -> Formatting USB as: '{short_usb_label}'")
 
     if method == 'DD':
         print(f'Starting raw DD write from {image_path} to {device_path}...')
@@ -275,7 +307,8 @@ def burn_image(
         stream = write_image_iso(
             image_path, 
             device_path, 
-            has_large_file, 
+            has_large_file,
+            short_usb_label,
             partition_scheme, 
             uefi_path, 
             persistence_size_mb
