@@ -18,6 +18,7 @@ pub fn verify_file_chunks(
     mut iso_file: impl Read,
     mut usb_file: impl Read,
     file_size: u64,
+    file_name: &str,
     tx: &kanal::Sender<Result<(u64, u64), String>>,
     verified_bytes: &mut u64,
     total_size: u64,
@@ -31,11 +32,24 @@ pub fn verify_file_chunks(
     while read_so_far < file_size {
         let to_read = std::cmp::min(chunk_size as u64, file_size - read_so_far) as usize;
         
-        iso_file.read_exact(&mut buf_iso[..to_read]).map_err(|e| format!("ISO read error: {}", e))?;
-        usb_file.read_exact(&mut buf_usb[..to_read]).map_err(|e| format!("USB read error: {:?}", e))?;
+        iso_file.read_exact(&mut buf_iso[..to_read]).map_err(|e| format!("ISO read error in '{}': {}", file_name, e))?;
+        usb_file.read_exact(&mut buf_usb[..to_read]).map_err(|e| format!("USB read error in '{}': {:?}", file_name, e))?;
 
         if buf_iso[..to_read] != buf_usb[..to_read] {
-            return Err("Data corruption detected! File contents do not match.".to_string());
+            // Find the exact byte where it diverged for ultimate debugging!
+            let mut mismatch_idx = 0;
+            for i in 0..to_read {
+                if buf_iso[i] != buf_usb[i] {
+                    mismatch_idx = i;
+                    break;
+                }
+            }
+            
+            let abs_offset = read_so_far + mismatch_idx as u64;
+            return Err(format!(
+                "Corruption in '{}'! Mismatch at byte offset {}. ISO byte: {:#04X}, USB byte: {:#04X}", 
+                file_name, abs_offset, buf_iso[mismatch_idx], buf_usb[mismatch_idx]
+            ));
         }
 
         read_so_far += to_read as u64;
@@ -47,6 +61,7 @@ pub fn verify_file_chunks(
     }
     Ok(())
 }
+
 
 pub fn verify_recursive<T, U, TP, OCC>(
     usb_fs: &FileSystem<U, TP, OCC>,
@@ -76,12 +91,20 @@ where
             let sub_ref = entry.as_dir_ref(iso_img).map_err(|e| format!("Dir ref err: {}", e))?;
             verify_recursive(usb_fs, iso_img, sub_ref, &mut usb_subdir, tx, verified, total_size)?;
         } else {
+            if matches!(
+                clean_name.to_lowercase().as_str(),
+                "bootx64.efi" | "bootaa64.efi" | "sprout.toml" | "autounattend.xml"
+            ) {
+                // Skip verification for files we intentionally altered/injected
+                *verified += entry.total_size() as u64; // Artificially advance the progress bar
+                let _ = tx.send(Ok((*verified, total_size))); // Advance the progress bar
+                continue;
+            }
+
             let iso_data = iso_img.read_file(&entry).map_err(|e| format!("Failed to read ISO file '{}': {}", clean_name, e))?;
             let usb_file = usb_dir.open_file(&clean_name).map_err(|e| format!("Missing USB file '{}': {:?}", clean_name, e))?;
             
-            // Look ma, no wrappers! usb_file natively implements std::io::Read now!
-            verify_file_chunks(&iso_data[..], usb_file, entry.total_size(), tx, verified, total_size)?;
-        }
+            verify_file_chunks(&iso_data[..], usb_file, entry.total_size(), &clean_name, tx, verified, total_size)?;        }
     }
     Ok(())
 }
@@ -112,6 +135,15 @@ where
             let sub_ref = entry.as_dir_ref(iso_img).map_err(|e| format!("Dir ref err: {}", e))?;
             verify_recursive_exfat(usb_fs, iso_img, sub_ref, &usb_subdir, tx, verified, total_size)?;
         } else {
+            if matches!(
+                clean_name.to_lowercase().as_str(),
+                "bootx64.efi" | "bootaa64.efi" | "sprout.toml" | "autounattend.xml"
+            ) {
+                // Skip verification for files we intentionally altered/injected
+                *verified += entry.total_size() as u64; // Artificially advance the progress bar
+                let _ = tx.send(Ok((*verified, total_size))); // Advance the progress bar
+                continue;
+            }
             let iso_data = iso_img.read_file(&entry).map_err(|e| format!("Failed to read ISO file '{}': {}", clean_name, e))?;
             
             let usb_entry_opt = usb_dir.find(&clean_name).map_err(|e| format!("USB find err: {:?}", e))?;
@@ -119,7 +151,7 @@ where
             
             let usb_file = ExFatFileReader::new(usb_fs, &usb_entry).map_err(|e| format!("Failed to open USB file: {:?}", e))?;
             
-            verify_file_chunks(&iso_data[..], usb_file, entry.total_size(), tx, verified, total_size)?;
+            verify_file_chunks(&iso_data[..], usb_file, entry.total_size(), &clean_name, tx, verified, total_size)?;
         }
     }
     Ok(())

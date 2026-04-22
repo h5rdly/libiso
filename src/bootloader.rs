@@ -55,6 +55,11 @@ pub fn detect_linux_payloads(
 ) {
     let lower_name = filename.to_lowercase();
     
+    // Blacklist utility payloads / aux kernels so they don't overwrite the real OS kernel
+    if lower_name.contains("memtest") || lower_name.contains("rescue") {
+        return;
+    }
+
     // If we haven't found a kernel yet, check if this file is one
     if found_kernel.is_none() {
         if match_kernel_prefix(&lower_name, LINUX_KERNEL_PREFIXES).is_some() {
@@ -68,6 +73,41 @@ pub fn detect_linux_payloads(
         for prefix in LINUX_INITRAMFS_PREFIXES {
             if lower_name.starts_with(prefix) {
                 *found_initrd = Some(format!("{}/{}", current_path, filename));
+                return;
+            }
+        }
+    }
+}
+
+
+// Scrapes GRUB or Syslinux configuration text to find default boot arguments
+pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>) {
+    
+    if found_args.is_some() {
+        return; 
+    }
+
+    for line in config_content.lines() {
+        let trimmed = line.trim();
+        
+        // Match GRUB style: "linux /casper/vmlinuz boot=casper quiet splash"
+        if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() > 2 {
+                // Skip the "linux" command and the "/path/to/kernel"
+                *found_args = Some(parts[2..].join(" "));
+                return;
+            }
+        } 
+        // Match Syslinux style: "APPEND boot=casper initrd=/casper/initrd.lz quiet splash"
+        else if trimmed.starts_with("APPEND ") || trimmed.starts_with("append ") {
+            let parts: Vec<&str> = trimmed.split_whitespace()
+                .skip(1) // Skip the "APPEND" command
+                .filter(|p| !p.starts_with("initrd=")) // Strip out initrd mapping, Sprout handles this!
+                .collect();
+                
+            if !parts.is_empty() {
+                *found_args = Some(parts.join(" "));
                 return;
             }
         }

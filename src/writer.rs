@@ -119,6 +119,7 @@ fn copy_recursive<T, TP, OCC>(
     current_path: &str,                 
     found_kernel: &mut Option<String>,  
     found_initrd: &mut Option<String>,  
+    found_args: &mut Option<String>, 
 ) -> Result<(), Box<dyn std::error::Error>> 
 where 
     T: ReadWriteSeek<Error = std::io::Error>,
@@ -145,7 +146,7 @@ where
             let sub_usb_dir = usb_dir.create_dir(&clean_name)?; 
             let sub_iso_ref = entry.as_dir_ref(iso)?;
             // Pass the trackers down
-            copy_recursive(iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_size, &new_path, found_kernel, found_initrd)?;        
+            copy_recursive(iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_size, &new_path, found_kernel, found_initrd, found_args)?;        
         } else {
             let mut writer = usb_dir.create_file(&clean_name)?;
             writer.truncate()?;
@@ -153,6 +154,17 @@ where
             // Look for the kernel as we extract!
             bootloader::detect_linux_payloads(&clean_name, current_path, found_kernel, found_initrd);
             
+            // Intercept config files and scrape them
+            let lower_name = clean_name.to_lowercase();
+            if lower_name == "grub.cfg" || lower_name == "syslinux.cfg" || lower_name == "isolinux.cfg" {
+                // Read the whole config file into memory since it's tiny
+                if let Ok(cfg_bytes) = iso.read_file(&entry) {
+                    if let Ok(cfg_str) = std::str::from_utf8(&cfg_bytes) {
+                        bootloader::scrape_boot_args(cfg_str, found_args);
+                    }
+                }
+            }
+
             for extent in entry.extents() {
                 let mut extent_offset = 0u64;
                 let extent_len = extent.length as u64;
@@ -613,7 +625,9 @@ pub fn write_image_iso(
                 let usb_verify_root = exfat_fs.root_dir();
                 if let Err(e) = verify::verify_recursive_exfat(&exfat_fs, &iso_img, iso_verify_root.dir_ref(), &usb_verify_root, &tx, &mut verified, total_size) {
                     let _ = tx.send(Err(format!("Verification error: {}", e)));
+                    return;
                 }
+                let _ = tx.send(Ok((total_size, total_size))); // Bump verification progress to 100%
             }
         });
     } else {
@@ -651,8 +665,9 @@ pub fn write_image_iso(
             // Trackers for our Bootloader to find the Linux payload
             let mut found_kernel = None;
             let mut found_initrd = None;
-            
-            if let Err(e) = copy_recursive(&iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size, "", &mut found_kernel, &mut found_initrd) {
+            let mut found_args = None;
+
+            if let Err(e) = copy_recursive(&iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size, "", &mut found_kernel, &mut found_initrd, &mut found_args) {
                 let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
                 return; 
             }
@@ -669,7 +684,7 @@ pub fn write_image_iso(
                     &usb_root, 
                     found_kernel.as_deref(), 
                     found_initrd.as_deref(), 
-                    Some("root=live:CDLABEL=LIBISO_USB ro quiet splash") // Optional boot args
+                    found_args.as_deref(),
                 ) {
                     let _ = tx.send(Err(format!("Sprout config failed: {:?}", e)));
                     return;
@@ -694,7 +709,9 @@ pub fn write_image_iso(
                 let mut usb_verify_root = usb_fs.root_dir();
                 if let Err(e) = verify::verify_recursive(&usb_fs, &iso_img, iso_verify_root.dir_ref(), &mut usb_verify_root, &tx, &mut verified, total_size) {
                     let _ = tx.send(Err(format!("Verification error: {}", e)));
+                    return;
                 }
+                let _ = tx.send(Ok((total_size, total_size))); // Bump verification progress to 100%
             }
         });
     }
@@ -802,6 +819,67 @@ pub fn format_usb_drive(device_path: String, fs_type: Option<String>, volume_lab
 
 
 
+// Recursive helper for FAT32
+fn inspect_fat32_recursive<IO: fatfs::ReadWriteSeek, TP: fatfs::TimeProvider, OCC: fatfs::OemCpConverter>(
+    dir: &fatfs::Dir<'_, IO, TP, OCC>,
+    current_path: &str,
+    found_files: &mut Vec<String>,
+) {
+    for entry_res in dir.iter() {
+        if let Ok(entry) = entry_res {
+            let short = entry.short_file_name();
+            // Skip self and parent directory pointers
+            if short == "." || short == ".." { continue; }
+
+            // Get the long name if available, fallback to short
+            let long = entry.file_name();
+            
+            let name = if long.is_empty() { short.clone() } else { long };
+            let full_path = if current_path.is_empty() { name.clone() } else { format!("{}/{}", current_path, name) };
+
+            if entry.is_dir() {
+                found_files.push(format!("[DIR ] {}", full_path));
+                // Recurse into the sub-directory!
+                if let Ok(sub_dir) = dir.open_dir(&name) {
+                    inspect_fat32_recursive(&sub_dir, &full_path, found_files);
+                }
+            } else {
+                // Grab the exact file size
+                found_files.push(format!("[FILE] {} ({} bytes)", full_path, entry.len()));
+            }
+        }
+    }
+}
+
+
+// Recursive helper for exFAT
+fn inspect_exfat_recursive<U: std::io::Read + std::io::Write + std::io::Seek>(
+    dir: &hadris_fat::exfat::ExFatDir<'_, U>,
+    current_path: &str,
+    found_files: &mut Vec<String>,
+) {
+
+    for entry_res in dir.entries() {
+        // The individual entries being read from disk can still fail, so we keep this Ok() check
+        if let Ok(entry) = entry_res {
+            let name = entry.name.clone();
+            if name == "." || name == ".." || name.is_empty() { continue; }
+            
+            let full_path = if current_path.is_empty() { name.clone() } else { format!("{}/{}", current_path, name) };
+            
+            if entry.is_directory() {
+                found_files.push(format!("[exFAT DIR ] {}", full_path));
+                if let Ok(sub_dir) = dir.open_dir(&name) {
+                    inspect_exfat_recursive(&sub_dir, &full_path, found_files);
+                }
+            } else {
+                found_files.push(format!("[exFAT FILE] {}", full_path));
+            }
+        }
+    }
+}
+
+
 #[pyfunction]
 #[pyo3(signature = (device_path))]
 pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
@@ -832,33 +910,13 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
         let fs = ExFatFs::open(wrapped_partition).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount exFAT: {:?}", e))
         })?;
-        let root = fs.root_dir();
-        
-        for entry_res in root.entries() {
-            if let Ok(entry) = entry_res {
-                found_files.push(format!("[exFAT] {}", entry.name));
-            }
-        }
+        inspect_exfat_recursive(&fs.root_dir(), "", &mut found_files);
     } else {
-        // Wrap the partition for fatfs
         let fatfs_partition = fatfs::StdIoWrapper::new(wrapped_partition);
-        
         let fs = FileSystem::new(fatfs_partition, FsOptions::new()).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount FAT32: {:?}", e))
         })?;
-        let root = fs.root_dir();
-        
-        for entry_res in root.iter() {
-            if let Ok(entry) = entry_res {
-                let is_dir = if entry.is_dir() { "DIR " } else { "FILE" };
-                let short = entry.short_file_name();
-                let long = entry.file_name();
-                found_files.push(format!(
-                    "[{}] Short: '{}' | Long: '{}'", 
-                    is_dir, short.trim(), long
-                ));
-            }
-        }
+        inspect_fat32_recursive(&fs.root_dir(), "", &mut found_files);
     }
 
     Ok(found_files)
