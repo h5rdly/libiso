@@ -14,7 +14,7 @@ sysinfo = "0.38.1"
 
 hadris-iso = "1.1.2"
 hadris-fat = {version = "1.1.2", features = ["exfat"]} 
-hadris-part = "1.1.2"
+hadris-part = { version = "1.1.2", features = ["crc"] }
 arcbox-ext4 = "0.1.1"   # https://github.com/arcboxlabs/ext4-rs
 fatfs = { features = ["lfn", "std", "alloc"], git = "https://github.com/rafalh/rust-fatfs.git"}
 
