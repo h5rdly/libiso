@@ -295,23 +295,32 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
 }
 
 
+
 #[cfg(target_os = "linux")]
 pub fn trigger_os_reread(file: &std::fs::File) {
 
     use std::os::unix::io::AsRawFd;
-
+    use std::thread;
+    use std::time::Duration;
+    
     unsafe extern "C" {
         fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
     }
-    const BLKRRPART: std::ffi::c_ulong = 0x1259;
     
+    const BLKRRPART: std::ffi::c_ulong = 0x125F; // BLKRRPART is _IO(0x12, 95)
+    let _ = file.sync_all();
+    thread::sleep(Duration::from_millis(500));
+    
+    // Tell the Linux kernel to drop its cache and re-read the partition map 
     unsafe {
-        let _ = ioctl(file.as_raw_fd(), BLKRRPART);
+        let res = ioctl(file.as_raw_fd(), BLKRRPART);
+        if res != 0 {
+            println!("Warning: OS cache flush failed (BLKRRPART returned {})", res);
+        }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn trigger_os_reread(_file: &std::fs::File) {
-    // macOS and Windows handle auto-discovery differently, 
-    // but you can expand this later if needed!
+    // macOS and Windows auto-discovery r
 }
