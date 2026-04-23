@@ -470,7 +470,10 @@ pub fn write_image_iso(
         })?;
     } else {
         let mut gpt = GptDisk::new(total_sectors, 512);
-        
+        let disk_id = Guid::from_bytes(pseudo_uuid());
+        gpt.primary_header.disk_guid = disk_id;
+        gpt.backup_header.disk_guid = disk_id;
+
         let part1 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::from_bytes(pseudo_uuid()), start_lba, part1_end_lba);
         gpt.add_partition(part1).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 1 err: {:?}", e)))?;
         
@@ -540,6 +543,7 @@ pub fn write_image_iso(
 
     let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
     let total_size = Path::new(&iso_path_clone).metadata()?.len();
+    let autorun_inf_label = usb_label.to_string();
 
     if has_large_file {
         let uefi_path = uefi_ntfs_path.ok_or_else(|| {
@@ -583,6 +587,14 @@ pub fn write_image_iso(
                 }
             }
 
+            if let Ok(autorun_entry) = exfat_fs.create_file(&usb_root, "autorun.inf") {
+                if let Ok(mut autorun_writer) = exfat_fs.write_file(&autorun_entry) {
+                    let autorun_content = format!("[autorun]\nlabel={}\n", autorun_inf_label);
+                    let _ = autorun_writer.write(autorun_content.as_bytes());
+                    let _ = autorun_writer.finish();
+                }
+            }
+            
             let _ = tx.send(Ok((total_size, total_size)));
 
             if verify_written {
@@ -641,6 +653,12 @@ pub fn write_image_iso(
                     let _ = xml_writer.truncate();
                     let _ = xml_writer.write_all(xml_contents.as_bytes());
                 }
+            }
+
+            if let Ok(mut autorun_writer) = usb_root.create_file("autorun.inf") {
+                let _ = autorun_writer.truncate();
+                let autorun_content = format!("[autorun]\nlabel={}\n", autorun_inf_label);
+                let _ = autorun_writer.write_all(autorun_content.as_bytes());
             }
 
             let _ = tx.send(Ok((total_size, total_size))); 

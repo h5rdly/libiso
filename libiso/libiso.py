@@ -579,6 +579,7 @@ def tui_loop(iso_path: str, pre_mode: str = None, pre_verify: bool = None):
             if not is_burning:
                 draw_wizard_ui(os.path.basename(iso_path), drives, step, sel_drive, sel_mode, sel_verify, stats, base_col, text_col)
 
+            should_exit = False
             while not ui_queue.empty():
                 msg = ui_queue.get()
                 progress_row = 20 
@@ -587,13 +588,16 @@ def tui_loop(iso_path: str, pre_mode: str = None, pre_verify: bool = None):
                 elif msg[0] == 'PROGRESS':
                     draw_progress(progress_row, current_phase, msg[1], msg[2], text_col)
                 elif msg[0] == 'DONE':
-                    step = 5 
-                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_SUCCESS}Success: {msg[1]}{COLOR_RESET}')
+                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_SUCCESS}Success: {msg[1]}{COLOR_RESET}\n\n')
                     sys.stdout.flush()
+                    should_exit = True
                 elif msg[0] == 'ERROR':
-                    step = 5 
-                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_DANGER}Error: {msg[1]}{COLOR_RESET}')
+                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_DANGER}Error: {msg[1]}{COLOR_RESET}\n\n')
                     sys.stdout.flush()
+                    should_exit = True
+                    
+            if should_exit:
+                break
 
             key = read_key_nonblocking()
             if key == 'QUIT':
