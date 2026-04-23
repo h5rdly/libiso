@@ -117,7 +117,11 @@ pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>) {
 
 // Generates and writes the explicit sprout.toml configuration file
 pub fn write_sprout_toml<T, TP, OCC>(
-    root_dir: &Dir<'_, T, TP, OCC>, kernel_path: Option<&str>, initrd_path: Option<&str>, kernel_args: Option<&str>
+    root_dir: &Dir<'_, T, TP, OCC>, 
+    kernel_path: Option<&str>, 
+    initrd_path: Option<&str>, 
+    kernel_args: Option<&str>, 
+    os_name: &str 
 ) -> PyResult<()> 
 where 
     T: ReadWriteSeek<Error = std::io::Error>,
@@ -133,7 +137,7 @@ where
         toml.push_str("[options]\nautoconfigure = true\n");
     } else {
         toml.push_str("[entries.linux-iso]\n");
-        toml.push_str("title = \"Boot Linux ISO\"\n");
+        toml.push_str(&format!("title = \"Boot Linux ISO - {os_name}\"\n"));
         toml.push_str("actions = [\"boot-linux\"]\n\n");
 
         toml.push_str("[actions.boot-linux.chainload]\n");

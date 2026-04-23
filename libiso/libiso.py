@@ -155,6 +155,69 @@ def extract_iso_label(iso_path: str) -> str:
     return 'LIBISO_USB' # Fallback
 
 
+def generate_disk_layout_ascii(device_path: str) -> str:
+    ''' Generates a human-readable ASCII map of a GPT-formatted drive '''
+
+    try:
+        with open(device_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            total_sectors = f.tell() // 512
+
+            # Read Primary GPT Header
+            f.seek(512)
+            hdr = f.read(512)
+            if hdr[:8] != b'EFI PART':
+                return '[!] Drive is not GPT formatted or header is missing.'
+                
+            _, _, _, _, _, _, bak_lba, first_usable, last_usable, _, part_start, num_parts, part_size, _ = struct.unpack('<8sIIIIQQQQ16sQIII', hdr[:92])
+            
+            # Read Partitions
+            f.seek(part_start * 512)
+            partitions = []
+            for _ in range(min(num_parts, 4)): # Check first 4 slots
+                p_data = f.read(part_size)
+                type_guid, uniq_guid, p_start, p_end, attrs, name_utf16 = struct.unpack('<16s16sQQQ72s', p_data)
+                if uniq_guid == b'\x00' * 16:
+                    continue # Empty slot
+                
+                name = name_utf16.decode('utf-16le').rstrip('\x00')
+                size_mb = ((p_end - p_start + 1) * 512) / (1024 * 1024)
+                partitions.append((p_start, p_end, size_mb, name))
+
+            # Draw the UI (Expanded Middle Column)
+            lines = [
+                '┌───────────────┬───────────────┬─────────────────────────────┐',
+                '│                  libiso Flash Drive Layout                  │',
+                '├───────────────┼───────────────┼─────────────────────────────┤',
+                '│    Sector     │     Size      │         Description         │',
+                '├───────────────┼───────────────┼─────────────────────────────┤',
+                '│ LBA 0         │       512 B   │ Protective MBR (Type 0xEE)  │',
+                '│ LBA 1         │       512 B   │ Primary GPT Header          │',
+                '│ LBA 2-33      │        16 KB  │ Primary Partition Array     │',
+                '│ LBA 34-2047   │      1007 KB  │ 1 MiB Alignment Padding     │',
+                '├───────────────┼───────────────┼─────────────────────────────┤'
+            ]
+            
+            for i, (p_start, p_end, size_mb, name) in enumerate(partitions):
+                lines.append(f'│ LBA {p_start:<10}│               │ [Partition {i+1}]               │')
+                lines.append(f'│       ...     │ {size_mb:>9.1f} MB  │ {name:<27} │')
+                lines.append(f'│ LBA {p_end:<10}│               │                             │')
+                if i < len(partitions) - 1:
+                    lines.append('├───────────────┼───────────────┼─────────────────────────────┤')
+                
+            lines.extend([
+                '├───────────────┼───────────────┼─────────────────────────────┤',
+                f'│ LBA {last_usable+1:<10}│        16 KB  │ Backup Partition Array      │',
+                f'│ LBA {bak_lba:<10}│       512 B   │ Backup GPT Header           │',
+                '└───────────────┴───────────────┴─────────────────────────────┘'
+            ])
+            
+            return '\n'.join(lines)
+            
+    except Exception as e:
+        return f'[!] Failed to generate disk map: {e}'
+
+
 def _check_gpt_corruption(device_path):
     ''' Aux diagnostic function '''
     
@@ -275,7 +338,7 @@ def burn_image(
 
     iso_label = extract_iso_label(image_path)
     short_usb_label = iso_label[:11].replace(' ', '_').upper()
-    print(f"Detected ISO Label: '{iso_label}' -> Formatting USB as: '{short_usb_label}'")
+    print(f'''Detected ISO Label: '{iso_label}' -> Formatting USB as: '{short_usb_label}' ''')
 
     if method == 'DD':
         print(f'Starting raw DD write from {image_path} to {device_path}...')
@@ -313,7 +376,7 @@ def burn_image(
             image_path, 
             device_path, 
             has_large_file,
-            short_usb_label,
+            iso_label,
             partition_scheme, 
             uefi_path, 
             persistence_size_mb
@@ -508,7 +571,7 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
                 iso_path, 
                 device_path, 
                 has_large_file, 
-                short_usb_label,
+                iso_label,
                 partition_scheme, 
                 uefi_path, 
                 persistence_size_mb=None, 
@@ -523,8 +586,13 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
                 
             highest_written = written
             ui_queue.put(('PROGRESS', written, total))
-            
+        
         ui_queue.put(('DONE', 'Burn and Verification Complete!'))
+
+        if mode != 'DD':
+            layout_map = generate_disk_layout_ascii(device_path)
+            ui_queue.put(('LAYOUT', layout_map))
+
     except Exception as e:
         ui_queue.put(('ERROR', str(e)))
 
@@ -587,15 +655,26 @@ def tui_loop(iso_path: str, pre_mode: str = None, pre_verify: bool = None):
                     current_phase = msg[1]
                 elif msg[0] == 'PROGRESS':
                     draw_progress(progress_row, current_phase, msg[1], msg[2], text_col)
-                elif msg[0] == 'DONE':
-                    sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_SUCCESS}Success: {msg[1]}{COLOR_RESET}\n\n')
-                    sys.stdout.flush()
-                    should_exit = True
                 elif msg[0] == 'ERROR':
                     sys.stdout.write(move_cursor(progress_row + 2, text_col) + f'\033[K{COLOR_DANGER}Error: {msg[1]}{COLOR_RESET}\n\n')
                     sys.stdout.flush()
                     should_exit = True
-                    
+
+                elif msg[0] == 'DONE':
+                    sys.stdout.write(move_cursor(6, 1) + '\033[J')
+                    progress_row = 6
+                    sys.stdout.write(move_cursor(progress_row, text_col) + f'\033[K{COLOR_SUCCESS}Success: {msg[1]}{COLOR_RESET}\n\n')
+                    sys.stdout.flush()
+
+                elif msg[0] == 'LAYOUT':  
+                    map_lines = msg[1].strip('\n').split('\n')
+                    progress_row = 7
+                    for i, line in enumerate(map_lines):
+                        sys.stdout.write(move_cursor(progress_row + i, text_col) + f'\033[K{line}')
+                    progress_row += len(map_lines) + 2
+                    sys.stdout.flush()
+                    should_exit = True
+
             if should_exit:
                 break
 

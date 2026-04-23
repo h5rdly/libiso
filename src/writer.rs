@@ -23,7 +23,7 @@ use arcbox_ext4::Formatter as Ext4Formatter;
 
 use pyo3::prelude::*;
 
-use crate::io::{AlignedBuffer, sys::DriveLocker, open_device};
+use crate::io::{AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread};
 use crate::verify;
 use crate::bootloader;
 
@@ -366,12 +366,12 @@ pub fn write_image_dd(
 
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, usb_label, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, unattend_xml_payload=None, target_arch=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, iso_label, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, unattend_xml_payload=None, target_arch=None))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
     has_large_file: bool,
-    usb_label: &str,
+    iso_label: &str,
     partition_scheme: Option<String>, 
     uefi_ntfs_path: Option<String>,
     persistence_size_mb: Option<u64>, 
@@ -525,6 +525,7 @@ pub fn write_image_iso(
     }
 
     let mut dest_file_for_uefi = dest_file.try_clone()?;
+    let dest_file_for_fat32 = dest_file.try_clone()?;
 
     let mut wrapped_partition = PartitionWrapper {
         inner: dest_file,
@@ -532,7 +533,8 @@ pub fn write_image_iso(
         size: partition_size_bytes,
     };
 
-    format_partition(&mut wrapped_partition, has_large_file, usb_label, start_lba)
+    let short_label = iso_label.chars().take(11) .collect::<String>().replace(' ', "_").to_uppercase();
+    format_partition(&mut wrapped_partition, has_large_file, &short_label, start_lba)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     
     let iso_path_clone = image_path.clone();
@@ -543,7 +545,7 @@ pub fn write_image_iso(
 
     let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
     let total_size = Path::new(&iso_path_clone).metadata()?.len();
-    let autorun_inf_label = usb_label.to_string();
+    let autorun_inf_label = iso_label.to_string();
 
     if has_large_file {
         let uefi_path = uefi_ntfs_path.ok_or_else(|| {
@@ -642,6 +644,7 @@ pub fn write_image_iso(
                     found_kernel.as_deref(), 
                     found_initrd.as_deref(), 
                     found_args.as_deref(),
+                    &autorun_inf_label,
                 ) {
                     let _ = tx.send(Err(format!("Sprout config failed: {:?}", e)));
                     return;
@@ -674,6 +677,7 @@ pub fn write_image_iso(
                 }
                 let _ = tx.send(Ok((total_size, total_size))); 
             }
+            trigger_os_reread(&dest_file_for_fat32);
         });
     }
 

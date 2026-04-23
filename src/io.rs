@@ -254,7 +254,6 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
         opts.write(true);
     }
 
-    // --- Windows Implementation ---
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -273,7 +272,6 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
         }
     }
 
-    // --- Linux Implementation ---
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -294,4 +292,26 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
     // --- Mac OS / Fallback ---
     // (Mac uses F_NOCACHE via fcntl instead of open flags, so we just use standard I/O for now)
     opts.open(path)
+}
+
+
+#[cfg(target_os = "linux")]
+pub fn trigger_os_reread(file: &std::fs::File) {
+
+    use std::os::unix::io::AsRawFd;
+
+    unsafe extern "C" {
+        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+    }
+    const BLKRRPART: std::ffi::c_ulong = 0x1259;
+    
+    unsafe {
+        let _ = ioctl(file.as_raw_fd(), BLKRRPART);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn trigger_os_reread(_file: &std::fs::File) {
+    // macOS and Windows handle auto-discovery differently, 
+    // but you can expand this later if needed!
 }
