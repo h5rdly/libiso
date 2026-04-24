@@ -2,27 +2,30 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 
-#[pyclass(from_py_object)]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct DriveInfo {
     #[pyo3(get)]
-    pub display_name: String,
-    
+    pub display_name: String, 
     #[pyo3(get)]
     pub device_path: String, 
     
     #[pyo3(get)]
     pub total_space_bytes: u64,
-}
 
+    #[pyo3(get)]
+    pub label: Option<String>,
+    
+    #[pyo3(get)]
+    pub hardware_model: String,
+}
 
 #[pymethods]
 impl DriveInfo {
-
     #[new]
-    pub fn new(display_name: String, device_path: String, total_space_bytes: u64) -> Self {
+    pub fn new(display_name: String, device_path: String, total_space_bytes: u64, label: Option<String>, hardware_model: String) -> Self {
         DriveInfo {
-            display_name, device_path, total_space_bytes,
+            display_name, device_path, total_space_bytes, label, hardware_model
         }
     }
 
@@ -31,58 +34,61 @@ impl DriveInfo {
         dict.set_item("display_name", &self.display_name)?;
         dict.set_item("device_path", &self.device_path)?;
         dict.set_item("total_space_bytes", self.total_space_bytes)?;
+        dict.set_item("hardware_model", &self.hardware_model)?;
+        
+        if let Some(l) = &self.label {
+            dict.set_item("label", l)?;
+        } else {
+            dict.set_item("label", py.None())?;
+        }
         Ok(dict)
-    }
-
-    fn __str__(&self) -> String {
-        format!(
-            "Name:  {}\nPath:  {}\nSize:  {} bytes",
-            self.display_name, self.device_path, self.total_space_bytes
-        )
-    }
-
-    fn __repr__(&self) -> String {
-        format!("<DriveInfo: {} ({})>", self.display_name, self.device_path)
     }
 }
 
-// Linux specific implementation - read raw block devices
+
 #[cfg(target_os = "linux")]
 #[pyfunction]
 pub fn list_removable_drives() -> Vec<DriveInfo> {
-
     let mut available_drives = Vec::new();
     let hardware_devices = drives::get_devices().unwrap_or_default();
 
     for device in hardware_devices {
         if !device.is_removable { continue; }
 
-        let hw_name = device.model.unwrap_or_else(|| "Generic USB Drive".to_string());
+        // Get the hardware model, trim trailing spaces that some USB firmware leaves
+        let hw_name = device.model.unwrap_or_else(|| "Generic USB".to_string()).trim().to_string();
         let device_path = format!("/dev/{}", device.name);
+        
+        let mut label = None;
+        if let Ok(out) = std::process::Command::new("lsblk")
+            .args(&["-n", "-o", "LABEL", &device_path])
+            .output() 
+        {
+            let out_str = String::from_utf8_lossy(&out.stdout);
+            if let Some(l) = out_str.lines().map(|s| s.trim()).find(|s| !s.is_empty()) {
+                label = Some(l.to_string());
+            }
+        }
         
         let size_path = format!("/sys/block/{}/size", device.name);
         let total_space_bytes = std::fs::read_to_string(&size_path)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|sectors| sectors * 512) // 1 sector = 512 bytes
+            .map(|sectors| sectors * 512)
             .unwrap_or(0);
-            
-        let size_gb = total_space_bytes / (1024 * 1024 * 1024);
-
-        let display_name = format!("{} - {} GB ({})", hw_name.trim(), size_gb, device_path);
 
         available_drives.push(DriveInfo {
-            display_name,
+            display_name: format!("{} ({})", hw_name, device_path), // Generic fallback
             device_path,
-            total_space_bytes, 
+            total_space_bytes,
+            label, 
+            hardware_model: hw_name,
         });
     }
-
     available_drives
 }
 
 
-// Win / Mac implementation - read OS volume mounts
 #[cfg(not(target_os = "linux"))]
 #[pyfunction]
 pub fn list_removable_drives() -> Vec<DriveInfo> {
@@ -96,11 +102,12 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
             continue;
         }
 
-        let hw_name = disk.name().to_string_lossy().into_owned();
+        let label_str = disk.name().to_string_lossy().into_owned();
+        let label = if label_str.trim().is_empty() { None } else { Some(label_str.trim().to_string()) };
+
         let mut device_path = disk.mount_point().to_string_lossy().into_owned();
         #[cfg(target_os = "windows")]
         {
-            // Convert "D:\" to "\\.\D:" for raw device access
             if device_path.ends_with('\\') || device_path.ends_with('/') {
                 device_path.pop(); 
             }
@@ -108,18 +115,17 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
         }
         
         let total_space_bytes = disk.total_space();
-        let size_gb = total_space_bytes / (1024 * 1024 * 1024);
-
-        let display_name = format!("{} - {} GB ({})", hw_name, size_gb, device_path);
+        
+        // sysinfo doesn't easily expose physical hardware names (eg "Cruzer xx")
+        let hardware_model = "USB Flash Drive".to_string(); 
 
         available_drives.push(DriveInfo {
-            display_name,
+            display_name: format!("{} ({})", hardware_model, device_path),
             device_path,
             total_space_bytes,
+            label,
+            hardware_model,
         });
     }
-
     available_drives
 }
-
-

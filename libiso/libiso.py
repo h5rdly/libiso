@@ -297,7 +297,8 @@ def write_image_iso(
     persistence_size_mb: int = None,
     verify_written: bool = False,
     unattend_xml_payload: str = None,
-    target_arch: str = None
+    target_arch: str = None,
+    abort_token = None  
 ):
     ''' To avoid using the tempfile crate, which pulls windows-sys, we use a Python wrapper 
         and utilize it's built in tempfile
@@ -311,9 +312,9 @@ def write_image_iso(
 
     try:
         return _libiso.write_image_iso(
-            image_path, device_path, has_large_file, usb_label, 
-            partition_scheme, uefi_ntfs_path, persistence_size_mb, 
-            ext4_temp_path, verify_written, unattend_xml_payload, target_arch
+            image_path, device_path, has_large_file, usb_label, partition_scheme, 
+            uefi_ntfs_path, persistence_size_mb, ext4_temp_path, verify_written, 
+            unattend_xml_payload, target_arch, abort_token
         )
     finally:
         if ext4_temp_path and os.path.exists(ext4_temp_path):
@@ -343,19 +344,19 @@ def burn_image(
     if method == 'DD':
         print(f'Starting raw DD write from {image_path} to {device_path}...')
         stream = _libiso.write_image_dd(image_path, device_path, verify_written)
-        
-        phase = 'DD Write'
-        highest_written = 0
-        
-        for written, total in stream:
-            # Check if Rust has entered the verification loop
-            if written < highest_written:
-                phase = 'Verifying'
-                print('\nWrite complete! Starting bit-for-bit verification...')
-                highest_written = 0
-                
-            highest_written = written
-            _progress_bar(written, total, prefix=phase)
+        phase = 'Writing'
+        for event in stream:
+            if event.msg_type == 'PHASE':
+                phase = event.text
+                if phase == 'Verifying Data':
+                    print('\nWrite complete! Starting bit-for-bit verification...')
+            elif event.msg_type == 'PROGRESS':
+                _progress_bar(event.written, event.total, prefix=phase)
+            elif event.msg_type == 'DONE':
+                pass # Handled after loop
+            elif event.msg_type == 'ERROR':
+                print(f'\n[!] Fatal Error: {event.text}')
+                return
             
         print(f'\n{phase} Complete!')
 
@@ -382,8 +383,8 @@ def burn_image(
             persistence_size_mb
         )
 
-    for written, total in stream:
-        _progress_bar(written, total)
+    for event in stream:
+        _progress_bar(event.written, event.total)
             
     print(f'\n{method} burning complete!') 
     return
@@ -562,32 +563,39 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
             partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
             uefi_path = ensure_uefi_bridge() if has_large_file else None
             
-            # Extract the label so the TUI also gets the pretty USB name
             iso_label = extract_iso_label(iso_path)
             short_usb_label = iso_label[:11].replace(' ', '_').upper()
             
-            # Call the Python wrapper instead of the raw _libiso module
             stream = write_image_iso(
-                iso_path, 
-                device_path, 
-                has_large_file, 
-                iso_label,
-                partition_scheme, 
-                uefi_path, 
+                image_path=iso_path, 
+                device_path=device_path, 
+                has_large_file=has_large_file, 
+                usb_label=short_usb_label,
+                partition_scheme=partition_scheme, 
+                uefi_ntfs_path=uefi_path, 
                 persistence_size_mb=None, 
                 verify_written=verify
             )
         
-        for written, total in stream:
-            if written < highest_written:
-                phase = 'Verifying Data'
-                ui_queue.put(('PHASE', phase))
-                highest_written = 0
+        for event in stream:
+            if event.msg_type == 'PROGRESS':
+                if event.written < highest_written:
+                    phase = 'Verifying Data'
+                    ui_queue.put(('PHASE', phase))
+                    highest_written = 0
+                    
+                highest_written = event.written
+                ui_queue.put(('PROGRESS', event.written, event.total))
                 
-            highest_written = written
-            ui_queue.put(('PROGRESS', written, total))
-        
-        ui_queue.put(('DONE', 'Burn and Verification Complete!'))
+            elif event.msg_type == 'PHASE':
+                ui_queue.put(('PHASE', event.text))
+                
+            elif event.msg_type == 'DONE':
+                ui_queue.put(('DONE', event.text))
+                
+            elif event.msg_type == 'ERROR':
+                ui_queue.put(('ERROR', event.text))
+                return
 
         if mode != 'DD':
             layout_map = generate_disk_layout_ascii(device_path)

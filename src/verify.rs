@@ -9,7 +9,7 @@ use hadris_iso::directory::DirectoryRef;
 
 use pyo3::prelude::*;
 
-use crate::writer::{ProgressStream, DD_CHUNK_SIZE, get_clean_filename};
+use crate::writer::{EventMsg, ProgressStream, DD_CHUNK_SIZE, get_clean_filename};
 use crate::io::{AlignedBuffer};
 
 
@@ -19,7 +19,7 @@ pub fn verify_file_chunks(
     mut usb_file: impl Read,
     file_size: u64,
     file_name: &str,
-    tx: &kanal::Sender<Result<(u64, u64), String>>,
+    tx: &kanal::Sender<EventMsg>,
     verified_bytes: &mut u64,
     total_size: u64,
 ) -> Result<(), String> {
@@ -55,7 +55,7 @@ pub fn verify_file_chunks(
         read_so_far += to_read as u64;
         *verified_bytes += to_read as u64;
         
-        if tx.send(Ok((*verified_bytes, total_size))).is_err() {
+        if tx.send(EventMsg::progress(*verified_bytes, total_size)).is_err() {
             return Err("Python disconnected".to_string());
         }
     }
@@ -68,7 +68,7 @@ pub fn verify_recursive<T, U, TP, OCC>(
     iso_img: &IsoImage<T>,
     iso_dir: DirectoryRef,
     usb_dir: &Dir<'_, U, TP, OCC>, 
-    tx: &kanal::Sender<Result<(u64, u64), String>>,
+    tx: &kanal::Sender<EventMsg>,
     verified: &mut u64,
     total_size: u64,
 ) -> Result<(), String>
@@ -97,7 +97,7 @@ where
             ) {
                 // Skip verification for files we intentionally altered/injected
                 *verified += entry.total_size() as u64; // Artificially advance the progress bar
-                let _ = tx.send(Ok((*verified, total_size))); // Advance the progress bar
+                let _ = tx.send(EventMsg::progress(*verified, total_size)); // Advance the progress bar
                 continue;
             }
 
@@ -115,7 +115,7 @@ pub fn verify_recursive_exfat<T, U>(
     iso_img: &IsoImage<T>,
     iso_dir: DirectoryRef,
     usb_dir: &ExFatDir<'_, U>, 
-    tx: &kanal::Sender<Result<(u64, u64), String>>,
+    tx: &kanal::Sender<EventMsg>,
     verified: &mut u64,
     total_size: u64,
 ) -> Result<(), String> 
@@ -141,7 +141,7 @@ where
             ) {
                 // Skip verification for files we intentionally altered/injected
                 *verified += entry.total_size() as u64; // Artificially advance the progress bar
-                let _ = tx.send(Ok((*verified, total_size))); // Advance the progress bar
+                let _ = tx.send(EventMsg::progress(*verified, total_size)); // Advance the progress bar
                 continue;
             }
             let iso_data = iso_img.read_file(&entry).map_err(|e| format!("Failed to read ISO file '{}': {}", clean_name, e))?;
@@ -163,7 +163,7 @@ where
 pub fn verify_hardware_capacity<T: Read + Write + Seek>(
     drive: &mut T,
     total_size: u64,
-    tx: &kanal::Sender<Result<(u64, u64), String>>,
+    tx: &kanal::Sender<EventMsg>,
     mut sync_fn: impl FnMut(&mut T) -> Result<(), String>, 
 ) -> Result<(), String> {
 
@@ -190,7 +190,7 @@ pub fn verify_hardware_capacity<T: Read + Write + Seek>(
         drive.write_all(&buf[..to_write]).map_err(|e| format!("Hardware write failed at offset {}: {}", offset, e))?;
         offset += to_write as u64;
         
-        if tx.send(Ok((offset, total_size * 2))).is_err() {
+        if tx.send(EventMsg::progress(offset, total_size * 2)).is_err() {
             return Err("Python disconnected".to_string());
         }
     }
@@ -223,7 +223,7 @@ pub fn verify_hardware_capacity<T: Read + Write + Seek>(
 
         offset += to_read as u64;
         
-        if tx.send(Ok((total_size + offset, total_size * 2))).is_err() {
+        if tx.send(EventMsg::progress(total_size + offset, total_size * 2)).is_err() {
             return Err("Python disconnected".to_string());
         }
     }
@@ -234,7 +234,7 @@ pub fn verify_hardware_capacity<T: Read + Write + Seek>(
 
 // Used by the PyO3 binding
 pub fn verify_usb_size(
-    device_path: &str, tx: &kanal::Sender<Result<(u64, u64), String>>,) -> Result<(), String> {
+    device_path: &str, tx: &kanal::Sender<EventMsg>,) -> Result<(), String> {
     
     let mut file = crate::io::open_device(device_path, true)
         .map_err(|e| format!("Failed to open device for hardware verification: {}", e))?;
@@ -252,11 +252,11 @@ pub fn verify_usb_size(
 #[pyfunction]
 #[pyo3(signature = (device_path))]
 pub fn destructive_verify_usb_size(device_path: String) -> PyResult<ProgressStream> {
-    let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
+    let (tx, rx) = kanal::bounded::<EventMsg>(100);
 
     thread::spawn(move || {
         if let Err(e) = verify_usb_size(&device_path, &tx) {
-            let _ = tx.send(Err(e));
+            let _ = tx.send(EventMsg::error(&e));
         }
     });
 

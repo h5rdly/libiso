@@ -297,17 +297,18 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
 
 
 #[cfg(target_os = "linux")]
-pub fn trigger_os_reread(file: &std::fs::File) {
+pub fn trigger_os_reread(file: &std::fs::File) -> std::io::Result<()> {
 
     use std::os::unix::io::AsRawFd;
     use std::thread;
     use std::time::Duration;
-    
+    use std::ffi::{c_int, c_ulong};
+
     unsafe extern "C" {
-        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     }
-    
-    const BLKRRPART: std::ffi::c_ulong = 0x125F; // BLKRRPART is _IO(0x12, 95)
+
+    const BLKRRPART: c_ulong = 0x125F; 
     let _ = file.sync_all();
     thread::sleep(Duration::from_millis(500));
     
@@ -315,9 +316,10 @@ pub fn trigger_os_reread(file: &std::fs::File) {
     unsafe {
         let res = ioctl(file.as_raw_fd(), BLKRRPART);
         if res != 0 {
-            println!("Warning: OS cache flush failed (BLKRRPART returned {})", res);
+            return Err(std::io::Error::last_os_error());
         }
     }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]

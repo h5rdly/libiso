@@ -49,15 +49,16 @@ class TestWriterIso(unittest.TestCase):
             self.dest_path
         )
 
-        for written, total in stream:
-            # Sleep just enough to watch the 4MB chunks fly by
-            time.sleep(0.1)
+        for event in stream:
+            if event.msg_type == 'PROGRESS':
+                # Sleep just enough to watch the 4MB chunks fly by
+                time.sleep(0.1)
+                ratio = event.written / event.total
+                percent = (ratio) * 100 if event.total > 0 else 0
+                bar = '█' * int(40 * ratio)
+                bar = bar.ljust(40, '-')
+                print(f'\r\033[KDD Mode Write:  |{bar}| {percent:.1f}% ({event.written}/{event.total} bytes)', end='')
             
-            percent = (written / total) * 100 if total > 0 else 0
-            bar = '█' * int(40 * written / total)
-            bar = bar.ljust(40, '-')
-            print(f'\r\033[KDD Mode Write:  |{bar}| {percent:.1f}% ({written}/{total} bytes)', end='')
-        
         print('\nDD Write Complete!')
 
 
@@ -122,13 +123,18 @@ class TestWriterIso(unittest.TestCase):
             uefi_ntfs_path=uefi_path
         )
 
-        for written, total in stream:
+        for event in stream:
+
+            if event.msg_type != 'PROGRESS':
+                continue
+
             # slow down the loop so the human eye can see it
             # This triggers backpressure on the Rust thread
             time.sleep(10** -4) 
-            
-            percent = (written / total) * 100 if total > 0 else 0
-            bar = '█' * int(40 * written / total)
+            ratio = event.written / event.total
+            ratio = event.written / event.total
+            percent = (ratio) * 100 if event.total > 0 else 0
+            bar = '█' * int(40 * ratio)
             bar = bar.ljust(40, '-')
             print(f'\r\033[KISO Extraction: |{bar}| {percent:.1f}%', end='')
         

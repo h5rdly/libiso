@@ -68,8 +68,8 @@ def show_progress(total, written, mode, sleep_interval=0.05):
    print(f'\r\033[K{mode} Mode Write:  |{bar}| {percent:.1f}% ({written}/{total} bytes)', end='')
 
 # Writing in DD mode
-for written, total in libiso.write_image_dd(source_fd.name, dest_fd.name):
-    show_progress(total, written, 'DD')
+for event in libiso.write_image_dd(source_fd.name, dest_fd.name):
+    show_progress(event.total, event.written, 'DD')
 
 # DD Mode Write:  |████████████████████████████████████████| 100.0% (209715200/209715200 bytes)
 
@@ -88,10 +88,10 @@ with (tempfile.NamedTemporaryFile(delete=False) as dest_fd,
       'TEST_ISO', ['EFI/BOOT/BOOTX64.EFI', 'KERNEL.BIN'], True, 50))   # 50Mb for each of the 2 files
 
 uefi_bridge_path = libiso.ensure_uefi_bridge()
-for written, total in libiso.write_image_iso(
+for event in libiso.write_image_iso(
    source_fd.name, dest_fd.name, True, 'GPT', uefi_bridge_path
    ):   
-   show_progress(total, written, 'ISO')
+   show_progress(event.total, event.written, 'ISO')
 
 # ISO Mode Write:  |████████████████████████████████████████| 100.0% (109051904/109051904 bytes)
 

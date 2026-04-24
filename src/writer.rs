@@ -3,6 +3,8 @@ use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::Path;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use hadris_part::geometry::DiskGeometry;
 use hadris_part::mbr::{MasterBootRecord, MbrPartition, MbrPartitionType};
@@ -32,9 +34,57 @@ pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
 
 
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct AbortToken {
+    pub(crate) flag: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl AbortToken {
+    #[new]
+    pub fn new() -> Self {
+        Self { flag: Arc::new(AtomicBool::new(false)) }
+    }
+    pub fn abort(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+}
+
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct EventMsg {
+    #[pyo3(get)]
+    pub msg_type: String, // "PROGRESS", "PHASE", "LOG", "DONE", "ERROR"
+    #[pyo3(get)]
+    pub written: u64,
+    #[pyo3(get)]
+    pub total: u64,
+    #[pyo3(get)]
+    pub text: String,
+}
+
+impl EventMsg {
+    pub fn progress(written: u64, total: u64) -> Self {
+        Self { msg_type: "PROGRESS".to_string(), written, total, text: String::new() }
+    }
+    pub fn phase(text: &str) -> Self {
+        Self { msg_type: "PHASE".to_string(), written: 0, total: 0, text: text.to_string() }
+    }
+    pub fn log(text: &str) -> Self {
+        Self { msg_type: "LOG".to_string(), written: 0, total: 0, text: text.to_string() }
+    }
+    pub fn done(text: &str) -> Self {
+        Self { msg_type: "DONE".to_string(), written: 0, total: 0, text: text.to_string() }
+    }
+    pub fn error(text: &str) -> Self {
+        Self { msg_type: "ERROR".to_string(), written: 0, total: 0, text: text.to_string() }
+    }
+}
+
 #[pyclass]
 pub struct ProgressStream {
-    pub(crate) rx: kanal::Receiver<Result<(u64, u64), String>>,
+    pub(crate) rx: kanal::Receiver<EventMsg>,
 }
 
 #[pymethods]
@@ -43,14 +93,14 @@ impl ProgressStream {
         slf
     }
 
-    fn __next__(&self, py: Python) -> PyResult<Option<(u64, u64)>> {
+    fn __next__(&self, py: Python) -> PyResult<Option<EventMsg>> {
         match py.detach(|| self.rx.recv()) {
-            Ok(Ok((written, total))) => Ok(Some((written, total))),
-            Ok(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(e)), 
+            Ok(msg) => Ok(Some(msg)),
             Err(_) => Ok(None), 
         }
     }
 }
+
 
 pub struct PartitionWrapper<T: Read + Write + Seek> {
     pub inner: T,
@@ -263,9 +313,9 @@ pub fn format_usb_drive(
 // -- Writing logic
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, verify_written=false))]
+#[pyo3(signature = (image_path, device_path, verify_written=false, abort_token=None))]
 pub fn write_image_dd(
-    image_path: String, device_path: String, verify_written: bool,
+    image_path: String, device_path: String, verify_written: bool, abort_token: Option<PyRef<'_, AbortToken>>,
 ) -> PyResult<ProgressStream> {
 
     let iso_path = Path::new(&image_path);
@@ -287,86 +337,106 @@ pub fn write_image_dd(
     }
     drop(dest_file);
 
-    let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
+    let (tx, rx) = kanal::bounded::<EventMsg>(100);
+    let abort_flag = abort_token.map(|t| t.flag.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     thread::spawn(move || {
         let mut f_iso = match File::open(&image_path) {
             Ok(f) => f,
-            Err(e) => { let _ = tx.send(Err(format!("Open ISO err: {}", e))); return; }
+            Err(e) => { let _ = tx.send(EventMsg::error(&format!("Open ISO err: {}", e))); return; }
         };
         let mut f_dev = match open_device(&device_path, true) {
             Ok(f) => f,
-            Err(e) => { let _ = tx.send(Err(format!("Open device err: {}", e))); return; }
+            Err(e) => { let _ = tx.send(EventMsg::error(&format!("Open device err: {}", e))); return; }
         };
+        let _ = tx.send(EventMsg::phase("Raw DD Write"));
 
         let chunk_size = DD_CHUNK_SIZE;
         let mut buf = AlignedBuffer::new(chunk_size);
         let mut written = 0u64;
 
         while written < total_size {
+            if abort_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(EventMsg::error("Cancelled by user"));
+                return;
+            }
+
             let to_read = std::cmp::min(chunk_size as u64, total_size - written) as usize;
             if let Err(e) = f_iso.read_exact(&mut buf[..to_read]) {
-                let _ = tx.send(Err(format!("Read err: {}", e))); return;
+                let _ = tx.send(EventMsg::error(&format!("Read err: {}", e))); return;
             }
             if let Err(e) = f_dev.write_all(&buf[..to_read]) {
-                let _ = tx.send(Err(format!("Write err: {}", e))); return;
+                let _ = tx.send(EventMsg::error(&format!("Write err: {}", e))); return;
             }
             
             let _ = f_dev.sync_all();
 
             written += to_read as u64;
-            if tx.send(Ok((written, total_size))).is_err() {
-                return; 
-            }
+            let _ = tx.send(EventMsg::progress(written, total_size));
         }
 
+        let _ = tx.send(EventMsg::done("Burn Complete!"));
         if verify_written {
-            drop(f_dev); 
+            let _ = tx.send(EventMsg::phase("Verifying Data"));
+            drop(f_dev); // release the OS lock and reopen for reading
 
             let mut v_iso = match File::open(&image_path) {
                 Ok(f) => f,
-                Err(e) => { let _ = tx.send(Err(format!("Verify open ISO err: {}", e))); return; }
+                Err(e) => { let _ = tx.send(EventMsg::error(&format!("Verify open ISO err: {}", e))); return; }
             };
-            let mut v_dev = match crate::io::open_device(&device_path, false) { 
+            f_dev = match open_device(&device_path, false) { 
                 Ok(f) => f,
-                Err(e) => { let _ = tx.send(Err(format!("Verify open device err: {}", e))); return; }
+                Err(e) => { let _ = tx.send(EventMsg::error(&format!("Verify open device err: {}", e))); return; }
             };
 
             let mut buf_iso = vec![0u8; chunk_size];
             let mut buf_dev = vec![0u8; chunk_size];
             let mut verified = 0u64;
 
-            let _ = tx.send(Ok((0, total_size)));
+            let _ = tx.send(EventMsg::progress(0, total_size));
 
             while verified < total_size {
+                if abort_flag.load(Ordering::Relaxed) {
+                    let _ = tx.send(EventMsg::error("Cancelled by user during verification."));
+                    return;
+                }
                 let to_read = std::cmp::min(chunk_size as u64, total_size - verified) as usize;
 
                 if let Err(e) = v_iso.read_exact(&mut buf_iso[..to_read]) {
-                    let _ = tx.send(Err(format!("Verify ISO read err: {}", e))); return;
+                    let _ = tx.send(EventMsg::error(&format!("Verify ISO read err: {}", e))); return;
                 }
-                if let Err(e) = v_dev.read_exact(&mut buf_dev[..to_read]) {
-                    let _ = tx.send(Err(format!("Verify device read err: {}", e))); return;
+                if let Err(e) = f_dev.read_exact(&mut buf_dev[..to_read]) {
+                    let _ = tx.send(EventMsg::error(&format!("Verify device read err: {}", e))); return;
                 }
 
                 if buf_iso[..to_read] != buf_dev[..to_read] {
-                    let _ = tx.send(Err(format!("Data corruption detected at byte offset {}! The USB drive may be failing.", verified)));
+                    let _ = tx.send(EventMsg::error(&format!("Data corruption detected at byte offset {}! The USB drive may be failing.", verified)));
                     return;
                 }
 
                 verified += to_read as u64;
-                if tx.send(Ok((verified, total_size))).is_err() {
-                    return; 
-                }
+                let _ = tx.send(EventMsg::progress(verified, total_size));
+            }
+            let _ = tx.send(EventMsg::done("Verification Complete!"));
+        } 
+        drop(f_dev); 
+        
+        if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path) {
+            if let Err(e) = trigger_os_reread(&f_reread) {
+                let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
+            } else {
+                let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
             }
         }
     });
-
     Ok(ProgressStream { rx })
 }
 
 
 #[pyfunction]
-#[pyo3(signature = (image_path, device_path, has_large_file, iso_label, partition_scheme=None, uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, unattend_xml_payload=None, target_arch=None))]
+#[pyo3(signature = (image_path, device_path, has_large_file, iso_label, partition_scheme=None, 
+    uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, 
+    unattend_xml_payload=None, target_arch=None, abort_token=None))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
@@ -379,6 +449,7 @@ pub fn write_image_iso(
     verify_written: bool, 
     unattend_xml_payload: Option<String>,
     target_arch: Option<String>, 
+    abort_token: Option<PyRef<'_, AbortToken>> 
 ) -> PyResult<ProgressStream> {
     
     let arch_selection = target_arch.unwrap_or_else(|| "all".to_string());
@@ -525,7 +596,6 @@ pub fn write_image_iso(
     }
 
     let mut dest_file_for_uefi = dest_file.try_clone()?;
-    let dest_file_for_fat32 = dest_file.try_clone()?;
 
     let mut wrapped_partition = PartitionWrapper {
         inner: dest_file,
@@ -538,12 +608,15 @@ pub fn write_image_iso(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     
     let iso_path_clone = image_path.clone();
+    let device_path_clone = device_path.clone();
     let iso_file = File::open(&iso_path_clone)?;
     let iso_img = IsoImage::open(iso_file).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to open ISO: {:?}", e))
     })?;
 
-    let (tx, rx) = kanal::bounded::<Result<(u64, u64), String>>(100);
+    let (tx, rx) = kanal::bounded::<EventMsg>(100);
+    let abort_flag = abort_token.map(|t| t.flag.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
     let total_size = Path::new(&iso_path_clone).metadata()?.len();
     let autorun_inf_label = iso_label.to_string();
 
@@ -563,14 +636,15 @@ pub fn write_image_iso(
             std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
             dest_file_for_uefi.sync_all()?;
         }
+        drop(dest_file_for_uefi);
 
         thread::spawn(move || {
             let mut written = 0u64;
             let root = iso_img.root_dir();
             let usb_root = exfat_fs.root_dir(); 
             
-            if let Err(e) = copy_recursive_exfat(&exfat_fs, &iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size) {
-                let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
+            if let Err(e) = copy_recursive_exfat(&exfat_fs, &iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size, abort_flag.clone()) {
+                let _ = tx.send(EventMsg::error(&format!("Extraction error: {:?}", e)));
                 return;
             }
 
@@ -583,7 +657,7 @@ pub fn write_image_iso(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(format!("XML injection error: {:?}", e)));
+                        let _ = tx.send(EventMsg::error(&format!("XML injection error: {:?}", e)));
                         return;
                     }
                 }
@@ -597,18 +671,27 @@ pub fn write_image_iso(
                 }
             }
             
-            let _ = tx.send(Ok((total_size, total_size)));
+            let _ = tx.send(EventMsg::progress(total_size, total_size));
 
             if verify_written {
-                let _ = tx.send(Ok((0, total_size)));
+                let _ = tx.send(EventMsg::progress(0, total_size));
                 let mut verified = 0u64;
                 let iso_verify_root = iso_img.root_dir();
                 let usb_verify_root = exfat_fs.root_dir();
                 if let Err(e) = verify::verify_recursive_exfat(&exfat_fs, &iso_img, iso_verify_root.dir_ref(), &usb_verify_root, &tx, &mut verified, total_size) {
-                    let _ = tx.send(Err(format!("Verification error: {}", e)));
+                    let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
                     return;
                 }
-                let _ = tx.send(Ok((total_size, total_size))); 
+                let _ = tx.send(EventMsg::progress(total_size, total_size)); 
+            }
+            drop(exfat_fs); 
+            
+            if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path_clone) {
+                if let Err(e) = trigger_os_reread(&f_reread) {
+                    let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
+                } else {
+                    let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
+                }
             }
         });
     } else {
@@ -628,14 +711,14 @@ pub fn write_image_iso(
             let mut found_initrd = None;
             let mut found_args = None;
 
-            if let Err(e) = copy_recursive(&iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size, "", &mut found_kernel, &mut found_initrd, &mut found_args) {
-                let _ = tx.send(Err(format!("Extraction error: {:?}", e)));
+            if let Err(e) = copy_recursive(&iso_img, root.dir_ref(), &usb_root, &tx, &mut written, total_size, "", &mut found_kernel, &mut found_initrd, &mut found_args, abort_flag.clone()) {
+                let _ = tx.send(EventMsg::error(&format!("Extraction error: {:?}", e)));
                 return; 
             }
 
             if !has_large_file {
                 if let Err(e) = bootloader::install_uefi_sprout(&usb_root, &arch_selection) {
-                    let _ = tx.send(Err(format!("Bootloader installation failed: {:?}", e)));
+                    let _ = tx.send(EventMsg::error(&format!("Bootloader installation failed: {:?}", e)));
                     return;
                 }
 
@@ -646,7 +729,7 @@ pub fn write_image_iso(
                     found_args.as_deref(),
                     &autorun_inf_label,
                 ) {
-                    let _ = tx.send(Err(format!("Sprout config failed: {:?}", e)));
+                    let _ = tx.send(EventMsg::error(&format!("Sprout config failed: {:?}", e)));
                     return;
                 }
             }
@@ -664,20 +747,29 @@ pub fn write_image_iso(
                 let _ = autorun_writer.write_all(autorun_content.as_bytes());
             }
 
-            let _ = tx.send(Ok((total_size, total_size))); 
+            let _ = tx.send(EventMsg::progress(total_size, total_size)); 
 
             if verify_written {
-                let _ = tx.send(Ok((0, total_size)));
+                let _ = tx.send(EventMsg::progress(0, total_size));
                 let mut verified = 0u64;
                 let iso_verify_root = iso_img.root_dir();
                 let mut usb_verify_root = usb_fs.root_dir();
                 if let Err(e) = verify::verify_recursive(&usb_fs, &iso_img, iso_verify_root.dir_ref(), &mut usb_verify_root, &tx, &mut verified, total_size) {
-                    let _ = tx.send(Err(format!("Verification error: {}", e)));
+                    let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
                     return;
                 }
-                let _ = tx.send(Ok((total_size, total_size))); 
+                let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
-            trigger_os_reread(&dest_file_for_fat32);
+            drop(usb_root);
+            drop(usb_fs); 
+            
+            if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path) {
+                if let Err(e) = trigger_os_reread(&f_reread) {
+                    let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
+                } else {
+                    let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
+                }
+            }
         });
     }
 
@@ -692,13 +784,14 @@ fn copy_recursive<T, TP, OCC>(
     iso: &IsoImage<File>,
     iso_dir_ref: DirectoryRef,
     usb_dir: &Dir<'_, T, TP, OCC>, 
-    tx: &kanal::Sender<Result<(u64, u64), String>>,
+    tx: &kanal::Sender<EventMsg>,
     bytes_written: &mut u64,
     total_size: u64,
     current_path: &str,                 
     found_kernel: &mut Option<String>,  
     found_initrd: &mut Option<String>,  
     found_args: &mut Option<String>, 
+    abort_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> 
 where 
     T: ReadWriteSeek<Error = std::io::Error>,
@@ -709,6 +802,9 @@ where
     let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
 
     for entry_res in dir.entries() {
+        if abort_flag.load(Ordering::Relaxed) { 
+            return Err("Cancelled by user".into()); 
+        }
         let entry = entry_res?;
         if entry.record.name() == b"\x00" || entry.record.name() == b"\x01" { continue; }
         
@@ -723,7 +819,7 @@ where
         if entry.is_directory() {
             let sub_usb_dir = usb_dir.create_dir(&clean_name)?; 
             let sub_iso_ref = entry.as_dir_ref(iso)?;
-            copy_recursive(iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_size, &new_path, found_kernel, found_initrd, found_args)?;        
+            copy_recursive(iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_size, &new_path, found_kernel, found_initrd, found_args, abort_flag.clone())?;        
         } else {
             let mut writer = usb_dir.create_file(&clean_name)?;
             writer.truncate()?;
@@ -754,7 +850,7 @@ where
                         if n == 0 { return Err(Box::new(std::io::Error::new(std::io::ErrorKind::WriteZero, "USB write failure"))); }
                         pos += n;
                         *bytes_written += n as u64;
-                        let _ = tx.send(Ok((*bytes_written, total_size)));
+                        let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
                     }
                     extent_offset += read_size as u64;
                 }
@@ -772,14 +868,18 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
     iso: &IsoImage<File>,
     iso_dir_ref: DirectoryRef,
     usb_dir: &ExFatDir<'_, T>,
-    tx: &kanal::Sender<Result<(u64, u64), String>>,
+    tx: &kanal::Sender<EventMsg>,
     bytes_written: &mut u64,
     total_bytes: u64,
+    abort_flag: Arc<AtomicBool>
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = iso.open_dir(iso_dir_ref);
     let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
 
     for entry_res in dir.entries() {
+        if abort_flag.load(Ordering::Relaxed) { 
+            return Err("Cancelled by user".into()); 
+        }
         let entry = entry_res?;
         if entry.record.name() == b"\x00" || entry.record.name() == b"\x01" { continue; }
 
@@ -788,7 +888,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
         if entry.is_directory() {
             let sub_usb_dir = fs_handle.create_dir(usb_dir, &clean_name)?;
             let sub_iso_ref = entry.as_dir_ref(iso)?;
-            copy_recursive_exfat(fs_handle, iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_bytes)?;
+            copy_recursive_exfat(fs_handle, iso, sub_iso_ref, &sub_usb_dir, tx, bytes_written, total_bytes, abort_flag.clone())?;
         } else {
             let file_entry = fs_handle.create_file(usb_dir, &clean_name)?;
             let mut writer = fs_handle.write_file(&file_entry)?;
@@ -808,7 +908,7 @@ fn copy_recursive_exfat<T: Read + Write + Seek>(
                         if n == 0 { return Err(Box::new(std::io::Error::new(std::io::ErrorKind::WriteZero, "USB write failure"))); }
                         pos += n;
                         *bytes_written += n as u64;
-                        let _ = tx.send(Ok((*bytes_written, total_bytes)));
+                        let _ = tx.send(EventMsg::progress(*bytes_written, total_bytes));
                     }
                     extent_offset += read_size as u64;
                 }
