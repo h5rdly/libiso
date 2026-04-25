@@ -272,6 +272,53 @@ def _check_gpt_corruption(device_path):
             print(f'[+] Backup Signature Found!')
 
 
+def _get_all_drives():
+        
+        # import os, sys
+
+        drive_list = []
+
+        if os.name == 'nt':
+            import ctypes
+            buffer_size = 256
+            buffer = ctypes.create_unicode_buffer(buffer_size)
+            ctypes.windll.kernel32.GetLogicalDriveStringsW(buffer_size, buffer)
+            
+            # The buffer looks like 'C:\\\x00D:\\\x00\x00'
+            drive_string = buffer.value
+            drive_list = [d for d in drive_string.split('\x00') if d]
+
+        elif sys.platform.startswith('linux'):
+            try:
+                with open('/proc/mounts', 'r') as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            dev, mount_point = parts[0], parts[1]
+                            # Filter for physical drives/network mounts (ignore sysfs, proc, etc.)
+                            if dev.startswith('/'):
+                                # Decode octal escapes (e.g., \040 for spaces in paths)
+                                mount_point = mount_point.replace('\\040', ' ')
+                                if mount_point not in drive_list:
+                                    drive_list.append(mount_point)
+            except Exception:
+                drive_list.append('/')
+
+        elif sys.platform == 'darwin' or 'bsd' in sys.platform:
+            import subprocess
+            try:
+                output = subprocess.check_output(['mount']).decode('utf-8')
+                for line in output.splitlines():
+                    # mount() output: '/dev/disk3s1 on /Volumes/USB (exfat, ...)'
+                    if ' on ' in line:
+                        mount_point = line.split(' on ')[1].split(' (')[0]
+                        if mount_point not in drive_list:
+                            drive_list.append(mount_point)
+            except Exception:
+                drive_list.append('/')
+
+        return drive_list
+
 
 def _progress_bar(written: int, total: int, prefix: str = 'Progress'):
 

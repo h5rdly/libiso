@@ -675,6 +675,7 @@ pub fn write_image_iso(
             let _ = tx.send(EventMsg::progress(total_size, total_size));
 
             if verify_written {
+                let _ = tx.send(EventMsg::phase("Verifying Data"));
                 let _ = tx.send(EventMsg::progress(0, total_size));
                 let mut verified = 0u64;
                 let iso_verify_root = iso_img.root_dir();
@@ -749,6 +750,7 @@ pub fn write_image_iso(
             let _ = tx.send(EventMsg::progress(total_size, total_size)); 
 
             if verify_written {
+                let _ = tx.send(EventMsg::phase("Verifying Data"));
                 let _ = tx.send(EventMsg::progress(0, total_size));
                 let mut verified = 0u64;
                 let iso_verify_root = iso_img.root_dir();

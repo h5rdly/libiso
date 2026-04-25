@@ -129,3 +129,21 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
     }
     available_drives
 }
+
+
+#[pyfunction]
+pub fn _list_all_volumes() -> PyResult<Vec<String>> {
+
+    use sysinfo::Disks;
+
+    let disks = Disks::new_with_refreshed_list();
+    let mut drive_list = Vec::new();
+    
+    for disk in disks.list() {
+        if let Some(path_str) = disk.mount_point().to_str() {
+            drive_list.push(path_str.to_string());
+        }
+    }
+    
+    Ok(drive_list)
+}

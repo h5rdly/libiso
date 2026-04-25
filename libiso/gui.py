@@ -256,7 +256,8 @@ else:
     ]
     font_path = next((f for f in linux_fonts if os.path.exists(f)), '')
 
-font_path = __file__.replace('\\', '/').rsplit('/', 1)[0] + os.sep + 'HackNerdFontPropo-Regular.ttf'
+current_dir = __file__.replace('\\', '/').rsplit('/', 1)[0] + os.sep
+font_path = current_dir + 'HackNerdFontPropo-Regular.ttf'
 
 with dpg.font_registry():
     if os.path.exists(font_path):
@@ -332,7 +333,9 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
     with dpg.collapsing_header(tag='advanced_header', label='Advanced Options'):
         dpg.add_checkbox(tag='chk_verify', label='Verify written data (Bit-for-bit check)')
         dpg.add_checkbox(tag='chk_dd', label='Force DD (Raw Image) Mode')
-    
+    with dpg.tooltip('chk_verify'):
+        dpg.add_text("ISO mode is the default, since it doesn't take up the entir drive space")
+
     # dpg.bind_item_theme('advanced_header', 'blue_ui_theme')
     
     dpg.add_spacer(height=50)
@@ -389,6 +392,18 @@ window_width = int(750 * scale_factor)
 window_height = int(500 * scale_factor)
 
 dpg.create_viewport(title='libiso USB flasher', width=window_width, height=window_height, resizable=True)
+
+icon_path = current_dir + 'libiso.png'
+if not os.path.exists(icon_path):
+    import base64, tempfile
+    TRANSPARENT_PNG_B64 = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    fd, icon_path = tempfile.mkstemp(suffix='.png')
+    with os.fdopen(fd, 'wb') as f:
+        f.write(base64.b64decode(TRANSPARENT_PNG_B64))
+    
+dpg.set_viewport_small_icon(icon_path)
+dpg.set_viewport_large_icon(icon_path)
+
 dpg.setup_dearpygui()
 # dpg.show_font_manager()
 dpg.set_primary_window('main_window', True)

@@ -32,6 +32,7 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(list_removable_drives, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_image, m)?)?;
     m.add_function(wrap_pyfunction!(destructive_verify_usb_size, m)?)?; 
+    // m.add_function(wrap_pyfunction!(drives::_list_all_volumes, m)?)?; 
     
     // Writing
     m.add_class::<AbortToken>()?;
