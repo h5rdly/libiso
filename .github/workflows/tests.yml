@@ -76,8 +76,9 @@ jobs:
       - name: Test in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
+          release: "14.4"  # Temp issue with the latest port repo, 25/04/26, remove later
           usesh: true
-          prepare: pkg update && pkg install -y rust python314 git
+          prepare: pkg install -y rust python314 git
           run: |
             python3.14 -m venv venv
             . venv/bin/activate
