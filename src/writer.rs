@@ -596,6 +596,7 @@ pub fn write_image_iso(
     }
 
     let mut dest_file_for_uefi = dest_file.try_clone()?;
+    let dest_file_for_fat32 = dest_file.try_clone()?;
 
     let mut wrapped_partition = PartitionWrapper {
         inner: dest_file,
@@ -608,7 +609,6 @@ pub fn write_image_iso(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     
     let iso_path_clone = image_path.clone();
-    let device_path_clone = device_path.clone();
     let iso_file = File::open(&iso_path_clone)?;
     let iso_img = IsoImage::open(iso_file).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to open ISO: {:?}", e))
@@ -636,9 +636,10 @@ pub fn write_image_iso(
             std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
             dest_file_for_uefi.sync_all()?;
         }
-        drop(dest_file_for_uefi);
 
         thread::spawn(move || {
+            let _ = tx.send(EventMsg::phase("Extracting ISO (exFAT)"));
+
             let mut written = 0u64;
             let root = iso_img.root_dir();
             let usb_root = exfat_fs.root_dir(); 
@@ -684,14 +685,10 @@ pub fn write_image_iso(
                 }
                 let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
-            drop(exfat_fs); 
-            
-            if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path_clone) {
-                if let Err(e) = trigger_os_reread(&f_reread) {
-                    let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
-                } else {
-                    let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
-                }
+            if let Err(e) = trigger_os_reread(&dest_file_for_uefi) {
+                let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
+            } else {
+                let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
             }
         });
     } else {
@@ -703,6 +700,8 @@ pub fn write_image_iso(
         })?;
 
         thread::spawn(move || {
+            let _ = tx.send(EventMsg::phase("Extracting ISO (FAT32)"));
+
             let mut written = 0u64;
             let root = iso_img.root_dir();
             let usb_root = usb_fs.root_dir(); 
@@ -760,15 +759,10 @@ pub fn write_image_iso(
                 }
                 let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
-            drop(usb_root);
-            drop(usb_fs); 
-            
-            if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path) {
-                if let Err(e) = trigger_os_reread(&f_reread) {
-                    let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
-                } else {
-                    let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
-                }
+            if let Err(e) = trigger_os_reread(&dest_file_for_fat32) {
+                let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
+            } else {
+                let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
             }
         });
     }
