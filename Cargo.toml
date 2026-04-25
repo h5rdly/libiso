@@ -31,6 +31,12 @@ sha2 = "0.11"
 
 edera-sprout-parsing = {git = "https://github.com/edera-dev/sprout.git", version = "0.0.28" } 
 
+# sbsign specific
+spki = "0.8.0"
+x509-cert = { version = " 0.3.0-rc.4", features = ["pem", "builder"] }
+signature = "3.0.0-rc.10"
+rsa = { version = "0.10.0-rc.17", features = ["sha2"] }
+rand = "0.10.1"
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 

@@ -12,6 +12,7 @@ mod esd;
 mod lzms;
 mod lzms_arrays;
 mod bootloader;
+mod sbsign;
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};
@@ -49,6 +50,10 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(test_verify_fake_drive_sync, m)?)?; 
     m.add_function(wrap_pyfunction!(create_mock_esd, m)?)?; 
 
+    // Signing
+    m.add_function(wrap_pyfunction!(sbsign::sign_efi_binary, m)?)?;
+    // m.add_function(wrap_pyfunction!(sbsign::generate_secure_boot_keys, m)?)?;
+    
     // Windows .esd file parsing
     m.add_class::<esd::WimFileEntry>()?;
     m.add_class::<esd::EsdArchive>()?;

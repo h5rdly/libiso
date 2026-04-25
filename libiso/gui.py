@@ -303,7 +303,7 @@ dpg.bind_theme(global_theme)
 
 
 #   -  Build the UI 
-with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True):
+with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True, no_title_bar=True):
     
     # dpg.add_separator()
     dpg.add_spacer(height=10)
@@ -399,7 +399,8 @@ with dpg.handler_registry():
 window_width = int(750 * scale_factor)
 window_height = int(550 * scale_factor)
 
-dpg.create_viewport(title='libiso USB burner', width=window_width, height=window_height, resizable=True)
+dpg.create_viewport(title='Sulfur USB burner', width=window_width, height=window_height, 
+    resizable=True)
 
 icon_path = current_dir + 'libiso.png'
 if not os.path.exists(icon_path):
