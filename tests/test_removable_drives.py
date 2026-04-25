@@ -14,7 +14,9 @@ class TestRemovableDrives(unittest.TestCase):
             mock_drive = libiso.DriveInfo(
                 'Mock Flash Drive - 64 GB (/dev/mock_usb)', 
                 '/dev/mock_usb', 
-                64 * 1024 * 1024 * 1024
+                64 * 1024 * 1024 * 1024,
+                'mock_label',
+                'Mock Hardware Model'
             )
             drives.append(mock_drive)
             

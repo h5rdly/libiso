@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 
 [dependencies]
-sysinfo = "0.38.1"
+sysinfo = "0.38.4"
 
 hadris-iso = "1.1.2"
 hadris-fat = {version = "1.1.2", features = ["exfat"]} 
@@ -23,8 +23,8 @@ temp-file = "=0.1.4"
 log = "0.4.1"
 
 pelite = "0.10.0"
-cms = "0.2.3"
-der = { version = "0.7", features = ["alloc", "derive"] } 
+cms = { version = "0.3.0-pre.2" }
+der = { version = "0.8", features = ["alloc", "derive"] } 
 
 sha1 = "0.11"
 sha2 = "0.11"
