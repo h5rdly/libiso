@@ -395,11 +395,11 @@ dpg.create_viewport(title='libiso USB flasher', width=window_width, height=windo
 
 icon_path = current_dir + 'libiso.png'
 if not os.path.exists(icon_path):
-    import base64, tempfile
-    TRANSPARENT_PNG_B64 = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    import tempfile
+    TRANSPARENT_PNG_B64 = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDATx\xdacd`\x00\x00\x00\x06\x00\x020\x81\xd0/\x00\x00\x00\x00IEND\xaeB`\x82'
     fd, icon_path = tempfile.mkstemp(suffix='.png')
     with os.fdopen(fd, 'wb') as f:
-        f.write(base64.b64decode(TRANSPARENT_PNG_B64))
+        f.write(TRANSPARENT_PNG_B64)
     
 dpg.set_viewport_small_icon(icon_path)
 dpg.set_viewport_large_icon(icon_path)
