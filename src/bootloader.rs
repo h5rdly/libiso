@@ -145,16 +145,16 @@ where
         if let Some(k) = kernel_path {
             // Sprout expects UEFI-style backslash paths
             let efi_kernel_path = k.replace('/', "\\");
-            toml.push_str(&format!("path = \"{}\"\n", efi_kernel_path));
+            toml.push_str(&format!("path = '{}'\n", efi_kernel_path));
         }
         
         if let Some(i) = initrd_path {
             let efi_initrd_path = i.replace('/', "\\");
-            toml.push_str(&format!("linux-initrd = \"{}\"\n", efi_initrd_path));
+            toml.push_str(&format!("linux-initrd = '{}'\n", efi_initrd_path));
         }
         
         let args = kernel_args.unwrap_or("quiet splash");
-        toml.push_str(&format!("options = [\"{}\"]\n", args));
+        toml.push_str(&format!("options = ['{}']\n", args));
     }
 
     let mut config_file = root_dir.create_file("sprout.toml").map_err(|e| {
