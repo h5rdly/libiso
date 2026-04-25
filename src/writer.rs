@@ -422,7 +422,7 @@ pub fn write_image_dd(
         drop(f_dev); 
         
         if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path) {
-            if let Err(e) = trigger_os_reread(&f_reread) {
+            if let Err(e) = trigger_os_reread(&f_reread, &image_path.clone()) {
                 let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
             } else {
                 let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
@@ -686,7 +686,7 @@ pub fn write_image_iso(
                 }
                 let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
-            if let Err(e) = trigger_os_reread(&dest_file_for_uefi) {
+            if let Err(e) = trigger_os_reread(&dest_file_for_uefi, &iso_path_clone) {
                 let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
             } else {
                 let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
@@ -761,7 +761,7 @@ pub fn write_image_iso(
                 }
                 let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
-            if let Err(e) = trigger_os_reread(&dest_file_for_fat32) {
+            if let Err(e) = trigger_os_reread(&dest_file_for_fat32, &iso_path_clone) {
                 let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
             } else {
                 let _ = tx.send(EventMsg::log("OS cache flushed successfully."));

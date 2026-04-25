@@ -30,7 +30,7 @@ def get_dpi_scale():
             return dpi / 96.0
         except Exception:
             return 1.0
-    return 2.0 # Linux/macOS usually handle native scaling well, or default to 1.0
+    return 2.0 
 
 
 #  Global UI State
@@ -169,7 +169,7 @@ def burn_worker():
                 
                 if (current_time := time.time()) - last_ui_update > 0.05 or event.written == event.total:
                     progress = event.written / event.total if event.total > 0 else 0.0
-                    dpg.set_value("progress_bar", progress)
+                    dpg.set_value('progress_bar', progress)
                     last_ui_update = current_time
             
             elif event.msg_type == 'PHASE':
@@ -270,7 +270,7 @@ with dpg.font_registry():
 # -  Themes 
 
 # listen for a Left-Click to open the hidden file dialog
-with dpg.item_handler_registry(tag="iso_click_handler"):
+with dpg.item_handler_registry(tag='iso_click_handler'):
     dpg.add_item_clicked_handler(button=dpg.mvMouseButton_Left, callback=lambda: dpg.show_item('file_dialog'))
 
 # Blue theme for buttons and headers
@@ -293,17 +293,18 @@ with dpg.theme() as global_theme:
     with dpg.theme_component(dpg.mvButton):
         # 0 extra horizontal padding, and 10 pixels of vertical padding for buttons
         dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 10)
-
+    
+    with dpg.theme_component(dpg.mvCheckbox):
+        dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (70, 70, 70, 255))
+        dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (41, 128, 185, 255))
+        dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (255, 255, 255, 255))
+        
 dpg.bind_theme(global_theme)
 
 
 #   -  Build the UI 
 with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True):
     
-    # dpg.add_text('libiso USB Flasher', tag='main_headline')
-    # if title_font: # Only bind if the font successfully loaded
-    #     dpg.bind_item_font('main_headline', title_font)
-        
     # dpg.add_separator()
     dpg.add_spacer(height=10)
     
@@ -323,21 +324,28 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
     dpg.add_input_text(tag='iso_text', readonly=True, default_value='Click to select ISO...', width=-1)
     dpg.bind_item_handler_registry('iso_text', 'iso_click_handler')
     with dpg.tooltip('iso_text'):
-        dpg.add_text("Click to browse your computer for an ISO file")
+        dpg.add_text('Click to browse your computer for an ISO file')
 
     dpg.add_spacer(height=50)
     dpg.add_separator()
                 
     
     # Advanced Options
-    with dpg.collapsing_header(tag='advanced_header', label='Advanced Options'):
-        dpg.add_checkbox(tag='chk_verify', label='Verify written data (Bit-for-bit check)')
-        dpg.add_checkbox(tag='chk_dd', label='Force DD (Raw Image) Mode')
-    with dpg.tooltip('chk_verify'):
-        dpg.add_text("ISO mode is the default, since it doesn't take up the entir drive space")
+    dpg.add_text('Advanced Options')
+    with dpg.group(horizontal=True):
+        dpg.add_checkbox(tag='chk_verify')
+        dpg.add_text('Verify written data (Bit-for-bit check)', tag='txt_verify')
 
-    # dpg.bind_item_theme('advanced_header', 'blue_ui_theme')
-    
+    with dpg.group(horizontal=True):
+        dpg.add_checkbox(tag='chk_dd')
+        dpg.add_text('Force DD (Raw Image) Mode', tag='txt_dd')
+
+    with dpg.tooltip('txt_verify'):
+
+        dpg.add_text('Reads the USB after burning to ensure bit-for-bit\naccuracy')
+    with dpg.tooltip('txt_dd'):
+        dpg.add_text('''ISO mode is the default, since it doesn't take up\nthe entire drive space''')
+
     dpg.add_spacer(height=50)
     
     # Status & Progress
@@ -389,9 +397,9 @@ with dpg.handler_registry():
 
 # Scale the main window size 
 window_width = int(750 * scale_factor)
-window_height = int(500 * scale_factor)
+window_height = int(550 * scale_factor)
 
-dpg.create_viewport(title='libiso USB flasher', width=window_width, height=window_height, resizable=True)
+dpg.create_viewport(title='libiso USB burner', width=window_width, height=window_height, resizable=True)
 
 icon_path = current_dir + 'libiso.png'
 if not os.path.exists(icon_path):
@@ -403,6 +411,16 @@ if not os.path.exists(icon_path):
     
 dpg.set_viewport_small_icon(icon_path)
 dpg.set_viewport_large_icon(icon_path)
+
+# Auto-load ISO from command line arguments
+if len(sys.argv) > 1:
+    cli_iso_path = sys.argv[1]
+    if os.path.exists(cli_iso_path):
+        state['iso_path'] = cli_iso_path
+        dpg.set_value('iso_text', cli_iso_path)
+        dpg.set_value('status_text', 'Ready')
+    else:
+        print(f'Warning: CLI ISO path does not exist: {cli_iso_path}')
 
 dpg.setup_dearpygui()
 # dpg.show_font_manager()

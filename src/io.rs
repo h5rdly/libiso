@@ -53,17 +53,51 @@ impl DerefMut for AlignedBuffer {
 
 
 
-// -- Low level controls for Windows to allow locking the USB for the eneded work
+// -- DriveLocker
 
 
 #[cfg(not(windows))]
 pub mod sys {
-    pub struct DriveLocker {}
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+    use std::ffi::c_int;
+
+    unsafe extern "C" {
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+
+    const LOCK_EX: c_int = 2; // Exclusive lock
+    const LOCK_UN: c_int = 8; // Unlock
+
+    pub struct DriveLocker {
+        file: Option<File>,
+    }
 
     impl DriveLocker {
-        pub fn new(_volume_path: &str) -> Result<Self, String> {
-            // Unix systems generally respect raw block writes if running as root
-            Ok(Self {})
+        pub fn new(volume_path: &str) -> Result<Self, String> {
+            // Open a persistent handle to the raw device
+            if let Ok(f) = File::open(volume_path) {
+                unsafe { 
+                    // Lock out udev and udisks2 from auto-mounting!
+                    if flock(f.as_raw_fd(), LOCK_EX) != 0 {
+                        println!("Warning: Could not acquire exclusive flock on device.");
+                    }
+                }
+                Ok(Self { file: Some(f) })
+            } else {
+                Ok(Self { file: None })
+            }
+        }
+    }
+
+    impl Drop for DriveLocker {
+        fn drop(&mut self) {
+            // Automatically release the lock when libiso finishes
+            if let Some(f) = &self.file {
+                unsafe { 
+                    flock(f.as_raw_fd(), LOCK_UN); 
+                }
+            }
         }
     }
 }
@@ -222,6 +256,8 @@ pub mod sys {
 }
 
 
+// -- Helper IO functions
+
 // Linux O_DIRECT Constants 
 #[cfg(target_os = "linux")]
 mod linux_sys {
@@ -295,10 +331,56 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
 }
 
 
+// helper for trigger_os_reread
+#[cfg(target_os = "linux")]
+fn find_locking_processes(dev_path: &str) -> String {
+    let mut lockers = Vec::new();
+    
+    // Read the /proc directory
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let pid_str = entry.file_name();
+            let pid_str = pid_str.to_string_lossy();
+            
+            // If the folder name is purely digits, it's a Process ID
+            if pid_str.chars().all(|c| c.is_ascii_digit()) {
+                let fd_dir = entry.path().join("fd");
+                if let Ok(fds) = std::fs::read_dir(fd_dir) {
+                    for fd in fds.flatten() {
+                        // Check where the file descriptor points
+                        if let Ok(target) = std::fs::read_link(fd.path()) {
+                            let target_str = target.to_string_lossy();
+                            // If it points to /dev/sdX or /dev/sdX1, we found a culprit!
+                            if target_str.starts_with(dev_path) {
+                                let cmdline_path = entry.path().join("cmdline");
+                                let cmdline = std::fs::read_to_string(cmdline_path).unwrap_or_default();
+                                // Clean up the null bytes from /proc/pid/cmdline
+                                let name = cmdline.replace('\0', " ");
+                                lockers.push(format!("PID {} ({})", pid_str, name.trim()));
+                                break; // We only need to log the process once
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Also check if it's currently mounted (which blocks BLKRRPART)
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            if line.starts_with(dev_path) {
+                lockers.push(format!("MOUNTED: {}", line.split_whitespace().take(2).collect::<Vec<_>>().join(" on ")));
+            }
+        }
+    }
+
+    lockers.join("\n")
+}
+
 
 #[cfg(target_os = "linux")]
-pub fn trigger_os_reread(file: &std::fs::File) -> std::io::Result<()> {
-
+pub fn trigger_os_reread(file: &std::fs::File, dev_path: &str) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     use std::thread;
     use std::time::Duration;
@@ -312,18 +394,28 @@ pub fn trigger_os_reread(file: &std::fs::File) -> std::io::Result<()> {
     let _ = file.sync_all();
     thread::sleep(Duration::from_millis(500));
     
-    // Tell the Linux kernel to drop its cache and re-read the partition map 
     unsafe {
         let res = ioctl(file.as_raw_fd(), BLKRRPART);
         if res != 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            
+            // Execute lsof to find out who is locking the drive
+            let who = find_locking_processes(dev_path);
+            let msg = if who.is_empty() {
+                format!("Kernel EBUSY: {}", err)
+            } else {
+                format!("Kernel EBUSY: {}\nLocked by:\n{}", err, who)
+            };
+            
+            return Err(std::io::Error::new(err.kind(), msg));
         }
     }
     Ok(())
 }
 
+
 #[cfg(not(target_os = "linux"))]
-pub fn trigger_os_reread(_file: &std::fs::File) -> std::io::Result<()> {
-    // macOS and Windows auto-discovery
+pub fn trigger_os_reread(_file: &std::fs::File, _dev_path: &str) -> std::io::Result<()> {
     Ok(())
 }
+
