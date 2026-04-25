@@ -323,6 +323,7 @@ pub fn trigger_os_reread(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn trigger_os_reread(_file: &std::fs::File) {
-    // macOS and Windows auto-discovery r
+pub fn trigger_os_reread(_file: &std::fs::File) -> std::io::Result<()> {
+    // macOS and Windows auto-discovery
+    Ok(())
 }

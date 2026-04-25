@@ -105,7 +105,7 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
         let label_str = disk.name().to_string_lossy().into_owned();
         let label = if label_str.trim().is_empty() { None } else { Some(label_str.trim().to_string()) };
 
-        let device_path = disk.mount_point().to_string_lossy().into_owned();
+        let mut device_path = disk.mount_point().to_string_lossy().into_owned();
         #[cfg(target_os = "windows")]
         {
             if device_path.ends_with('\\') || device_path.ends_with('/') {
