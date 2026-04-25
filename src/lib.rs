@@ -52,7 +52,7 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Signing
     m.add_function(wrap_pyfunction!(sbsign::sign_efi_binary, m)?)?;
-    // m.add_function(wrap_pyfunction!(sbsign::generate_secure_boot_keys, m)?)?;
+    m.add_function(wrap_pyfunction!(sbsign::generate_secure_boot_keys, m)?)?;
     
     // Windows .esd file parsing
     m.add_class::<esd::WimFileEntry>()?;
