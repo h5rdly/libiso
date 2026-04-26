@@ -22,7 +22,7 @@ pub fn install_uefi_sprout<W: UsbWriter>(
     let _ = writer.create_dir("/EFI/BOOT");
 
     if target_arch == "x86_64" || target_arch == "all" {
-        let mut sprout_x64 = writer.open_file_writer("/EFI/BOOT/BOOTX64.EFI").map_err(|e| {
+        let mut sprout_x64 = writer.open_file_writer("/EFI/BOOT/BOOTX64.EFI", SPROUT_X86_64.len() as u64).map_err(|e| {
             PyRuntimeError::new_err(format!("Failed to create BOOTX64.EFI: {:?}", e))
         })?;
         sprout_x64.write_all(SPROUT_X86_64).unwrap();
@@ -30,7 +30,7 @@ pub fn install_uefi_sprout<W: UsbWriter>(
     }
 
     if target_arch == "aarch64" || target_arch == "all" {
-        let mut sprout_aa64 = writer.open_file_writer("/EFI/BOOT/BOOTAA64.EFI").map_err(|e| {
+        let mut sprout_aa64 = writer.open_file_writer("/EFI/BOOT/BOOTAA64.EFI", SPROUT_AARCH64.len() as u64).map_err(|e| {
             PyRuntimeError::new_err(format!("Failed to create BOOTAA64.EFI: {:?}", e))
         })?;
         sprout_aa64.write_all(SPROUT_AARCH64).unwrap();
@@ -143,12 +143,12 @@ pub fn write_sprout_toml<W: UsbWriter>(
         let args = kernel_args.unwrap_or("quiet splash");
         toml.push_str(&format!("options = ['{}']\n", args));
     }
-
-    let mut config_file = writer.open_file_writer("/sprout.toml").map_err(|e| {
+    let toml_bytes = toml.as_bytes();
+    let mut config_file = writer.open_file_writer("/sprout.toml", toml_bytes.len() as u64).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to create sprout.toml: {:?}", e))
     })?;
 
-    config_file.write_all(toml.as_bytes()).map_err(|e| {
+    config_file.write_all(toml_bytes).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to write sprout.toml: {:?}", e))
     })?;
     config_file.flush().unwrap();

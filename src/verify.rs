@@ -108,6 +108,24 @@ pub fn verify<R: ImageReader, U: UsbReader>(
                     for i in 0..to_read {
                         if iso_chunk[i] != usb_buf[i] { mismatch_idx = i; break; }
                     }
+
+                    // 👇 ---  DEBUG BLOCK --- 👇
+                    println!("\n================ FATAL DATA CORRUPTION ================");
+                    println!("File: {}", new_path);
+                    println!("Absolute Byte Offset: {}", file_read_so_far + mismatch_idx as u64);
+                    
+                    // Take a 32-byte window around the exact point of failure
+                    let window_start = mismatch_idx.saturating_sub(8);
+                    let window_end = (mismatch_idx + 24).min(to_read);
+                    
+                    println!("\nISO Expected Data:");
+                    for b in &iso_chunk[window_start..window_end] { print!("{:02X} ", b); }
+                    
+                    println!("\n\nUSB Actual Data:");
+                    for b in &usb_buf[window_start..window_end] { print!("{:02X} ", b); }
+                    println!("\n=======================================================\n");
+                    // 👆 ---------------------------- 👆
+
                     return Err(format!(
                         "Corruption in '{}'! Mismatch at byte offset {}. ISO byte: {:#04X}, USB byte: {:#04X}", 
                         new_path, file_read_so_far + mismatch_idx as u64, iso_chunk[mismatch_idx], usb_buf[mismatch_idx]

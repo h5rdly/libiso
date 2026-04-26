@@ -15,7 +15,7 @@ use hadris_part::{
     scheme_io::DiskPartitionSchemeWriteExt
 };
 
-use hadris_fat::exfat::{ExFatFs, ExFatDir}; 
+use hadris_fat::exfat::{ExFatFs}; 
 use hadris_fat::format::{FormatOptions as Fat32FormatOptions, FatVolumeFormatter, FatTypeSelection};
 use fatfs::{ Dir, FileSystem, FsOptions, ReadWriteSeek, TimeProvider, OemCpConverter}; 
 
@@ -28,6 +28,7 @@ use crate::io::{AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread}
 use crate::verify;
 use crate::bootloader;
 use crate::udf;
+use crate::exfat::BareExFat;
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
@@ -457,6 +458,13 @@ pub fn write_image_iso(
     }
     dest_file.sync_all()?;
 
+    let mut lba0_bytes = [0u8; 512];
+    dest_file.seek(SeekFrom::Start(0))?;
+    dest_file.read_exact(&mut lba0_bytes)?;
+    dest_file.seek(SeekFrom::Start(0))?;
+    dest_file.write_all(&[0u8; 512])?;
+    dest_file.sync_all()?;
+
     if let Some((start, sectors)) = persistence_part {
         let ext4_offset = start * 512;
         let ext4_size = sectors * 512;
@@ -514,19 +522,23 @@ pub fn write_image_iso(
         wp.seek(SeekFrom::Start(0)).unwrap();
 
         if has_large_file {
-            let _ = tx.send(EventMsg::phase("Extracting image (exFAT)"));
-            let exfat_fs = match ExFatFs::open(wp) {
+            let _ = tx.send(EventMsg::phase("Extracting image (exFAT Bare-Metal)"));
+            
+            // USE OUR NEW ZERO-DEPENDENCY BARE METAL WRITER!
+            let bare_fs = match BareExFat::mount(wp) {
                 Ok(fs) => fs,
-                Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount exFAT: {:?}", e))); return; }
+                Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount Bare exFAT: {}", e))); return; }
             };
             
-            let writer = ExFatWriter { fs: &exfat_fs };
-            let usb_reader = verify::ExFatUsbReader { fs: &exfat_fs };
+            // We can just mount hadris-fat EXCLUSIVELY for the read-only USB verifier!
+            let wp_verify = PartitionWrapper { inner: dest_file_for_uefi, offset: partition_offset_bytes, size: partition_size_bytes };
+            let verify_fs = ExFatFs::open(wp_verify).unwrap();
+            let usb_reader = verify::ExFatUsbReader { fs: &verify_fs };
             
             run_burn_and_verify(
-                &writer, &usb_reader, &iso_path_clone, &device_path_clone, &tx, total_size, 
+                &bare_fs, &usb_reader, &iso_path_clone, &device_path_clone, &tx, total_size, 
                 has_large_file, &arch_selection, unattend_xml_payload, &autorun_inf_label, 
-                abort_flag, verify_written
+                abort_flag, verify_written, lba0_bytes
             );
             
         } else {
@@ -543,7 +555,7 @@ pub fn write_image_iso(
             run_burn_and_verify(
                 &writer, &usb_reader, &iso_path_clone, &device_path_clone, &tx, total_size, 
                 has_large_file, &arch_selection, unattend_xml_payload, &autorun_inf_label, 
-                abort_flag, verify_written
+                abort_flag, verify_written, lba0_bytes
             );
         }
     });
@@ -568,7 +580,7 @@ pub trait ImageReader {
 pub trait UsbWriter {
     type FileWriter<'w>: Write + 'w where Self: 'w;
     fn create_dir(&self, path: &str) -> Result<(), String>;
-    fn open_file_writer<'w>(&'w self, path: &str) -> Result<Self::FileWriter<'w>, String>;
+    fn open_file_writer<'w>(&'w self, path: &str, size: u64) -> Result<Self::FileWriter<'w>, String>;
 }
 
 // --- ISO9660 READER ---
@@ -643,7 +655,13 @@ impl<'a> ImageReader for UdfReader<'a> {
         let mut nodes = Vec::new();
         for e in udf::read_directory(&mut f, self.ctx.partition_start, &icb)? {
             let name = e.name.split(';').next().unwrap_or(&e.name).to_string();
-            nodes.push(ImageNode { name, is_dir: e.is_directory, size: 0 });
+            let size = if e.is_directory { 
+                0 
+            } else {
+                udf::get_file_size(&mut f, self.ctx.partition_start, &e.icb).unwrap_or(0)
+            };
+            
+            nodes.push(ImageNode { name, is_dir: e.is_directory, size });
         }
         Ok(nodes)
     }
@@ -700,14 +718,15 @@ fn execute_extraction_workflow<R: ImageReader, W: UsbWriter>(
 
     // Unattend XML Injection
     if let Some(xml_contents) = unattend_xml_payload {
-        if let Ok(mut xml_writer) = writer.open_file_writer("autounattend.xml") {
-            let _ = xml_writer.write_all(xml_contents.as_bytes());
+        let bytes = xml_contents.as_bytes();
+        if let Ok(mut xml_writer) = writer.open_file_writer("autounattend.xml", bytes.len() as u64) {
+            let _ = xml_writer.write_all(bytes);
             let _ = xml_writer.flush();
         }
     }
 
     // Autorun.inf
-    if let Ok(mut autorun_writer) = writer.open_file_writer("autorun.inf") {
+    if let Ok(mut autorun_writer) = writer.open_file_writer("autorun.inf", autorun_inf_label.len() as u64 + 17) {
         let autorun_content = format!("[autorun]\nlabel={}\n", autorun_inf_label);
         let _ = autorun_writer.write_all(autorun_content.as_bytes());
         let _ = autorun_writer.flush();
@@ -749,6 +768,7 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
     autorun_inf_label: &str,
     abort_flag: Arc<AtomicBool>,
     verify_written: bool,
+    lba0_bytes: [u8; 512], 
 ) {
     let mut file = File::open(iso_path).unwrap();
     let is_udf_valid = if let Ok(udf_ctx) = crate::udf::mount_udf(&mut file) {
@@ -779,31 +799,34 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
         return;
     }
 
+     // Flush the OS cache
+    if let Ok(mut f_reread) = OpenOptions::new().read(true).write(true).open(device_path) {
+        f_reread.seek(SeekFrom::Start(0)).unwrap();
+        f_reread.write_all(&lba0_bytes).unwrap();
+        f_reread.sync_all().unwrap();
+
+        if let Err(e) = trigger_os_reread(&f_reread, device_path) {
+            let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
+        } else {
+            let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
+        }
+    }
+
     if verify_written {
         let mut file = File::open(iso_path).unwrap();
-        let skip_bootloader = !has_large_file; // True for Linux, False for Windows
         let verify_res = if is_udf_valid {
             let udf_ctx = crate::udf::mount_udf(&mut file).unwrap();
             let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
-            execute_verify_workflow(&reader, usb_reader, tx, total_size, skip_bootloader)
+            execute_verify_workflow(&reader, usb_reader, tx, total_size, !has_large_file)
         } else {
             let iso_file = File::open(iso_path).unwrap();
             let iso = IsoImage::open(iso_file).unwrap();
             let reader = IsoReader { iso: &iso };
-            execute_verify_workflow(&reader, usb_reader, tx, total_size, skip_bootloader)
+            execute_verify_workflow(&reader, usb_reader, tx, total_size, !has_large_file)
         };
         if let Err(e) = verify_res {
             let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
             return;
-        }
-    }
-
-    // Open a fresh file handle to the physical device to flush the OS caches
-    if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(device_path) {
-        if let Err(e) = trigger_os_reread(&f_reread, iso_path) {
-            let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
-        } else {
-            let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
         }
     }
 
@@ -839,7 +862,7 @@ impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbWriter for 
         parent.create_dir(&name).map_err(|e| format!("{:?}", e))?;
         Ok(())
     }
-    fn open_file_writer<'w>(&'w self, path: &str) -> Result<Self::FileWriter<'w>, String> {
+    fn open_file_writer<'w>(&'w self, path: &str, _size: u64) -> Result<Self::FileWriter<'w>, String> {
         let (parent, name) = self.nav(path)?;
         let mut f = parent.create_file(&name).map_err(|e| format!("{:?}", e))?;
         f.truncate().map_err(|e| format!("{:?}", e))?; 
@@ -847,57 +870,6 @@ impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbWriter for 
     }
 }
 
-// --- EXFAT WRITER ---
-pub struct ExFatWriter<'a, T: Read + Write + Seek> { pub fs: &'a ExFatFs<T> }
-pub struct ExFatFileWriterWrapper<'a, T: Read + Write + Seek> { 
-    inner: Option<hadris_fat::exfat::ExFatFileWriter<'a, T>> 
-}
-impl<'a, T: Read + Write + Seek> Write for ExFatFileWriterWrapper<'a, T> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(writer) = &mut self.inner {
-            writer.write(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
-        } else {
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "File already flushed/closed"))
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        // take() removes the writer from the Option, giving us ownership so we can call finish(self)!
-        if let Some(writer) = self.inner.take() {
-            writer.finish().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
-        } else {
-            Ok(()) // Already flushed
-        }
-    }
-}
-impl<'a, T: Read + Write + Seek> ExFatWriter<'a, T> {
-    fn nav(&self, path: &str) -> Result<(ExFatDir<'a, T>, String), String> {
-        let mut curr = self.fs.root_dir();
-        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let target = parts.pop().unwrap_or("").to_string();
-        
-        // hadris_fat ExFatDir doesn't have an open_dir like fatfs, we use fs.open_dir(&parent, name)
-        for p in parts { 
-            if !p.is_empty() { 
-                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?;
-            } 
-        }
-        Ok((curr, target))
-    }
-}
-impl<'a, T: Read + Write + Seek> UsbWriter for ExFatWriter<'a, T> {
-    type FileWriter<'w> = ExFatFileWriterWrapper<'w, T> where Self: 'w;
-    fn create_dir(&self, path: &str) -> Result<(), String> {
-        let (parent, name) = self.nav(path)?;
-        self.fs.create_dir(&parent, &name).map_err(|e| format!("{:?}", e))?;
-        Ok(())
-    }
-    fn open_file_writer<'w>(&'w self, path: &str) -> Result<Self::FileWriter<'w>, String> {
-        let (parent, name) = self.nav(path)?;
-        let entry = self.fs.create_file(&parent, &name).map_err(|e| format!("{:?}", e))?;
-        let f = self.fs.write_file(&entry).map_err(|e| format!("{:?}", e))?;
-        Ok(ExFatFileWriterWrapper { inner: Some(f) }) // Wrap in Some()!
-    }
-}
 
 pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
     reader: &R,
@@ -927,7 +899,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             copy_recursive(reader, writer, &new_path, tx, bytes_written, total_size, found_kernel, found_initrd, found_args, abort_flag.clone())?;
         } else {
             let _ = tx.send(EventMsg::log(&format!("Extracting: {}", new_path)));
-            let mut out_file = writer.open_file_writer(&new_path)?;
+            let mut out_file = writer.open_file_writer(&new_path, entry.size)?;
             
             bootloader::detect_linux_payloads(&clean_name, current_path, found_kernel, found_initrd);
             
@@ -1051,7 +1023,7 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
 
 fn extract_to_fs<R: ImageReader>(reader: &R, current_path: &str, host_dir: &Path,
 ) -> Result<(), String> {
-    
+
     let entries = reader.list_dir(current_path)?;
 
     for entry in entries {

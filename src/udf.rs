@@ -539,3 +539,26 @@ pub fn read_file_bytes(iso_file: &mut File, partition_start: u32, entry: &UdfDir
     })?;
     Ok(data)
 }
+
+
+pub fn get_file_size(file: &mut File, partition_start: u32, icb: &LongAllocationDescriptor) -> Result<u64, String> {
+    let sector = partition_start as u64 + icb.logical_block_num as u64;
+    file.seek(SeekFrom::Start(sector * SECTOR_SIZE as u64)).map_err(|e| e.to_string())?;
+    
+    let mut buffer = [0u8; SECTOR_SIZE];
+    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+
+    let tag: DescriptorTag = bytemuck::pod_read_unaligned(&buffer[..16]);
+    
+    match tag.tag_identifier {
+        261 => { 
+            let fe: FileEntry = bytemuck::pod_read_unaligned(&buffer[..FileEntry::BASE_SIZE]);
+            Ok(fe.information_length)
+        },
+        266 => { 
+            let efe: ExtendedFileEntry = bytemuck::pod_read_unaligned(&buffer[..ExtendedFileEntry::BASE_SIZE]);
+            Ok(efe.information_length)
+        }
+        _ => Err(format!("Invalid ICB tag id for size lookup: {}", tag.tag_identifier)),
+    }
+}
