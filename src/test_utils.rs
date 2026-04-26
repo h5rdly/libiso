@@ -1,9 +1,12 @@
 use std::sync::{Arc, mpsc};
 use std::io::{Cursor, Read, Write, Seek, SeekFrom};
+use std::fs::File;
 
 use hadris_iso::write::{IsoImageWriter, InputFiles, File as IsoFile};
 use hadris_iso::write::options::{FormatOptions, CreationFeatures, BaseIsoLevel};
 use hadris_iso::read::PathSeparator;
+
+use sha2::{Sha256, Digest};
 
 use pyo3::prelude::*;
 
@@ -275,4 +278,38 @@ pub fn create_mock_esd() -> PyResult<Vec<u8>> {
     wim.extend(xml_data);
 
     Ok(wim)
+}
+
+
+#[pyfunction]
+#[pyo3(signature = (file_path))]
+pub fn hash_sha256(file_path: String) -> PyResult<String> {
+    let mut file = File::open(&file_path).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to open file '{}': {}", file_path, e))
+    })?;
+
+    let mut hasher = Sha256::new();
+    // 64KB buffer for efficient disk streaming
+    let mut buffer = vec![0u8; 64 * 1024]; 
+
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to read file: {}", e))
+        })?;
+        
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+
+    let result = hasher.finalize();
+
+    // Manually format each byte as a 2-character lowercase hex string
+    let mut hex_string = String::with_capacity(64);
+    for byte in result {
+        hex_string.push_str(&format!("{:02x}", byte));
+    }
+    
+    Ok(hex_string)
 }

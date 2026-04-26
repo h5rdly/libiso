@@ -1047,3 +1047,76 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
 
     Ok(found_files)
 }
+
+
+fn extract_to_fs<R: ImageReader>(reader: &R, current_path: &str, host_dir: &Path,
+) -> Result<(), String> {
+    
+    let entries = reader.list_dir(current_path)?;
+
+    for entry in entries {
+        let clean_name = entry.name;
+        if clean_name == "." || clean_name == ".." || clean_name.is_empty() { 
+            continue; 
+        }
+
+        let new_img_path = if current_path.is_empty() { 
+            format!("/{}", clean_name) 
+        } else { 
+            format!("{}/{}", current_path, clean_name) 
+        };
+        
+        let new_host_path = host_dir.join(&clean_name);
+
+        if entry.is_dir {
+            std::fs::create_dir_all(&new_host_path).map_err(|e| e.to_string())?;
+            extract_to_fs(reader, &new_img_path, &new_host_path)?;
+        } else {
+            let mut out_file = File::create(&new_host_path).map_err(|e| e.to_string())?;
+            reader.stream_file(&new_img_path, &mut |chunk| {
+                out_file.write_all(chunk).map_err(|e| e.to_string())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+
+#[pyfunction]
+#[pyo3(signature = (image_path, extract_dir))]
+pub fn extract_image(image_path: String, extract_dir: String) -> PyResult<()> {
+    let host_root = Path::new(&extract_dir);
+    if !host_root.exists() {
+        std::fs::create_dir_all(host_root)?;
+    }
+
+    let mut file = File::open(&image_path).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to open ISO: {}", e))
+    })?;
+
+    let is_udf_valid = if let Ok(udf_ctx) = crate::udf::mount_udf(&mut file) {
+        crate::udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb).is_ok()
+    } else { 
+        false 
+    };
+
+    if is_udf_valid {
+        let udf_ctx = crate::udf::mount_udf(&mut file).unwrap();
+        let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
+        extract_to_fs(&reader, "", host_root).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(e)
+        })?;
+    } else {
+        let iso_file = File::open(&image_path)?;
+        let iso = IsoImage::open(iso_file).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to parse ISO9660: {:?}", e))
+        })?;
+        let reader = IsoReader { iso: &iso };
+        extract_to_fs(&reader, "", host_root).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(e)
+        })?;
+    }
+
+    Ok(())
+}
+

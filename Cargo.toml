@@ -2,23 +2,27 @@
 name = "libiso"
 version = "0.0.8"
 edition = "2024"
-# rust-version = "1.95"   # The stabilized MaybeUninit<[T; N]> can allow skipping zero-filling
+rust-version = "1.95"   # The stabilized MaybeUninit<[T; N]> can allow skipping zero-filling
 
 [lib]
 name = "_libiso"
 crate-type = ["cdylib"]
 
 
+[target.'cfg(target_os = "linux")'.dependencies]
+drives = "0.6.1"   # Get drive data directly from
+
 [dependencies]
 sysinfo = "0.38.4"
 
 hadris-iso = "1.1.2"
-# hadris-udf = "1.1.2"  # has an overflow bytemuck panic currently, rolling our own UDF reader
 bytemuck = "1.25"
 hadris-fat = {version = "1.1.2", features = ["exfat"]} 
 hadris-part = { version = "1.1.2", features = ["crc"] }
-arcbox-ext4 = "0.1.1"   # https://github.com/arcboxlabs/ext4-rs
+arcbox-ext4 = "0.1.2"   # https://github.com/arcboxlabs/ext4-rs
 fatfs = { features = ["lfn", "std", "alloc"], git = "https://github.com/rafalh/rust-fatfs.git"}
+
+edera-sprout-parsing = {git = "https://github.com/edera-dev/sprout.git", version = "0.0.28" } 
 
 temp-file = "=0.1.4"
 log = "0.4.1"
@@ -30,8 +34,6 @@ der = { version = "0.8", features = ["alloc", "derive"] }
 sha1 = "0.11"
 sha2 = "0.11"
 
-edera-sprout-parsing = {git = "https://github.com/edera-dev/sprout.git", version = "0.0.28" } 
-
 # sbsign specific
 spki = "0.8.0"
 x509-cert = { version = " 0.3.0-rc.4", features = ["pem", "builder"] }
@@ -41,9 +43,6 @@ rand = "0.10.1"
 
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 
-
-[target.'cfg(target_os = "linux")'.dependencies]
-drives = "0.6.1"
 
 
 [profile.release]
