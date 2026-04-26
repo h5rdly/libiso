@@ -1,251 +1,181 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::thread;
 
-use fatfs::{Dir, FileSystem, ReadWriteSeek, TimeProvider, OemCpConverter}; 
-use hadris_fat::exfat::{ExFatFs, ExFatDir, ExFatFileReader};
-
-use hadris_iso::read::IsoImage;
-use hadris_iso::directory::DirectoryRef;
+use fatfs::{FileSystem, ReadWriteSeek, TimeProvider, OemCpConverter}; 
+use hadris_fat::exfat::{ExFatFs, ExFatFileReader};
 
 use pyo3::prelude::*;
 
-use crate::writer::{EventMsg, ProgressStream, DD_CHUNK_SIZE, ISO_CHUNK_SIZE, get_clean_filename};
+use crate::writer::{ImageReader, EventMsg, ProgressStream, ISO_CHUNK_SIZE, DD_CHUNK_SIZE};
 use crate::io::{AlignedBuffer};
 
 
+pub trait UsbReader {
+    type FileReader<'a>: Read + 'a where Self: 'a;
+    fn open_file_reader<'a>(&'a self, path: &str) -> Result<Self::FileReader<'a>, String>;
+}
 
-// Compare a file from the ISO against a file on the USB drive byte-for-byte
-pub fn verify_file_chunks(
-    mut iso_file: impl Read,
-    mut usb_file: impl Read,
-    file_size: u64,
-    file_name: &str,
+pub struct Fat32UsbReader<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { pub fs: &'a FileSystem<T, TP, OCC> }
+pub struct Fat32FileReader<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { inner: fatfs::File<'a, T, TP, OCC> }
+
+impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for Fat32FileReader<'a, T, TP, OCC> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        fatfs::Read::read(&mut self.inner, buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+    }
+}
+
+impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbReader for Fat32UsbReader<'a, T, TP, OCC> {
+    type FileReader<'r> = Fat32FileReader<'r, T, TP, OCC> where Self: 'r;
+    fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
+        let mut curr = self.fs.root_dir();
+        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let target = parts.pop().unwrap_or("");
+        for p in parts { 
+            if !p.is_empty() { 
+                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; 
+            } 
+        }
+        let f = curr.open_file(target).map_err(|e| format!("{:?}", e))?;
+        Ok(Fat32FileReader { inner: f })
+    }
+}
+
+pub struct ExFatUsbReader<'a, T: Read + Write + Seek> { pub fs: &'a ExFatFs<T> }
+
+impl<'a, T: Read + Write + Seek> UsbReader for ExFatUsbReader<'a, T> {
+    type FileReader<'r> = ExFatFileReader<'r, T> where Self: 'r;
+    fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
+        let mut curr = self.fs.root_dir();
+        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let target = parts.pop().unwrap_or("");
+        for p in parts { 
+            if !p.is_empty() { 
+                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; 
+            } 
+        }
+        let entry = curr.find(target).map_err(|e| format!("{:?}", e))?.ok_or_else(|| "File not found".to_string())?;
+        ExFatFileReader::new(self.fs, &entry).map_err(|e| format!("{:?}", e))
+    }
+}
+
+
+pub fn verify<R: ImageReader, U: UsbReader>(
+    iso_reader: &R,
+    usb_reader: &U,
+    current_path: &str,
     tx: &kanal::Sender<EventMsg>,
-    verified_bytes: &mut u64,
+    verified: &mut u64,
     total_size: u64,
+    skip_bootloader: bool, // <-- Add this flag!
 ) -> Result<(), String> {
+    let entries = iso_reader.list_dir(current_path)?;
 
-    let chunk_size = DD_CHUNK_SIZE;
-    let mut buf_iso = AlignedBuffer::new(chunk_size);
-    let mut buf_usb = AlignedBuffer::new(chunk_size);
-    let mut read_so_far = 0u64;
-
-    while read_so_far < file_size {
-        let to_read = std::cmp::min(chunk_size as u64, file_size - read_so_far) as usize;
+    for entry in entries {
+        let clean_name = entry.name;
+        if clean_name == "." || clean_name == ".." || clean_name.is_empty() { continue; }
         
-        iso_file.read_exact(&mut buf_iso[..to_read]).map_err(|e| format!("ISO read error in '{}': {}", file_name, e))?;
-        usb_file.read_exact(&mut buf_usb[..to_read]).map_err(|e| format!("USB read error in '{}': {:?}", file_name, e))?;
+        let new_path = if current_path.is_empty() { format!("/{}", clean_name) } else { format!("{}/{}", current_path, clean_name) };
 
-        if buf_iso[..to_read] != buf_usb[..to_read] {
-            let mut mismatch_idx = 0;
-            for i in 0..to_read {
-                if buf_iso[i] != buf_usb[i] {
-                    mismatch_idx = i;
-                    break;
+        if entry.is_dir {
+            verify(iso_reader, usb_reader, &new_path, tx, verified, total_size, skip_bootloader)?;
+        } else {
+            let clean_lower = clean_name.to_lowercase();
+            let mut skip_verify = matches!(clean_lower.as_str(), "sprout.toml" | "autounattend.xml" | "autorun.inf");
+            
+            // If we injected Sprout, skip verifying the EFI boot files
+            if skip_bootloader && matches!(clean_lower.as_str(), "bootx64.efi" | "bootaa64.efi") {
+                skip_verify = true;
+            }
+
+            if skip_verify {
+                *verified += entry.size; 
+                let _ = tx.send(EventMsg::progress(*verified, total_size));
+                continue;
+            }
+
+            let mut usb_file = usb_reader.open_file_reader(&new_path)?;
+            let mut file_read_so_far = 0u64;
+            let mut usb_buf = vec![0u8; ISO_CHUNK_SIZE];
+
+            // Stream from ISO, and pull the exact matching chunk from the USB drive
+            iso_reader.stream_file(&new_path, &mut |iso_chunk| {
+                let to_read = iso_chunk.len();
+                usb_file.read_exact(&mut usb_buf[..to_read]).map_err(|e| format!("USB read err in '{}': {}", new_path, e))?;
+                
+                if iso_chunk != &usb_buf[..to_read] {
+                    let mut mismatch_idx = 0;
+                    for i in 0..to_read {
+                        if iso_chunk[i] != usb_buf[i] { mismatch_idx = i; break; }
+                    }
+                    return Err(format!(
+                        "Corruption in '{}'! Mismatch at byte offset {}. ISO byte: {:#04X}, USB byte: {:#04X}", 
+                        new_path, file_read_so_far + mismatch_idx as u64, iso_chunk[mismatch_idx], usb_buf[mismatch_idx]
+                    ));
                 }
-            }
-            let abs_offset = read_so_far + mismatch_idx as u64;
-            return Err(format!(
-                "Corruption in '{}'! Mismatch at byte offset {}. ISO byte: {:#04X}, USB byte: {:#04X}", 
-                file_name, abs_offset, buf_iso[mismatch_idx], buf_usb[mismatch_idx]
-            ));
-        }
-
-        read_so_far += to_read as u64;
-        *verified_bytes += to_read as u64;
-        
-        if tx.send(EventMsg::progress(*verified_bytes, total_size)).is_err() {
-            return Err("Python disconnected".to_string());
+                
+                file_read_so_far += to_read as u64;
+                *verified += to_read as u64;
+                let _ = tx.send(EventMsg::progress(*verified, total_size));
+                Ok(())
+            })?;
         }
     }
     Ok(())
 }
 
 
-pub fn verify_recursive<T, U, TP, OCC>(
-    usb_fs: &FileSystem<U, TP, OCC>,
-    iso_img: &IsoImage<T>,
-    iso_dir: DirectoryRef,
-    usb_dir: &Dir<'_, U, TP, OCC>, 
-    tx: &kanal::Sender<EventMsg>,
-    verified: &mut u64,
-    total_size: u64,
-) -> Result<(), String>
-where 
-    T: std::io::Read + std::io::Seek,
-    // tell Rust that U uses standard std::io::Error so fatfs::File implements std::io::Read
-    U: ReadWriteSeek<Error = std::io::Error>, 
-    TP: TimeProvider,    
-    OCC: OemCpConverter, 
-{
-    let parsed_iso_dir = iso_img.open_dir(iso_dir);
+// -- USB drive claimed size verification 
 
-    for entry_result in parsed_iso_dir.entries() {
-        let entry = entry_result.map_err(|e| format!("ISO read err: {:?}", e))?;
-        if entry.is_special() { continue; }
-        let clean_name = get_clean_filename(&entry);
-
-        if entry.is_directory() {
-            let mut usb_subdir = usb_dir.open_dir(&clean_name).map_err(|e| format!("Missing USB dir '{}': {:?}", clean_name, e))?;
-            let sub_ref = entry.as_dir_ref(iso_img).map_err(|e| format!("Dir ref err: {}", e))?;
-            verify_recursive(usb_fs, iso_img, sub_ref, &mut usb_subdir, tx, verified, total_size)?;
-        } else {
-            if matches!(
-                clean_name.to_lowercase().as_str(),
-                "bootx64.efi" | "bootaa64.efi" | "sprout.toml" | "autounattend.xml"
-            ) {
-                // Skip verification for files we intentionally altered/injected
-                *verified += entry.total_size() as u64; // Artificially advance the progress bar
-                let _ = tx.send(EventMsg::progress(*verified, total_size)); // Advance the progress bar
-                continue;
-            }
-
-            let iso_data = iso_img.read_file(&entry).map_err(|e| format!("Failed to read ISO file '{}': {}", clean_name, e))?;
-            let usb_file = usb_dir.open_file(&clean_name).map_err(|e| format!("Missing USB file '{}': {:?}", clean_name, e))?;
-            
-            verify_file_chunks(&iso_data[..], usb_file, entry.total_size(), &clean_name, tx, verified, total_size)?;        }
-    }
-    Ok(())
-}
-
-
-pub fn verify_recursive_exfat<T, U>(
-    usb_fs: &ExFatFs<U>,
-    iso_img: &IsoImage<T>,
-    iso_dir: DirectoryRef,
-    usb_dir: &ExFatDir<'_, U>, 
-    tx: &kanal::Sender<EventMsg>,
-    verified: &mut u64,
-    total_size: u64,
-) -> Result<(), String> 
-where 
-    T: std::io::Read + std::io::Seek,
-    U: std::io::Read + std::io::Write + std::io::Seek,
-{
-    let parsed_iso_dir = iso_img.open_dir(iso_dir);
-
-    for entry_result in parsed_iso_dir.entries() {
-        let entry = entry_result.map_err(|e| format!("ISO read err: {:?}", e))?;
-        if entry.is_special() { continue; }
-        let clean_name = get_clean_filename(&entry);
-
-        if entry.is_directory() {
-            let usb_subdir = usb_dir.open_dir(&clean_name).map_err(|e| format!("Missing USB dir '{}': {:?}", clean_name, e))?;
-            let sub_ref = entry.as_dir_ref(iso_img).map_err(|e| format!("Dir ref err: {}", e))?;
-            verify_recursive_exfat(usb_fs, iso_img, sub_ref, &usb_subdir, tx, verified, total_size)?;
-        } else {
-            if matches!(
-                clean_name.to_lowercase().as_str(),
-                "bootx64.efi" | "bootaa64.efi" | "sprout.toml" | "autounattend.xml"
-            ) {
-                // Skip verification for files we intentionally altered/injected
-                *verified += entry.total_size() as u64; // Artificially advance the progress bar
-                let _ = tx.send(EventMsg::progress(*verified, total_size)); // Advance the progress bar
-                continue;
-            }
-            let iso_data = iso_img.read_file(&entry).map_err(|e| format!("Failed to read ISO file '{}': {}", clean_name, e))?;
-            
-            let usb_entry_opt = usb_dir.find(&clean_name).map_err(|e| format!("USB find err: {:?}", e))?;
-            let usb_entry = usb_entry_opt.ok_or_else(|| format!("Missing USB file: {}", clean_name))?;
-            
-            let usb_file = ExFatFileReader::new(usb_fs, &usb_entry).map_err(|e| format!("Failed to open USB file: {:?}", e))?;
-            
-            verify_file_chunks(&iso_data[..], usb_file, entry.total_size(), &clean_name, tx, verified, total_size)?;
-        }
-    }
-    Ok(())
-}
-
-
-
-/// The core algorithm, separated from OS files so we can test it in-memory.
 pub fn verify_hardware_capacity<T: Read + Write + Seek>(
-    drive: &mut T,
-    total_size: u64,
-    tx: &kanal::Sender<EventMsg>,
+    drive: &mut T, total_size: u64, tx: &kanal::Sender<EventMsg>,
     mut sync_fn: impl FnMut(&mut T) -> Result<(), String>, 
 ) -> Result<(), String> {
 
     let chunk_size = std::cmp::min(DD_CHUNK_SIZE, total_size as usize);
     let mut buf = AlignedBuffer::new(chunk_size);
-    
-    // A magic 64-bit number to XOR against the offset
     let magic: u64 = 0xAA55AA55_DEADBEEF;
 
-    // Pass 1 - write deterministic pattern
     let mut offset = 0u64;
     while offset < total_size {
         let to_write = std::cmp::min(chunk_size as u64, total_size - offset) as usize;
-        
         for i in (0..to_write).step_by(8) {
-            let current_pos = offset + i as u64;
-            let val = current_pos ^ magic;
-            let val_bytes = val.to_le_bytes();
-            
+            let val = (offset + i as u64) ^ magic;
             let copy_len = std::cmp::min(8, to_write - i);
-            buf[i..i + copy_len].copy_from_slice(&val_bytes[..copy_len]);
+            buf[i..i + copy_len].copy_from_slice(&val.to_le_bytes()[..copy_len]);
         }
-
         drive.write_all(&buf[..to_write]).map_err(|e| format!("Hardware write failed at offset {}: {}", offset, e))?;
         offset += to_write as u64;
-        
-        if tx.send(EventMsg::progress(offset, total_size * 2)).is_err() {
-            return Err("Python disconnected".to_string());
-        }
+        let _ = tx.send(EventMsg::progress(offset, total_size * 2));
     }
 
     sync_fn(drive)?;
     drive.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
 
-    // Pass 2 - read and verify deterministic pattern
     offset = 0;
     while offset < total_size {
         let to_read = std::cmp::min(chunk_size as u64, total_size - offset) as usize;
-        
         drive.read_exact(&mut buf[..to_read]).map_err(|e| format!("Hardware read failed at offset {}: {}", offset, e))?;
-
         for i in (0..to_read).step_by(8) {
             let current_pos = offset + i as u64;
-            let expected_val = current_pos ^ magic;
-            let expected_bytes = expected_val.to_le_bytes();
-            
+            let expected_bytes = (current_pos ^ magic).to_le_bytes();
             let copy_len = std::cmp::min(8, to_read - i);
-            
             if buf[i..i + copy_len] != expected_bytes[..copy_len] {
-                return Err(format!(
-                    "Fake drive detected! Hardware capacity spoofing found at byte offset {}. \
-                     The drive looped around and overwrote its own data.", 
-                     current_pos
-                ));
+                return Err(format!("Fake drive detected! Hardware capacity spoofing found at byte offset {}.", current_pos));
             }
         }
-
         offset += to_read as u64;
-        
-        if tx.send(EventMsg::progress(total_size + offset, total_size * 2)).is_err() {
-            return Err("Python disconnected".to_string());
-        }
+        let _ = tx.send(EventMsg::progress(total_size + offset, total_size * 2));
     }
-
     Ok(())
 }
 
 
-// Used by the PyO3 binding
-pub fn verify_usb_size(
-    device_path: &str, tx: &kanal::Sender<EventMsg>,) -> Result<(), String> {
+pub fn verify_usb_size(device_path: &str, tx: &kanal::Sender<EventMsg>) -> Result<(), String> {
     
-    let mut file = crate::io::open_device(device_path, true)
-        .map_err(|e| format!("Failed to open device for hardware verification: {}", e))?;
-
+    let mut file = crate::io::open_device(device_path, true).map_err(|e| format!("Failed to open device: {}", e))?;
     let total_size = file.seek(SeekFrom::End(0)).map_err(|e| format!("Seek err: {}", e))?;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-
-    verify_hardware_capacity(&mut file, total_size, tx, |f| {
-        // bypassing OS cache for real physical validation
-        f.sync_all().map_err(|e| format!("Hardware sync failed: {}", e))
-    })
+    verify_hardware_capacity(&mut file, total_size, tx, |f| f.sync_all().map_err(|e| e.to_string()))
 }
 
 
@@ -253,121 +183,8 @@ pub fn verify_usb_size(
 #[pyo3(signature = (device_path))]
 pub fn destructive_verify_usb_size(device_path: String) -> PyResult<ProgressStream> {
     let (tx, rx) = kanal::bounded::<EventMsg>(100);
-
     thread::spawn(move || {
-        if let Err(e) = verify_usb_size(&device_path, &tx) {
-            let _ = tx.send(EventMsg::error(&e));
-        }
+        if let Err(e) = verify_usb_size(&device_path, &tx) { let _ = tx.send(EventMsg::error(&e)); }
     });
-
     Ok(ProgressStream { rx })
-}
-
-
-// streaming verifier for UDF files
-pub fn verify_udf_file(
-    iso_file: &mut File,
-    partition_start: u32,
-    entry: &crate::udf::UdfDirEntry,
-    mut usb_file: impl Read,
-    file_name: &str,
-    tx: &kanal::Sender<EventMsg>,
-    verified_bytes: &mut u64,
-    total_size: u64,
-) -> Result<(), String> {
-    let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
-    let mut usb_buf = vec![0u8; ISO_CHUNK_SIZE];
-    let mut read_so_far = 0u64;
-
-    crate::udf::stream_file_data(iso_file, partition_start, entry, &mut chunk_buf, |chunk| {
-        let to_read = chunk.len();
-        usb_file.read_exact(&mut usb_buf[..to_read]).map_err(|e| format!("USB read err in '{}': {}", file_name, e))?;
-        
-        if chunk != &usb_buf[..to_read] {
-            let mut mismatch_idx = 0;
-            for i in 0..to_read {
-                if chunk[i] != usb_buf[i] { mismatch_idx = i; break; }
-            }
-            return Err(format!(
-                "Corruption in '{}'! Mismatch at byte offset {}. ISO byte: {:#04X}, USB byte: {:#04X}", 
-                file_name, read_so_far + mismatch_idx as u64, chunk[mismatch_idx], usb_buf[mismatch_idx]
-            ));
-        }
-        
-        read_so_far += to_read as u64;
-        *verified_bytes += to_read as u64;
-        let _ = tx.send(EventMsg::progress(*verified_bytes, total_size));
-        Ok(())
-    })?;
-    Ok(())
-}
-
-
-pub fn verify_recursive_udf<T, TP, OCC>(
-    udf_ctx: &crate::udf::UdfContext,
-    udf_entries: &[crate::udf::UdfDirEntry],
-    usb_dir: &mut Dir<'_, T, TP, OCC>,
-    tx: &kanal::Sender<EventMsg>,
-    verified: &mut u64,
-    total_size: u64,
-    iso_path: &str,
-) -> Result<(), String>
-where T: ReadWriteSeek<Error = std::io::Error>, TP: TimeProvider, OCC: OemCpConverter {
-    for entry in udf_entries {
-        let clean_name = entry.name.split(';').next().unwrap_or(&entry.name).to_string();
-        if clean_name == "." || clean_name == ".." || clean_name.is_empty() { continue; }
-
-        if entry.is_directory {
-            let mut usb_subdir = usb_dir.open_dir(&clean_name).map_err(|e| format!("Missing USB dir: {}", e))?;
-            let mut file = File::open(iso_path).map_err(|e| e.to_string())?;
-            let sub_entries = crate::udf::read_directory(&mut file, udf_ctx.partition_start, &entry.icb)?;
-            verify_recursive_udf(udf_ctx, &sub_entries, &mut usb_subdir, tx, verified, total_size, iso_path)?;
-        } else {
-            if matches!(clean_name.to_lowercase().as_str(), "bootx64.efi" | "bootaa64.efi" | "sprout.toml" | "autounattend.xml" | "autorun.inf") {
-                continue;
-            }
-            let usb_file = usb_dir.open_file(&clean_name).map_err(|e| format!("Missing USB file '{}': {}", clean_name, e))?;
-            let mut file = File::open(iso_path).map_err(|e| e.to_string())?;
-            verify_udf_file(&mut file, udf_ctx.partition_start, entry, usb_file, &clean_name, tx, verified, total_size)?;
-        }
-    }
-    Ok(())
-}
-
-
-pub fn verify_recursive_udf_exfat<U>(
-    usb_fs: &ExFatFs<U>,
-    udf_ctx: &crate::udf::UdfContext,
-    udf_entries: &[crate::udf::UdfDirEntry],
-    usb_dir: &ExFatDir<'_, U>,
-    tx: &kanal::Sender<EventMsg>,
-    verified: &mut u64,
-    total_size: u64,
-    iso_path: &str,
-) -> Result<(), String>
-where
-    U: std::io::Read + std::io::Write + std::io::Seek,
-{
-    for entry in udf_entries {
-        let clean_name = entry.name.split(';').next().unwrap_or(&entry.name).to_string();
-        if clean_name == "." || clean_name == ".." || clean_name.is_empty() { continue; }
-
-        if entry.is_directory {
-            let usb_subdir = usb_dir.open_dir(&clean_name).map_err(|e| format!("Missing USB dir: {:?}", e))?;
-            let mut file = File::open(iso_path).map_err(|e| e.to_string())?;
-            let sub_entries = crate::udf::read_directory(&mut file, udf_ctx.partition_start, &entry.icb)?;
-            verify_recursive_udf_exfat(usb_fs, udf_ctx, &sub_entries, &usb_subdir, tx, verified, total_size, iso_path)?;
-        } else {
-            if matches!(clean_name.to_lowercase().as_str(), "bootx64.efi" | "bootaa64.efi" | "sprout.toml" | "autounattend.xml" | "autorun.inf") {
-                continue;
-            }
-            let usb_entry_opt = usb_dir.find(&clean_name).map_err(|e| format!("USB find err: {:?}", e))?;
-            let usb_entry = usb_entry_opt.ok_or_else(|| format!("Missing USB file: {}", clean_name))?;
-            let usb_file = ExFatFileReader::new(usb_fs, &usb_entry).map_err(|e| format!("Failed to open USB file: {:?}", e))?;
-            
-            let mut file = File::open(iso_path).map_err(|e| e.to_string())?;
-            verify_udf_file(&mut file, udf_ctx.partition_start, entry, usb_file, &clean_name, tx, verified, total_size)?;
-        }
-    }
-    Ok(())
 }

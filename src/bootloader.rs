@@ -1,50 +1,44 @@
-use std::io::{Write};
+use std::io::Write;
 
-use fatfs::{Dir, ReadWriteSeek, TimeProvider, OemCpConverter}; 
-use edera_sprout_parsing::{match_kernel_prefix, LINUX_KERNEL_PREFIXES, 
-    LINUX_INITRAMFS_PREFIXES};  // initramfs_candidates
+use edera_sprout_parsing::{match_kernel_prefix, LINUX_KERNEL_PREFIXES, LINUX_INITRAMFS_PREFIXES}; 
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::PyResult;
 
+use crate::writer::UsbWriter;
 
-// Embed both Sprout binaries directly into libiso
+// Embed  Sprout binaries directly into libiso
 const SPROUT_X86_64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_x86_64.efi");
 const SPROUT_AARCH64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_aarch64.efi");
 
 
-// Installs the Sprout UEFI bootloader onto the root of the FAT32/exFAT partition
-pub fn install_uefi_sprout<T, TP, OCC>(
-    root_dir: &Dir<'_, T, TP, OCC>, target_arch: &str, // Expects "x86_64", "aarch64", or "all"
-) -> PyResult<()> 
-where 
-    T: ReadWriteSeek<Error = std::io::Error>,
-    TP: TimeProvider,
-    OCC: OemCpConverter,
-{
-
-    let efi_dir = root_dir.create_dir("EFI").unwrap_or_else(|_| root_dir.open_dir("EFI").unwrap());
-    let boot_dir = efi_dir.create_dir("BOOT").unwrap_or_else(|_| efi_dir.open_dir("BOOT").unwrap());
+// Installs the Sprout UEFI bootloader using our generic UsbWriter!
+pub fn install_uefi_sprout<W: UsbWriter>(
+    writer: &W, target_arch: &str, // Expects "x86_64", "aarch64", or "all"
+) -> PyResult<()> {
+    
+    // We ignore errors here in case the directories already exist
+    let _ = writer.create_dir("/EFI");
+    let _ = writer.create_dir("/EFI/BOOT");
 
     if target_arch == "x86_64" || target_arch == "all" {
-        let mut sprout_x64 = boot_dir.create_file("BOOTX64.EFI").map_err(|e| {
+        let mut sprout_x64 = writer.open_file_writer("/EFI/BOOT/BOOTX64.EFI").map_err(|e| {
             PyRuntimeError::new_err(format!("Failed to create BOOTX64.EFI: {:?}", e))
         })?;
-        sprout_x64.truncate().unwrap();
         sprout_x64.write_all(SPROUT_X86_64).unwrap();
+        sprout_x64.flush().unwrap();
     }
 
     if target_arch == "aarch64" || target_arch == "all" {
-        let mut sprout_aa64 = boot_dir.create_file("BOOTAA64.EFI").map_err(|e| {
+        let mut sprout_aa64 = writer.open_file_writer("/EFI/BOOT/BOOTAA64.EFI").map_err(|e| {
             PyRuntimeError::new_err(format!("Failed to create BOOTAA64.EFI: {:?}", e))
         })?;
-        sprout_aa64.truncate().unwrap();
         sprout_aa64.write_all(SPROUT_AARCH64).unwrap();
+        sprout_aa64.flush().unwrap();
     }
 
     Ok(())
 }
-
 
 // Helper to scan an extracted filename to see if it's a Linux kernel or initramfs
 pub fn detect_linux_payloads(
@@ -80,7 +74,6 @@ pub fn detect_linux_payloads(
 }
 
 
-// Scrapes GRUB or Syslinux configuration text to find default boot arguments
 pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>) {
     
     if found_args.is_some() {
@@ -115,19 +108,13 @@ pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>) {
 }
 
 
-// Generates and writes the explicit sprout.toml configuration file
-pub fn write_sprout_toml<T, TP, OCC>(
-    root_dir: &Dir<'_, T, TP, OCC>, 
+pub fn write_sprout_toml<W: UsbWriter>(
+    writer: &W, 
     kernel_path: Option<&str>, 
     initrd_path: Option<&str>, 
     kernel_args: Option<&str>, 
     os_name: &str 
-) -> PyResult<()> 
-where 
-    T: ReadWriteSeek<Error = std::io::Error>,
-    TP: TimeProvider,
-    OCC: OemCpConverter,
-{
+) -> PyResult<()> {
     
     let mut toml = String::new();
     toml.push_str("version = 1\n\n");
@@ -157,14 +144,14 @@ where
         toml.push_str(&format!("options = ['{}']\n", args));
     }
 
-    let mut config_file = root_dir.create_file("sprout.toml").map_err(|e| {
+    let mut config_file = writer.open_file_writer("/sprout.toml").map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to create sprout.toml: {:?}", e))
     })?;
 
-    config_file.truncate().unwrap();
     config_file.write_all(toml.as_bytes()).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to write sprout.toml: {:?}", e))
     })?;
+    config_file.flush().unwrap();
 
     Ok(())
 }

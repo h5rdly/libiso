@@ -460,20 +460,29 @@ where
     let mut buffer = [0u8; SECTOR_SIZE];
     iso_file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
     
-    let fe: FileEntry = bytemuck::pod_read_unaligned(&buffer[..FileEntry::BASE_SIZE]);
+    let tag: DescriptorTag = bytemuck::pod_read_unaligned(&buffer[..16]);
     
-    let ad_offset = FileEntry::BASE_SIZE + fe.extended_attributes_length as usize;
-    let ad_length = fe.allocation_descriptors_length as usize;
+    let (allocation_type, ad_offset, ad_length, mut bytes_remaining) = match tag.tag_identifier {
+        261 => { 
+            let fe: FileEntry = bytemuck::pod_read_unaligned(&buffer[..FileEntry::BASE_SIZE]);
+            (fe.allocation_type(), FileEntry::BASE_SIZE + fe.extended_attributes_length as usize, fe.allocation_descriptors_length as usize, fe.information_length)
+        },
+        266 => { 
+            let efe: ExtendedFileEntry = bytemuck::pod_read_unaligned(&buffer[..ExtendedFileEntry::BASE_SIZE]);
+            (efe.allocation_type(), ExtendedFileEntry::BASE_SIZE + efe.extended_attributes_length as usize, efe.allocation_descriptors_length as usize, efe.information_length)
+        }
+        _ => return Err(format!("Invalid ICB tag id for file stream: {}", tag.tag_identifier)),
+    };
     
-    // Protect against out-of-bounds
     let safe_ad_length = ad_length.min(SECTOR_SIZE.saturating_sub(ad_offset));
     let ad_data = &buffer[ad_offset..ad_offset + safe_ad_length];
     
-    match fe.allocation_type() {
+    match allocation_type {
         0 => { // Short Allocation
             for chunk in ad_data.chunks(8) {
-                if chunk.len() < 8 { break; }
+                if chunk.len() < 8 || bytes_remaining == 0 { break; }
                 let sad: ShortAllocationDescriptor = bytemuck::pod_read_unaligned(chunk);
+                
                 let extent_len = (sad.extent_length & 0x3FFFFFFF) as u64;
                 if extent_len == 0 { break; }
                 
@@ -481,18 +490,20 @@ where
                 iso_file.seek(SeekFrom::Start(ext_sector * SECTOR_SIZE as u64)).map_err(|e| e.to_string())?;
                 
                 let mut extent_offset = 0u64;
-                while extent_offset < extent_len {
-                    let read_size = (extent_len - extent_offset).min(chunk_buf.len() as u64) as usize;
+                while extent_offset < extent_len && bytes_remaining > 0 {
+                    let read_size = (extent_len - extent_offset).min(chunk_buf.len() as u64).min(bytes_remaining) as usize; 
                     iso_file.read_exact(&mut chunk_buf[..read_size]).map_err(|e| e.to_string())?;
                     on_chunk(&chunk_buf[..read_size])?;
                     extent_offset += read_size as u64;
+                    bytes_remaining -= read_size as u64;
                 }
             }
         },
         1 => { // Long Allocation
             for chunk in ad_data.chunks(16) {
-                if chunk.len() < 16 { break; }
+                if chunk.len() < 16 || bytes_remaining == 0 { break; }
                 let lad: LongAllocationDescriptor = bytemuck::pod_read_unaligned(chunk);
+                
                 let extent_len = (lad.extent_length & 0x3FFFFFFF) as u64;
                 if extent_len == 0 { break; }
                 
@@ -500,19 +511,20 @@ where
                 iso_file.seek(SeekFrom::Start(ext_sector * SECTOR_SIZE as u64)).map_err(|e| e.to_string())?;
                 
                 let mut extent_offset = 0u64;
-                while extent_offset < extent_len {
-                    let read_size = (extent_len - extent_offset).min(chunk_buf.len() as u64) as usize;
+                while extent_offset < extent_len && bytes_remaining > 0 {
+                    let read_size = (extent_len - extent_offset).min(chunk_buf.len() as u64).min(bytes_remaining) as usize; 
                     iso_file.read_exact(&mut chunk_buf[..read_size]).map_err(|e| e.to_string())?;
                     on_chunk(&chunk_buf[..read_size])?;
                     extent_offset += read_size as u64;
+                    bytes_remaining -= read_size as u64;
                 }
             }
         },
         3 => { // Embedded Allocation
-            let len = (fe.information_length as usize).min(ad_data.len());
+            let len = (bytes_remaining as usize).min(ad_data.len());
             on_chunk(&ad_data[..len])?;
         },
-        _ => return Err(format!("Unsupported UDF Allocation Type: {}", fe.allocation_type())),
+        _ => return Err(format!("Unsupported UDF Allocation Type: {}", allocation_type)),
     }
     Ok(())
 }

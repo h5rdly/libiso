@@ -142,10 +142,22 @@ def burn_worker():
         # Get UEFI bridge if needed
         uefi_path = libiso.ensure_uefi_bridge() if has_large_file else None
         
-        # Generate safe USB label
-        iso_label = libiso.extract_iso_label(state['iso_path'])
-        short_label = iso_label[:11].replace(' ', '_').upper()
+        # Get ISO label
+        win_info = getattr(stats, 'windows_info', None)
         
+        if win_info and getattr(win_info, 'is_windows', False):
+            arch = getattr(win_info, 'architecture', 'X64').upper()
+            win_ver = "11" if getattr(win_info, 'is_windows_11', False) else "10"
+            
+            # create a FAT32 compliant label like "WIN11_X64"
+            short_label = f"WIN{win_ver}_{arch}"[:11]
+            dpg.set_value('log_console', dpg.get_value('log_console') + f'\n[*] Generated dynamic WIM label: {short_label}')
+        else:
+            # Linux / other ISOs
+            iso_label = getattr(stats, 'volume_label', 'LIBISO')
+            short_label = iso_label[:11].replace(' ', '_').upper()
+            dpg.set_value('log_console', dpg.get_value('log_console') + f'\n[*] Using default ISO label: {short_label}')
+
         # Create AbortToken
         state['abort_token'] = libiso.AbortToken()
         
