@@ -67,31 +67,20 @@ pub struct SecureBootStatus {
     pub signature_size: usize,
 }
 
-pub fn inspect_secure_boot<T: Read + Seek>(iso: &IsoImage<T>) -> SecureBootStatus {
 
+pub fn inspect_secure_boot_bytes(efi_bytes: &[u8]) -> SecureBootStatus {
     let mut status = SecureBootStatus {
-        has_efi_bootloader: false,
+        has_efi_bootloader: true,
         is_signed: false,
         is_microsoft_signed: false,
         is_revoked: false,
         signature_size: 0,
     };
 
-    let efi_bytes = match read_file_from_iso(iso, "EFI/BOOT/BOOTX64.EFI")
-        .or_else(|| read_file_from_iso(iso, "BOOTX64.EFI")) 
-    {
-        Some(bytes) => bytes,
-        None => return status,
-    };
-
-    status.has_efi_bootloader = true;
-
-    // Hash the bootloader
     let mut image_hasher = Sha256::new();
     image_hasher.update(&efi_bytes);
     let flat_hash: String = image_hasher.finalize().iter().map(|b| format!("{:02X}", b)).collect();
     
-    // Binary Search against the sorted array
     if DBX_HASHES.binary_search(&flat_hash.as_str()).is_ok() {
         status.is_revoked = true;
     }
@@ -101,27 +90,17 @@ pub fn inspect_secure_boot<T: Read + Seek>(iso: &IsoImage<T>) -> SecureBootStatu
         Err(_) => return status,
     };
 
-    // Extract Security Directory and verify Certificates
     if let Ok(security) = pe.security() {
         let cert_data = security.certificate_data();
         if !cert_data.is_empty() {
             status.is_signed = true;
             status.signature_size = cert_data.len();
 
-            // Decode the PKCS#7 CMS ContentInfo envelope directly
             if let Ok(content_info) = ContentInfo::from_der(cert_data) {
-                
-                // Extract the underlying SignedData structure safely
                 if let Ok(signed_data) = content_info.content.decode_as::<SignedData>() {
-                    
-                    // Navigate directly to the certificates set (no brute-force scanning!)
                     if let Some(certs) = signed_data.certificates {
                         for cert_choice in certs.0.iter() {
-                            
-                            // Ensure the choice is actually an X.509 Certificate
                             if let cms::cert::CertificateChoices::Certificate(cert) = cert_choice {
-                                
-                                // Hash the fully validated, raw certificate bytes
                                 if let Ok(raw_cert) = cert.to_der() {
                                     let mut cert_hasher = Sha1::new();
                                     cert_hasher.update(&raw_cert);
@@ -142,6 +121,23 @@ pub fn inspect_secure_boot<T: Read + Seek>(iso: &IsoImage<T>) -> SecureBootStatu
             }
         }
     }
-    
     status
+}
+
+
+pub fn inspect_secure_boot<T: Read + Seek>(iso: &IsoImage<T>) -> SecureBootStatus {
+
+    let efi_bytes = match read_file_from_iso(iso, "EFI/BOOT/BOOTX64.EFI")
+        .or_else(|| read_file_from_iso(iso, "BOOTX64.EFI")) 
+    {
+        Some(bytes) => bytes,
+        None => return SecureBootStatus {
+            has_efi_bootloader: false,
+            is_signed: false,
+            is_microsoft_signed: false,
+            is_revoked: false,
+            signature_size: 0,
+        },
+    };
+    inspect_secure_boot_bytes(&efi_bytes)
 }

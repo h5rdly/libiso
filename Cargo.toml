@@ -13,6 +13,8 @@ crate-type = ["cdylib"]
 sysinfo = "0.38.4"
 
 hadris-iso = "1.1.2"
+# hadris-udf = "1.1.2"  # has an overflow bytemuck panic currently, rolling our own UDF reader
+bytemuck = "1.25"
 hadris-fat = {version = "1.1.2", features = ["exfat"]} 
 hadris-part = { version = "1.1.2", features = ["crc"] }
 arcbox-ext4 = "0.1.1"   # https://github.com/arcboxlabs/ext4-rs

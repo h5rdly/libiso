@@ -333,7 +333,7 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
     # Advanced Options
     dpg.add_text('Advanced Options')
     with dpg.group(horizontal=True):
-        dpg.add_checkbox(tag='chk_verify')
+        dpg.add_checkbox(tag='chk_verify', default_value=True)
         dpg.add_text('Verify written data (Bit-for-bit check)', tag='txt_verify')
 
     with dpg.group(horizontal=True):
@@ -376,9 +376,19 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
     dpg.add_spacer(height=50)
     
     # Live Log Window
-    # dpg.add_text('Debug Log:')
     with dpg.child_window(tag='log_window', width=-1, height=-1):
         dpg.add_text('', tag='log_console', wrap=0)
+    
+    dpg.add_spacer(height=10)
+
+    with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False, borders_outerH=False, borders_outerV=False):
+        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+        dpg.add_table_column(width_fixed=True, init_width_or_weight=250)
+        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+        with dpg.table_row():
+            dpg.add_spacer()
+            dpg.add_button(label='Copy', width=250, callback=lambda: dpg.set_clipboard_text(dpg.get_value('log_console')))
+            dpg.add_spacer()
 
 # Hidden File Dialog
 dialog_width = int(700 * scale_factor)

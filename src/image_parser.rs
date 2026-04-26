@@ -7,8 +7,10 @@ use hadris_iso::directory::DirectoryRef;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::signature::inspect_secure_boot;
+use crate::signature::{inspect_secure_boot, inspect_secure_boot_bytes};
 use crate::esd::{parse_wim_xml};
+use crate::udf;
+
 
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug)]
@@ -29,6 +31,7 @@ pub struct BootCapabilities {
     pub signature_size: usize, 
 }
 
+
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug)]
 pub struct WindowsMetadata {
@@ -40,12 +43,12 @@ pub struct WindowsMetadata {
     pub install_image_type: String, 
     #[pyo3(get)]
     pub supports_wintogo: bool,
-    // --- NEW FIELDS ---
     #[pyo3(get)]
     pub architecture: String,
     #[pyo3(get)]
     pub editions: Vec<String>,
 }
+
 
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug)]
@@ -67,6 +70,7 @@ pub struct ImageStats {
     #[pyo3(get)]
     pub windows_info: Option<WindowsMetadata>, 
 }
+
 
 #[pymethods]
 impl BootCapabilities {
@@ -106,64 +110,68 @@ impl ImageStats {
         dict.set_item("volume_label", &self.volume_label)?;
         dict.set_item("is_isohybrid", self.is_isohybrid)?;
         dict.set_item("has_large_file", self.has_large_file)?;
-        
         dict.set_item("boot_info", self.boot_info.as_dict(py)?)?;
-        
         if let Some(win_info) = &self.windows_info {
             dict.set_item("windows_info", win_info.as_dict(py)?)?;
         } else {
             dict.set_item("windows_info", py.None())?;
         }
-        
         Ok(dict)
-    }
-
-    fn __str__(&self) -> String {
-        let sb_str = if self.boot_info.secure_boot_signed {
-            let ms_trust = if self.boot_info.is_microsoft_signed { "Microsoft Trusted" } else { "Unknown CA" };
-            let revoked = if self.boot_info.is_revoked { " [VULNERABLE/REVOKED!]" } else { "" };
-            format!("True ({} - {} bytes){}", ms_trust, self.boot_info.signature_size, revoked)
-        } else {
-            "False".to_string()
-        };
-
-        let mut s = format!(
-            "Volume Label:      {}\n\
-             Size:              {} bytes\n\
-             ISOHybrid:         {}\n\
-             Large File (>4GB): {}\n\n\
-             --- Boot Info ---\n\
-             Bootable:          {} (BIOS: {}, UEFI: {})\n\
-             Secure Boot:       {}\n",
-            self.volume_label, self.size_bytes, self.is_isohybrid, self.has_large_file,
-            self.boot_info.is_bootable, self.boot_info.supports_bios, self.boot_info.supports_uefi,
-            sb_str
-        );
-
-        s.push_str("\n--- Windows Metadata ---\n");
-        if let Some(win) = &self.windows_info {
-            s.push_str(&format!(
-                "Is Windows:        Yes (Win 11: {})\n\
-                 Image Type:        {}\n\
-                 Architecture:      {}\n\
-                 Editions:          {}\n\
-                 WinToGo Supported: {}\n",
-                win.is_windows_11, win.install_image_type.to_uppercase(), 
-                win.architecture.to_uppercase(), win.editions.join(", "), 
-                win.supports_wintogo
-            ));
-        } else {
-            s.push_str("Is Windows:        False\n");
-        }
-        s
-    }
-    
-    fn __repr__(&self) -> String {
-        format!("<ImageStats volume_label='{}' size_bytes={}>", self.volume_label, self.size_bytes)
     }
 }
 
-// Traverse the ISO Directory Tree
+
+pub fn scan_directory_udf(
+    file: &mut File,
+    partition_start: u32,
+    entries: &[udf::UdfDirEntry],
+    has_large_file: &mut bool,
+    supports_uefi: &mut bool, 
+    is_windows: &mut bool,
+    is_windows_11: &mut bool,
+    install_image_type: &mut String,
+) {
+    for entry in entries {
+        let name = &entry.name;
+        if name == "." || name == ".." { continue; }
+        let clean_name = name.split(';').next().unwrap_or(name);
+        
+        if entry.is_directory {
+            if let Ok(sub_entries) = udf::read_directory(file, partition_start, &entry.icb) {
+                scan_directory_udf(
+                    file, partition_start, &sub_entries, 
+                    has_large_file, supports_uefi, 
+                    is_windows, is_windows_11, install_image_type
+                );
+            }
+        } else {
+            // Because our custom parser ignores size to speed up parsing,
+            // we will let the install type dictate the large file flag
+            
+            let file_name = clean_name.to_uppercase();
+            if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
+                *supports_uefi = true;
+            }
+            if file_name == "INSTALL.WIM" {
+                *is_windows = true;
+                *has_large_file = true; // WIMs are basically always >4GB
+                *install_image_type = "wim".to_string();
+            } else if file_name == "INSTALL.ESD" {
+                *is_windows = true;
+                *has_large_file = true;
+                *install_image_type = "esd".to_string();
+            } else if file_name == "INSTALL.SWM" {
+                *is_windows = true;
+                *install_image_type = "swm".to_string();
+            }
+            if file_name == "APPRAISERRES.DLL" {
+                *is_windows_11 = true;
+            }
+        }
+    }
+}
+
+
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
     iso: &IsoImage<File>, 
@@ -175,13 +183,9 @@ fn scan_directory(
     install_image_type: &mut String,
 ) {
     let dir = iso.open_dir(dir_ref); 
-    
     for entry_res in dir.entries() {
         let Ok(entry) = entry_res else { continue };
-        
-        if entry.record.name() == b"\x00" || entry.record.name() == b"\x01" {
-            continue;
-        }
+        if entry.record.name() == b"\x00" || entry.record.name() == b"\x01" { continue; }
 
         let mut name = if entry.record.is_joliet_name() {
             entry.record.joliet_name()
@@ -189,33 +193,16 @@ fn scan_directory(
             entry.display_name().into_owned()
         };
 
-        if let Some(pos) = name.rfind(';') {
-            name.truncate(pos);
-        }
+        if let Some(pos) = name.rfind(';') { name.truncate(pos); }
 
         if entry.is_directory() {
             if let Ok(sub_dir_ref) = entry.as_dir_ref(iso) {
-                scan_directory(
-                    iso, 
-                    sub_dir_ref, 
-                    has_large_file, 
-                    supports_uefi,
-                    is_windows,
-                    is_windows_11,
-                    install_image_type
-                );
+                scan_directory(iso, sub_dir_ref, has_large_file, supports_uefi, is_windows, is_windows_11, install_image_type);
             }
         } else {
-            if entry.total_size() >= 4_000_000_000 {
-                *has_large_file = true;
-            }
-
+            if entry.total_size() >= 4_000_000_000 { *has_large_file = true; }
             let file_name = name.to_uppercase();
-
-            if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
-                *supports_uefi = true;
-            }
-
+            if file_name.ends_with(".EFI") && file_name.contains("BOOT") { *supports_uefi = true; }
             if file_name == "INSTALL.WIM" {
                 *is_windows = true;
                 *install_image_type = "wim".to_string();
@@ -226,10 +213,7 @@ fn scan_directory(
                 *is_windows = true;
                 *install_image_type = "swm".to_string();
             }
-
-            if file_name == "APPRAISERRES.DLL" {
-                *is_windows_11 = true;
-            }
+            if file_name == "APPRAISERRES.DLL" { *is_windows_11 = true; }
         }
     }
 }
@@ -240,36 +224,25 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     let mut file = File::open(&file_path)?;
     let total_size = file.metadata()?.len();
 
-    // 1. MAGIC NUMBER ROUTING
-    // Read the first 8 bytes to check if it's a WIM or ESD file
     let mut magic = [0u8; 8];
     if file.read_exact(&mut magic).is_ok() {
         if &magic == b"MSWIM\x00\x00\x00" || &magic == b"WLPWM\x00\x00\x00" {
-            // It's a WIM/ESD! Parse the XML metadata.
             if let Some(wim_info) = parse_wim_xml(total_size, |buf, offset| {
                 file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(buf).is_ok()
             }) {
                 return Ok(ImageStats {
                     file_path, 
                     size_bytes: total_size,
-                    volume_label: "WIM/ESD Archive".to_string(), // Dummy label for standalone archives
+                    volume_label: "WIM/ESD Archive".to_string(), 
                     is_isohybrid: false,
-                    has_large_file: true, // WIMs are basically guaranteed to have large solid chunks
+                    has_large_file: true, 
                     boot_info: BootCapabilities {
-                        is_bootable: false,
-                        supports_bios: false,
-                        supports_uefi: false,
-                        secure_boot_signed: false, 
-                        is_microsoft_signed: false,
-                        is_revoked: false,
-                        signature_size: 0,
+                        is_bootable: false, supports_bios: false, supports_uefi: false,
+                        secure_boot_signed: false, is_microsoft_signed: false, is_revoked: false, signature_size: 0,
                     },
                     windows_info: Some(WindowsMetadata {
-                        is_windows: true,
-                        is_windows_11: false, // appraiserres.dll isn't inside the WIM
-                        install_image_type: "ESD/WIM".to_string(),
-                        supports_wintogo: true,
-                        architecture: wim_info.architecture.unwrap_or_else(|| "Unknown".to_string()),
+                        is_windows: true, is_windows_11: false, install_image_type: "ESD/WIM".to_string(),
+                        supports_wintogo: true, architecture: wim_info.architecture.unwrap_or_else(|| "Unknown".to_string()),
                         editions: wim_info.editions,
                     }),
                 });
@@ -279,10 +252,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
         }
     }
 
-    // 2. FALLBACK TO ISO9660 PARSING
-    // Rewind the file back to 0 so we don't mess up our sector alignments
     file.seek(SeekFrom::Start(0))?;
-
     let mut boot_sector = [0u8; 512];
     file.read_exact(&mut boot_sector)?;
     let is_isohybrid = boot_sector[510] == 0x55 && boot_sector[511] == 0xAA;
@@ -290,11 +260,9 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     file.seek(SeekFrom::Start(32768))?;
     let mut pvd = [0u8; 2048];
     file.read_exact(&mut pvd)?;
-
     let mut volume_label = String::from("UNKNOWN_ISO");
     if &pvd[1..6] == b"CD001" {
-        let label_bytes = &pvd[40..72];
-        volume_label = String::from_utf8_lossy(label_bytes).trim().to_string();
+        volume_label = String::from_utf8_lossy(&pvd[40..72]).trim().to_string();
     }
 
     let mut has_large_file = false;
@@ -308,60 +276,62 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     let mut install_image_type = String::new();
 
     file.seek(SeekFrom::Start(0))?;
+    let mut is_udf_valid = false;
 
-    if let Ok(iso) = IsoImage::open(file) {
-        
-        let sb_status = inspect_secure_boot(&iso);
-        supports_uefi = sb_status.has_efi_bootloader;
-        secure_boot_signed = sb_status.is_signed;
-        is_microsoft_signed = sb_status.is_microsoft_signed;
-        is_revoked = sb_status.is_revoked;
-        signature_size = sb_status.signature_size;
+    if let Ok(udf_ctx) = udf::mount_udf(&mut file) {
+        if let Ok(root_entries) = udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb) {
+            is_udf_valid = true;
+            let udf_label = udf_ctx.volume_id.trim();
+            if !udf_label.is_empty() { volume_label = udf_label.to_string(); }
+            
+            scan_directory_udf(
+                &mut file, udf_ctx.partition_start, &root_entries, 
+                &mut has_large_file, &mut supports_uefi, 
+                &mut is_windows, &mut is_windows_11, &mut install_image_type
+            );
+            
+            if let Some(entry) = udf::find_udf_entry(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb, "EFI/BOOT/BOOTX64.EFI")
+                .or_else(|| udf::find_udf_entry(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb, "BOOTX64.EFI")) 
+            {
+                if let Ok(bytes) = udf::read_file_bytes(&mut file, udf_ctx.partition_start, &entry) {
+                    let sb_status = inspect_secure_boot_bytes(&bytes);
+                    supports_uefi = sb_status.has_efi_bootloader;
+                    secure_boot_signed = sb_status.is_signed;
+                    is_microsoft_signed = sb_status.is_microsoft_signed;
+                    is_revoked = sb_status.is_revoked;
+                    signature_size = sb_status.signature_size;
+                }
+            }
+        }
+    }
 
-        let root = iso.root_dir();
-        
-        scan_directory(
-            &iso, root.dir_ref(), 
-            &mut has_large_file, 
-            &mut supports_uefi,
-            &mut is_windows,
-            &mut is_windows_11,
-            &mut install_image_type
-        );
+    if !is_udf_valid {
+        file.seek(SeekFrom::Start(0))?;
+        if let Ok(iso) = IsoImage::open(file) {
+            let sb_status = inspect_secure_boot(&iso);
+            supports_uefi = sb_status.has_efi_bootloader;
+            secure_boot_signed = sb_status.is_signed;
+            is_microsoft_signed = sb_status.is_microsoft_signed;
+            is_revoked = sb_status.is_revoked;
+            signature_size = sb_status.signature_size;
+
+            let root = iso.root_dir();
+            scan_directory(&iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, &mut is_windows_11, &mut install_image_type);
+        }
     }
 
     let boot_info = BootCapabilities {
-        is_bootable: is_isohybrid || supports_uefi,
-        supports_bios: is_isohybrid,
-        supports_uefi,
-        secure_boot_signed, 
-        is_microsoft_signed, 
-        is_revoked,
-        signature_size,
+        is_bootable: is_isohybrid || supports_uefi, supports_bios: is_isohybrid, supports_uefi,
+        secure_boot_signed, is_microsoft_signed, is_revoked, signature_size,
     };
 
     let windows_info = if is_windows {
         Some(WindowsMetadata {
-            is_windows: true,
-            is_windows_11,
-            install_image_type: install_image_type.clone(),
+            is_windows: true, is_windows_11, install_image_type: install_image_type.clone(),
             supports_wintogo: install_image_type == "wim" || install_image_type == "esd",
-            // Since we don't parse the internal WIM XML during a full ISO scan (for speed), 
-            // these are left empty/unknown for ISO files.
-            architecture: String::new(), 
-            editions: Vec::new(),
+            architecture: String::new(), editions: Vec::new(),
         })
-    } else {
-        None
-    };
+    } else { None };
 
-    Ok(ImageStats {
-        file_path,
-        size_bytes: total_size,
-        volume_label,
-        is_isohybrid,
-        has_large_file, 
-        boot_info,
-        windows_info,
-    })
+    Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, boot_info, windows_info })
 }

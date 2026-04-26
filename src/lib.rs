@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod drives;
 mod image_parser;
+mod udf;
 mod test_utils;
 mod writer;
 mod signature;
@@ -13,6 +14,7 @@ mod lzms;
 mod lzms_arrays;
 mod bootloader;
 mod sbsign;
+
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};
