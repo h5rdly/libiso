@@ -521,10 +521,10 @@ pub fn write_image_iso(
             let _ = tx.send(EventMsg::log("Attempting UDF mount..."));
             match crate::udf::mount_udf(&mut file) {
                 Ok(udf_ctx) => {
-                    let _ = tx.send(EventMsg::log(&format!("UDF Mounted! Vol: {}", udf_ctx.volume_id)));
+                    let _ = tx.send(EventMsg::log(&format!("UDF Mounted. Vol: {}", udf_ctx.volume_id)));
                     match crate::udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb) {
                         Ok(udf_root) => {
-                            let _ = tx.send(EventMsg::log(&format!("UDF root dir read successfully! Entries: {}", udf_root.len())));
+                            let _ = tx.send(EventMsg::log(&format!("UDF root dir read successfully. Entries: {}", udf_root.len())));
                             is_udf_valid = true;
                             let usb_root = exfat_fs.root_dir(); 
                             if let Err(e) = copy_recursive_udf_exfat(&exfat_fs, &udf_ctx, &udf_root, &usb_root, &tx, &mut written, total_size, abort_flag.clone(), &iso_path_clone) {
@@ -578,29 +578,41 @@ pub fn write_image_iso(
             }
             
             let _ = tx.send(EventMsg::progress(total_size, total_size));
+if verify_written {
+                let _ = tx.send(EventMsg::phase("Verifying Data"));
+                let _ = tx.send(EventMsg::progress(0, total_size));
+                let mut verified = 0u64;
 
-            if verify_written {
                 if is_udf_valid {
-                    let _ = tx.send(EventMsg::log("Note: Skipping bit-for-bit verify (UDF verification not yet supported)"));
-                } else {
-                    let _ = tx.send(EventMsg::phase("Verifying Data"));
-                    let _ = tx.send(EventMsg::progress(0, total_size));
-                    let mut verified = 0u64;
-                    let iso = IsoImage::open(File::open(&iso_path_clone).unwrap()).unwrap();
-                    let iso_verify_root = iso.root_dir();
+                    // Re-mount UDF for the verifier
+                    let mut file = File::open(&iso_path_clone).unwrap();
+                    let ctx = crate::udf::mount_udf(&mut file).unwrap();
+                    let udf_root = crate::udf::read_directory(&mut file, ctx.partition_start, &ctx.root_icb).unwrap();
                     let usb_verify_root = exfat_fs.root_dir();
-                    if let Err(e) = verify::verify_recursive_exfat(&exfat_fs, &iso, iso_verify_root.dir_ref(), &usb_verify_root, &tx, &mut verified, total_size) {
+                    
+                    if let Err(e) = verify::verify_recursive_udf_exfat(&exfat_fs, &ctx, &udf_root, &usb_verify_root, &tx, &mut verified, total_size, &iso_path_clone) {
                         let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
                         return;
                     }
-                    let _ = tx.send(EventMsg::progress(total_size, total_size)); 
+                } else {
+                    let iso = IsoImage::open(File::open(&iso_path_clone).unwrap()).unwrap();
+                    let usb_verify_root = exfat_fs.root_dir();
+                    if let Err(e) = verify::verify_recursive_exfat(&exfat_fs, &iso, iso.root_dir().dir_ref(), &usb_verify_root, &tx, &mut verified, total_size) {
+                        let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
+                        return;
+                    }
                 }
+                let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
+            
             if let Err(e) = trigger_os_reread(&dest_file_for_uefi, &iso_path_clone) {
                 let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
             } else {
                 let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
             }
+
+            let msg = if verify_written { "ISO Burn and Verify Complete!" } else { "ISO Burn Complete!" };
+            let _ = tx.send(EventMsg::done(msg));
         });
     } else {
         wrapped_partition.seek(SeekFrom::Start(0))?;
@@ -696,27 +708,40 @@ pub fn write_image_iso(
             let _ = tx.send(EventMsg::progress(total_size, total_size)); 
 
             if verify_written {
+                let _ = tx.send(EventMsg::phase("Verifying Data"));
+                let _ = tx.send(EventMsg::progress(0, total_size));
+                let mut verified = 0u64;
+
                 if is_udf_valid {
-                    let _ = tx.send(EventMsg::log("Note: Skipping bit-for-bit verify (UDF verification not yet supported)"));
-                } else {
-                    let _ = tx.send(EventMsg::phase("Verifying Data"));
-                    let _ = tx.send(EventMsg::progress(0, total_size));
-                    let mut verified = 0u64;
-                    let iso = IsoImage::open(File::open(&iso_path_clone).unwrap()).unwrap();
-                    let iso_verify_root = iso.root_dir();
+                    // Re-mount UDF for the verifier
+                    let mut file = File::open(&iso_path_clone).unwrap();
+                    let ctx = crate::udf::mount_udf(&mut file).unwrap();
+                    let udf_root = crate::udf::read_directory(&mut file, ctx.partition_start, &ctx.root_icb).unwrap();
                     let mut usb_verify_root = usb_fs.root_dir();
-                    if let Err(e) = verify::verify_recursive(&usb_fs, &iso, iso_verify_root.dir_ref(), &mut usb_verify_root, &tx, &mut verified, total_size) {
+                    
+                    if let Err(e) = verify::verify_recursive_udf(&ctx, &udf_root, &mut usb_verify_root, &tx, &mut verified, total_size, &iso_path_clone) {
                         let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
                         return;
                     }
-                    let _ = tx.send(EventMsg::progress(total_size, total_size)); 
+                } else {
+                    let iso = IsoImage::open(File::open(&iso_path_clone).unwrap()).unwrap();
+                    let mut usb_verify_root = usb_fs.root_dir();
+                    if let Err(e) = verify::verify_recursive(&usb_fs, &iso, iso.root_dir().dir_ref(), &mut usb_verify_root, &tx, &mut verified, total_size) {
+                        let _ = tx.send(EventMsg::error(&format!("Verification error: {}", e)));
+                        return;
+                    }
                 }
+                let _ = tx.send(EventMsg::progress(total_size, total_size)); 
             }
+
             if let Err(e) = trigger_os_reread(&dest_file_for_fat32, &iso_path_clone) {
                 let _ = tx.send(EventMsg::log(&format!("OS cache flush warning: {}", e)));
             } else {
                 let _ = tx.send(EventMsg::log("OS cache flushed successfully."));
             }
+
+            let msg = if verify_written { "ISO Burn and Verify Complete!" } else { "ISO Burn Complete!" };
+            let _ = tx.send(EventMsg::done(msg));
         });
     }
 
