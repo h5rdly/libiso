@@ -4,8 +4,7 @@ use std::{
     path::Path,
     thread,
     time::{SystemTime, UNIX_EPOCH},
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
+    sync::{Arc, mpsc, Mutex, atomic::{AtomicBool, Ordering}},
     cell::RefCell
 };
 
@@ -84,7 +83,7 @@ impl EventMsg {
 
 #[pyclass]
 pub struct ProgressStream {
-    pub(crate) rx: kanal::Receiver<EventMsg>,
+    pub(crate) rx: Mutex<mpsc::Receiver<EventMsg>>,
 }
 
 #[pymethods]
@@ -92,7 +91,7 @@ impl ProgressStream {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
 
     fn __next__(&self, py: Python) -> PyResult<Option<EventMsg>> {
-        match py.detach(|| self.rx.recv()) {
+        match py.detach(|| self.rx.lock().unwrap().recv()) {
             Ok(msg) => Ok(Some(msg)),
             Err(_) => Ok(None), 
         }
@@ -274,7 +273,7 @@ pub fn write_image_dd(
     }
     drop(dest_file);
 
-    let (tx, rx) = kanal::bounded::<EventMsg>(100);
+    let (tx, rx) = mpsc::sync_channel::<EventMsg>(100);
     let abort_flag = abort_token.map(|t| t.flag.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     thread::spawn(move || {
@@ -344,7 +343,7 @@ pub fn write_image_dd(
             }
         }
     });
-    Ok(ProgressStream { rx })
+    Ok(ProgressStream { rx: Mutex::new(rx) })
 }
 
 
@@ -493,7 +492,7 @@ pub fn write_image_iso(
     
     let iso_path_clone = image_path.clone();
 
-    let (tx, rx) = kanal::bounded::<EventMsg>(100);
+    let (tx, rx) = mpsc::sync_channel::<EventMsg>(100);
     let abort_flag = abort_token.map(|t| t.flag.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     let autorun_inf_label = iso_label.to_string();
@@ -549,7 +548,7 @@ pub fn write_image_iso(
         }
     });
 
-    Ok(ProgressStream { rx })
+    Ok(ProgressStream { rx: Mutex::new(rx) })
 }
 
 
@@ -661,7 +660,7 @@ impl<'a> ImageReader for UdfReader<'a> {
 fn execute_extraction_workflow<R: ImageReader, W: UsbWriter>(
     reader: &R,
     writer: &W,
-    tx: &kanal::Sender<EventMsg>,
+    tx: &mpsc::SyncSender<EventMsg>,
     total_size: u64,
     has_large_file: bool,
     arch_selection: &str,
@@ -722,7 +721,7 @@ fn execute_extraction_workflow<R: ImageReader, W: UsbWriter>(
 fn execute_verify_workflow<R: ImageReader, U: verify::UsbReader>(
     reader: &R,
     usb_reader: &U,
-    tx: &kanal::Sender<EventMsg>,
+    tx: &mpsc::SyncSender<EventMsg>,
     total_size: u64,
     skip_bootloader: bool,
 ) -> Result<(), String> {
@@ -742,7 +741,7 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
     usb_reader: &U,
     iso_path: &str,
     device_path: &str,
-    tx: &kanal::Sender<EventMsg>,
+    tx: &mpsc::SyncSender<EventMsg>,
     total_size: u64,
     has_large_file: bool,
     arch_selection: &str,
@@ -904,7 +903,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
     reader: &R,
     writer: &W,
     current_path: &str,
-    tx: &kanal::Sender<EventMsg>,
+    tx: &mpsc::SyncSender<EventMsg>,
     bytes_written: &mut u64,
     total_size: u64,
     found_kernel: &mut Option<String>,  

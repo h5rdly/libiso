@@ -1,5 +1,6 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::thread;
+use std::sync::{mpsc, Mutex};
 
 use fatfs::{FileSystem, ReadWriteSeek, TimeProvider, OemCpConverter}; 
 use hadris_fat::exfat::{ExFatFs, ExFatFileReader};
@@ -63,7 +64,7 @@ pub fn verify<R: ImageReader, U: UsbReader>(
     iso_reader: &R,
     usb_reader: &U,
     current_path: &str,
-    tx: &kanal::Sender<EventMsg>,
+    tx: &mpsc::SyncSender<EventMsg>,
     verified: &mut u64,
     total_size: u64,
     skip_bootloader: bool, // <-- Add this flag!
@@ -127,7 +128,7 @@ pub fn verify<R: ImageReader, U: UsbReader>(
 // -- USB drive claimed size verification 
 
 pub fn verify_hardware_capacity<T: Read + Write + Seek>(
-    drive: &mut T, total_size: u64, tx: &kanal::Sender<EventMsg>,
+    drive: &mut T, total_size: u64, tx: &mpsc::SyncSender<EventMsg>,
     mut sync_fn: impl FnMut(&mut T) -> Result<(), String>, 
 ) -> Result<(), String> {
 
@@ -170,7 +171,7 @@ pub fn verify_hardware_capacity<T: Read + Write + Seek>(
 }
 
 
-pub fn verify_usb_size(device_path: &str, tx: &kanal::Sender<EventMsg>) -> Result<(), String> {
+pub fn verify_usb_size(device_path: &str, tx: &mpsc::SyncSender<EventMsg>,) -> Result<(), String> {
     
     let mut file = crate::io::open_device(device_path, true).map_err(|e| format!("Failed to open device: {}", e))?;
     let total_size = file.seek(SeekFrom::End(0)).map_err(|e| format!("Seek err: {}", e))?;
@@ -182,9 +183,9 @@ pub fn verify_usb_size(device_path: &str, tx: &kanal::Sender<EventMsg>) -> Resul
 #[pyfunction]
 #[pyo3(signature = (device_path))]
 pub fn destructive_verify_usb_size(device_path: String) -> PyResult<ProgressStream> {
-    let (tx, rx) = kanal::bounded::<EventMsg>(100);
+    let (tx, rx) = mpsc::sync_channel::<EventMsg>(100);
     thread::spawn(move || {
         if let Err(e) = verify_usb_size(&device_path, &tx) { let _ = tx.send(EventMsg::error(&e)); }
     });
-    Ok(ProgressStream { rx })
+    Ok(ProgressStream { rx: Mutex::new(rx) })
 }

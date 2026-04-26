@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::io::{Cursor, Read, Write, Seek, SeekFrom};
 
 use hadris_iso::write::{IsoImageWriter, InputFiles, File as IsoFile};
@@ -206,7 +206,7 @@ impl Seek for FakeDrive {
 #[pyfunction]
 pub fn test_verify_fake_drive_sync(mut drive: PyRefMut<'_, FakeDrive>) -> PyResult<()> {
     // Create a dummy channel that we won't actually read from since this is synchronous
-    let (tx, _rx) = kanal::unbounded();
+    let (tx, _rx) = mpsc::sync_channel(100);
     let fake_cap = drive.fake_capacity;
     
     // Dereference `drive` to access the Rust struct inside the Python wrapper
