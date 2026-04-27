@@ -1,8 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-use hadris_iso::sync::IsoImage;
-use hadris_iso::directory::DirectoryRef;
+use hadris_iso::{sync::IsoImage, directory::DirectoryRef};
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;

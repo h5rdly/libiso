@@ -14,6 +14,7 @@ pub struct WimInfo {
     pub editions: Vec<String>,
     pub total_size_bytes: u64,
     pub raw_xml: String, 
+    pub suggested_label: String, 
 }
 
 
@@ -253,8 +254,8 @@ impl EsdArchive {
 }
 
 
-pub fn parse_xml_payload(xml_bytes: &[u8]) -> Option<WimInfo> {
 
+pub fn parse_xml_payload(xml_bytes: &[u8]) -> Option<WimInfo> {
     if xml_bytes.len() < 2 || xml_bytes[0] != 0xFF || xml_bytes[1] != 0xFE || xml_bytes.len() % 2 != 0 {
         return None;
     }
@@ -270,6 +271,9 @@ pub fn parse_xml_payload(xml_bytes: &[u8]) -> Option<WimInfo> {
     let mut editions = Vec::new();
     let mut total_bytes = 0u64;
     let mut start_pos = 0;
+    
+    // We need to track the Windows Build number to know if it's W10, W11, etc
+    let mut highest_build = 0u64;
 
     while let Some(image_start) = xml_string[start_pos..].find("<IMAGE") {
         let absolute_start = start_pos + image_start;
@@ -280,6 +284,13 @@ pub fn parse_xml_payload(xml_bytes: &[u8]) -> Option<WimInfo> {
             if let Some(bytes_str) = extract_tag(image_xml, "TOTALBYTES") {
                 if let Ok(bytes) = bytes_str.parse::<u64>() {
                     total_bytes += bytes;
+                }
+            }
+            
+            // Extract the Build Number
+            if let Some(build_str) = extract_tag(image_xml, "BUILD") {
+                if let Ok(b) = build_str.parse::<u64>() {
+                    if b > highest_build { highest_build = b; }
                 }
             }
 
@@ -316,14 +327,38 @@ pub fn parse_xml_payload(xml_bytes: &[u8]) -> Option<WimInfo> {
 
     let primary_arch = architectures.into_iter().max_by_key(|&(_, count)| count).map(|(arch, _)| arch);
 
+
+    // ── LABEL GENERATION LOGIC
+
+    // Map OS Version
+    let os_ver = if highest_build >= 22000 { "W11" }
+    else if highest_build >= 10240 { "W10" }
+    else if highest_build >= 9200 { "W8" }
+    else { "WIN" };
+
+    //  Map Architecture
+    let arch_tag = primary_arch.clone().unwrap_or_else(|| "x64".to_string()).to_uppercase();
+
+    // Map the "Highest" Edition
+    let edition_tag = if editions.contains(&"Pro".to_string()) { "PRO" }
+    else if editions.contains(&"Enterprise".to_string()) { "ENT" }
+    else if editions.contains(&"Education".to_string()) { "EDU" }
+    else if editions.contains(&"Server".to_string()) { "SRV" }
+    else if editions.contains(&"Home".to_string()) { "HOME" }
+    else { "SETUP" };
+
+    // Assemble and tightly truncate to exactly 11 chars (FAT32 limit)
+    let raw_label = format!("{}_{}_{}", os_ver, arch_tag, edition_tag);
+    let suggested_label: String = raw_label.chars().take(11).collect();
+
     Some(WimInfo { 
         architecture: primary_arch, 
         editions, 
         total_size_bytes: total_bytes,
-        raw_xml: xml_string 
+        raw_xml: xml_string,
+        suggested_label 
     })
 }
-
 
 
 pub fn parse_wim_xml<F>(total_size: u64, mut read_chunk: F) -> Option<WimInfo> where

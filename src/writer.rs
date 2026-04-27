@@ -3,12 +3,10 @@ use std::{
     io::{Read, Write, Seek, SeekFrom, copy},
     path::Path,
     thread,
-    time::{SystemTime, UNIX_EPOCH},
     sync::{Arc, mpsc, Mutex, atomic::{AtomicBool, Ordering}},
     cell::RefCell
 };
 
-use hadris_fat::format::{FormatOptions as Fat32FormatOptions, FatVolumeFormatter, FatTypeSelection};
 use fatfs::{ Dir, FileSystem, FsOptions, ReadWriteSeek, TimeProvider, OemCpConverter}; 
 
 use hadris_iso::{sync::IsoImage, directory::DirectoryRef, read::DirEntry};
@@ -22,6 +20,7 @@ use crate::verify;
 use crate::bootloader;
 use crate::udf;
 use crate::exfat;
+use crate::fat32;
 use crate::gpt;
 use crate::esd;
 
@@ -148,14 +147,13 @@ pub fn get_clean_filename(entry: &DirEntry) -> String {
     name
 }
 
+
 pub fn format_partition<T: Read + Write + Seek>(
     wrapped_partition: &mut PartitionWrapper<T>,
     is_exfat: bool,
     volume_label: &str,
     start_lba: u64,
 ) -> Result<(), String> {
-    let sys_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let vol_id = (sys_time & 0xFFFFFFFF) as u32;
     wrapped_partition.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let part_size = wrapped_partition.size;
 
@@ -163,18 +161,15 @@ pub fn format_partition<T: Read + Write + Seek>(
         exfat::format_exfat(&mut *wrapped_partition, part_size, volume_label)
             .map_err(|e| format!("exFAT Format failed: {:?}", e))?;
     } else {
-        let options = Fat32FormatOptions::new(part_size)
-            .with_label(volume_label)
-            .with_fat_type(FatTypeSelection::Fat32)
-            .with_volume_id(vol_id)
-            .with_hidden_sectors(start_lba as u32);
-        FatVolumeFormatter::format(&mut *wrapped_partition, options)
+        fat32::format_fat32(&mut *wrapped_partition, part_size, volume_label, start_lba as u32)
             .map_err(|e| format!("FAT32 Format failed: {:?}", e))?;
     }
+    
     wrapped_partition.flush().map_err(|e| e.to_string())?;
     wrapped_partition.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     Ok(())
 }
+
 
 #[pyfunction]
 #[pyo3(signature = (device_path, fs_type=None, volume_label="LIBISO", partition_scheme=None))]
@@ -757,6 +752,11 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
         }
     }
 
+    if let Err(e) = extract_res {
+        let _ = tx.send(EventMsg::error(&format!("Extraction error: {}", e)));
+        return;
+    }
+
     if verify_written {
         let mut file = File::open(iso_path).unwrap();
         let verify_res = if is_udf_valid {
@@ -1017,90 +1017,91 @@ pub fn extract_image(image_path: String, extract_dir: String) -> PyResult<()> {
 
 
 #[pyfunction]
-#[pyo3(signature = (image_path, wim_path="sources/boot.wim"))]
+#[pyo3(signature = (image_path, wim_path="sources/install.wim"))]
 pub fn get_wim_info_from_iso<'py>(py: Python<'py>, image_path: String, wim_path: &str) -> PyResult<Bound<'py, PyDict>> {
     
-    let mut file = File::open(&image_path)?;
-    
-    let is_udf_valid = if let Ok(udf_ctx) = udf::mount_udf(&mut file) {
-        udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb).is_ok()
-    } else { false };
+    // own the strings to move them into the background thread safely
+    let wim_path_owned = wim_path.to_string();
 
-    let mut wim_info_result: Option<esd::WimInfo> = None;
+    let wim_info_result: Option<esd::WimInfo> = py.detach(move || {
+        
+        let mut file = File::open(&image_path).ok()?;
+        
+        let is_udf_valid = if let Ok(udf_ctx) = udf::mount_udf(&mut file) {
+            udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb).is_ok()
+        } else { false };
 
-    let mut execute_wim_scan = |reader: &dyn ImageReader| -> Result<(), String> {
-        let mut current_offset = 0u64;
-        let mut xml_offset = 0u64;
-        let mut xml_size = 0u64;
-        let mut xml_buffer = Vec::new();
-        let mut header_buffer = Vec::new();
+        let mut result = None;
 
-        let stream_res = reader.stream_file(wim_path, &mut |chunk| {
-            // Look for the 204-byte WIM header
-            if xml_size == 0 {
-                header_buffer.extend_from_slice(chunk);
-                if header_buffer.len() >= 204 {
-                    let header = &header_buffer[0..204];
-                    if &header[0..8] != b"MSWIM\x00\x00\x00" && &header[0..8] != b"WLPWM\x00\x00\x00" {
-                        return Err("Invalid WIM Header".to_string());
-                    }
-                    
-                    let mut size_arr = [0u8; 8];
-                    size_arr[..7].copy_from_slice(&header[72..79]);
-                    xml_size = u64::from_le_bytes(size_arr);
-                    
-                    let mut offset_arr = [0u8; 8];
-                    offset_arr.copy_from_slice(&header[80..88]);
-                    xml_offset = u64::from_le_bytes(offset_arr);
-                    
-                    if xml_size == 0 || xml_size > 50 * 1024 * 1024 {
-                        return Err("Invalid XML bounds".to_string());
+        let mut execute_wim_scan = |reader: &dyn ImageReader| -> Result<(), String> {
+            let mut current_offset = 0u64;
+            let mut xml_offset = 0u64;
+            let mut xml_size = 0u64;
+            let mut xml_buffer = Vec::new();
+            let mut header_buffer = Vec::new();
+
+            let stream_res = reader.stream_file(&wim_path_owned, &mut |chunk| {
+                if xml_size == 0 {
+                    header_buffer.extend_from_slice(chunk);
+                    if header_buffer.len() >= 204 {
+                        let header = &header_buffer[0..204];
+                        if &header[0..8] != b"MSWIM\x00\x00\x00" && &header[0..8] != b"WLPWM\x00\x00\x00" {
+                            return Err("Invalid WIM Header".to_string());
+                        }
+                        
+                        let mut size_arr = [0u8; 8];
+                        size_arr[..7].copy_from_slice(&header[72..79]);
+                        xml_size = u64::from_le_bytes(size_arr);
+                        
+                        let mut offset_arr = [0u8; 8];
+                        offset_arr.copy_from_slice(&header[80..88]);
+                        xml_offset = u64::from_le_bytes(offset_arr);
+                        
+                        if xml_size == 0 || xml_size > 50 * 1024 * 1024 {
+                            return Err("Invalid XML bounds".to_string());
+                        }
                     }
                 }
-            }
-            
-            // Fast-forward to the XML payload
-            let chunk_end = current_offset + chunk.len() as u64;
-            if xml_size > 0 && chunk_end > xml_offset {
-                let overlap_start = if current_offset < xml_offset { 
-                    (xml_offset - current_offset) as usize 
-                } else { 0 };
                 
-                let overlap_data = &chunk[overlap_start..];
-                xml_buffer.extend_from_slice(overlap_data);
-                
-                // STATE 3: Payload complete! Abort the stream!
-                if xml_buffer.len() as u64 >= xml_size {
-                    xml_buffer.truncate(xml_size as usize);
-                    wim_info_result = esd::parse_xml_payload(&xml_buffer);
-                    return Err("ABORT_SUCCESS".to_string()); // Crash the stream to stop reading!
+                let chunk_end = current_offset + chunk.len() as u64;
+                if xml_size > 0 && chunk_end > xml_offset {
+                    let overlap_start = if current_offset < xml_offset { 
+                        (xml_offset - current_offset) as usize 
+                    } else { 0 };
+                    
+                    let overlap_data = &chunk[overlap_start..];
+                    xml_buffer.extend_from_slice(overlap_data);
+                    
+                    if xml_buffer.len() as u64 >= xml_size {
+                        xml_buffer.truncate(xml_size as usize);
+                        result = esd::parse_xml_payload(&xml_buffer);
+                        return Err("ABORT_SUCCESS".to_string());
+                    }
                 }
-            }
 
-            current_offset += chunk.len() as u64;
+                current_offset += chunk.len() as u64;
+                Ok(())
+            });
+
+            if let Err(e) = stream_res {
+                if e != "ABORT_SUCCESS" { return Err(e); }
+            }
             Ok(())
-        });
+        };
 
-        // Ignore the "ABORT_SUCCESS" error, since we threw it on purpose
-        if let Err(e) = stream_res {
-            if e != "ABORT_SUCCESS" { return Err(e); }
+        if is_udf_valid {
+            let udf_ctx = udf::mount_udf(&mut file).unwrap();
+            let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
+            let _ = execute_wim_scan(&reader);
+        } else {
+            let iso_file = File::open(&image_path).ok()?;
+            let iso = IsoImage::open(iso_file).ok()?;
+            let reader = IsoReader { iso: &iso };
+            let _ = execute_wim_scan(&reader);
         }
-        Ok(())
-    };
 
-    // Run the scanner on either UDF or ISO9660
-    if is_udf_valid {
-        let udf_ctx = udf::mount_udf(&mut file)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("UDF Mount Error: {}", e)))?;
-        let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
-        let _ = execute_wim_scan(&reader);
-    } else {
-        let iso_file = File::open(&image_path)?;
-        let iso = IsoImage::open(iso_file)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Not a valid ISO9660/UDF image: {}", e)))?;
-        let reader = IsoReader { iso: &iso };
-        let _ = execute_wim_scan(&reader);
-    }
+        result // Return the parsed WimInfo back to the main thread
+    });
 
     let info = wim_info_result.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Could not parse WIM info from ISO"))?;
 
@@ -1111,6 +1112,7 @@ pub fn get_wim_info_from_iso<'py>(py: Python<'py>, image_path: String, wim_path:
     dict.set_item("editions", info.editions)?;
     dict.set_item("total_size_bytes", info.total_size_bytes)?;
     dict.set_item("raw_xml", info.raw_xml)?;
+    dict.set_item("suggested_label", info.suggested_label)?;
 
     Ok(dict.into_any().cast_into::<PyDict>().unwrap())
 }

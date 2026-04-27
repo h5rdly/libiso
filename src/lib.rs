@@ -15,6 +15,7 @@ mod lzms_arrays;
 mod bootloader;
 mod sbsign;
 mod exfat;
+mod fat32;
 mod gpt;
 
 

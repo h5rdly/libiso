@@ -1,10 +1,14 @@
-use std::sync::{Arc, mpsc};
-use std::io::{Cursor, Read, Write, Seek, SeekFrom};
-use std::fs::File;
+use std::{
+    fs::File, 
+    sync::{Arc, mpsc}, 
+    io::{Cursor, Read, Write, Seek, SeekFrom}
+};
 
-use hadris_iso::write::{IsoImageWriter, InputFiles, File as IsoFile};
-use hadris_iso::write::options::{FormatOptions, CreationFeatures, BaseIsoLevel};
-use hadris_iso::read::PathSeparator;
+use hadris_iso::{
+    read::PathSeparator,
+    write::{IsoImageWriter, InputFiles, File as IsoFile},
+    write::options::{FormatOptions, CreationFeatures, BaseIsoLevel}
+};
 
 use sha2::{Sha256, Digest};
 
