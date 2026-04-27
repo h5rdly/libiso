@@ -3,12 +3,12 @@ use std::thread;
 use std::sync::{mpsc, Mutex};
 
 use fatfs::{FileSystem, ReadWriteSeek, TimeProvider, OemCpConverter}; 
-use hadris_fat::exfat::{ExFatFs, ExFatFileReader};
 
 use pyo3::prelude::*;
 
 use crate::writer::{ImageReader, EventMsg, ProgressStream, ISO_CHUNK_SIZE, DD_CHUNK_SIZE};
 use crate::io::{AlignedBuffer};
+use crate::exfat::BareExFat;
 
 
 pub trait UsbReader {
@@ -41,21 +41,47 @@ impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbReader for 
     }
 }
 
-pub struct ExFatUsbReader<'a, T: Read + Write + Seek> { pub fs: &'a ExFatFs<T> }
 
-impl<'a, T: Read + Write + Seek> UsbReader for ExFatUsbReader<'a, T> {
-    type FileReader<'r> = ExFatFileReader<'r, T> where Self: 'r;
+pub struct BareFileReader<'r, T: Read + Write + Seek> {
+    fs: &'r BareExFat<T>,
+    start_offset: u64,
+    size: u64,
+    position: u64,
+}
+
+impl<'r, T: Read + Write + Seek> Read for BareFileReader<'r, T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.size { return Ok(0); }
+        
+        let mut inner = self.fs.inner.lock().unwrap();
+        inner.seek(SeekFrom::Start(self.start_offset + self.position))?;
+        
+        let to_read = std::cmp::min(buf.len() as u64, self.size - self.position) as usize;
+        inner.read_exact(&mut buf[..to_read])?;
+        
+        self.position += to_read as u64;
+        Ok(to_read)
+    }
+}
+
+
+impl<T: Read + Write + Seek> UsbReader for BareExFat<T> {
+    type FileReader<'r> = BareFileReader<'r, T> where Self: 'r;
+
     fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
-        let mut curr = self.fs.root_dir();
-        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let target = parts.pop().unwrap_or("");
-        for p in parts { 
-            if !p.is_empty() { 
-                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; 
-            } 
-        }
-        let entry = curr.find(target).map_err(|e| format!("{:?}", e))?.ok_or_else(|| "File not found".to_string())?;
-        ExFatFileReader::new(self.fs, &entry).map_err(|e| format!("{:?}", e))
+        let (cluster, size) = self.find_file(path)?;
+        let start_offset = if cluster >= 2 {
+            self.heap_offset + (cluster as u64 - 2) * self.bytes_per_cluster
+        } else {
+            0
+        };
+
+        Ok(BareFileReader {
+            fs: self,
+            start_offset,
+            size,
+            position: 0,
+        })
     }
 }
 

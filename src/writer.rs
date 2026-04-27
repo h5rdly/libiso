@@ -15,7 +15,6 @@ use hadris_part::{
     scheme_io::DiskPartitionSchemeWriteExt
 };
 
-use hadris_fat::exfat::{ExFatFs}; 
 use hadris_fat::format::{FormatOptions as Fat32FormatOptions, FatVolumeFormatter, FatTypeSelection};
 use fatfs::{ Dir, FileSystem, FsOptions, ReadWriteSeek, TimeProvider, OemCpConverter}; 
 
@@ -530,13 +529,8 @@ pub fn write_image_iso(
                 Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount Bare exFAT: {}", e))); return; }
             };
             
-            // We can just mount hadris-fat EXCLUSIVELY for the read-only USB verifier!
-            let wp_verify = PartitionWrapper { inner: dest_file_for_uefi, offset: partition_offset_bytes, size: partition_size_bytes };
-            let verify_fs = ExFatFs::open(wp_verify).unwrap();
-            let usb_reader = verify::ExFatUsbReader { fs: &verify_fs };
-            
             run_burn_and_verify(
-                &bare_fs, &usb_reader, &iso_path_clone, &device_path_clone, &tx, total_size, 
+                &bare_fs, &bare_fs, &iso_path_clone, &device_path_clone, &tx, total_size, 
                 has_large_file, &arch_selection, unattend_xml_payload, &autorun_inf_label, 
                 abort_flag, verify_written, lba0_bytes
             );
@@ -582,6 +576,7 @@ pub trait UsbWriter {
     fn create_dir(&self, path: &str) -> Result<(), String>;
     fn open_file_writer<'w>(&'w self, path: &str, size: u64) -> Result<Self::FileWriter<'w>, String>;
 }
+
 
 // --- ISO9660 READER ---
 pub struct IsoReader<'a> { pub iso: &'a IsoImage<File> }
@@ -955,31 +950,6 @@ fn inspect_fat32_recursive<IO: fatfs::ReadWriteSeek, TP: fatfs::TimeProvider, OC
 }
 
 
-fn inspect_exfat_recursive<U: std::io::Read + std::io::Write + std::io::Seek>(
-    dir: &hadris_fat::exfat::ExFatDir<'_, U>,
-    current_path: &str,
-    found_files: &mut Vec<String>,
-) {
-    for entry_res in dir.entries() {
-        if let Ok(entry) = entry_res {
-            let name = entry.name.clone();
-            if name == "." || name == ".." || name.is_empty() { continue; }
-            
-            let full_path = if current_path.is_empty() { name.clone() } else { format!("{}/{}", current_path, name) };
-            
-            if entry.is_directory() {
-                found_files.push(format!("[exFAT DIR ] {}", full_path));
-                if let Ok(sub_dir) = dir.open_dir(&name) {
-                    inspect_exfat_recursive(&sub_dir, &full_path, found_files);
-                }
-            } else {
-                found_files.push(format!("[exFAT FILE] {}", full_path));
-            }
-        }
-    }
-}
-
-
 #[pyfunction]
 #[pyo3(signature = (device_path))]
 pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
@@ -1005,10 +975,12 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
     let mut found_files = Vec::new();
 
     if is_exfat {
-        let fs = ExFatFs::open(wrapped_partition).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount exFAT: {:?}", e))
+        let bare_fs = BareExFat::mount(wrapped_partition).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount bare exFAT: {}", e))
         })?;
-        inspect_exfat_recursive(&fs.root_dir(), "", &mut found_files);
+        found_files = bare_fs.inspect_all().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Inspection failed: {}", e))
+        })?;
     } else {
         let fatfs_partition = fatfs::StdIoWrapper::new(wrapped_partition);
         let fs = FileSystem::new(fatfs_partition, FsOptions::new()).map_err(|e| {

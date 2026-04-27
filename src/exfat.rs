@@ -7,17 +7,18 @@ use crate::writer::UsbWriter;
 
 pub struct BareExFat<T: Read + Write + Seek> {
     pub inner: Mutex<T>,
-    bytes_per_cluster: u64,
-    heap_offset: u64,
-    bitmap_offset: u64,
-    bitmap: Mutex<Vec<u8>>,
-    cluster_count: u32,
-    root_cluster: u32,
-    dir_map: Mutex<HashMap<String, u32>>,
+    pub bytes_per_cluster: u64,
+    pub heap_offset: u64,
+    pub bitmap_offset: u64,
+    pub bitmap: Mutex<Vec<u8>>,
+    pub cluster_count: u32,
+    pub root_cluster: u32,
+    pub dir_map: Mutex<HashMap<String, u32>>,
 }
 
 
 impl<T: Read + Write + Seek> BareExFat<T> {
+
     pub fn mount(mut inner: T) -> Result<Self, String> {
         let mut boot = [0u8; 512];
         inner.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
@@ -129,7 +130,134 @@ impl<T: Read + Write + Seek> BareExFat<T> {
         }
         Err("Directory cluster full! Cannot allocate more files.".to_string())
     }
+
+
+    // Scans the directory clusters to find a specific file path and returns (first_cluster, size)
+    pub fn find_file(&self, path: &str) -> Result<(u32, u64), String> {
+        let mut current_cluster = self.root_cluster;
+        let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        let mut inner = self.inner.lock().unwrap();
+
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i == parts.len() - 1;
+            let offset = self.heap_offset + (current_cluster as u64 - 2) * self.bytes_per_cluster;
+            
+            // Read the directory cluster
+            inner.seek(SeekFrom::Start(offset)).unwrap();
+            let mut dir_data = vec![0u8; self.bytes_per_cluster as usize];
+            inner.read_exact(&mut dir_data).unwrap();
+
+            let mut found = false;
+            let mut j = 0;
+            while j < dir_data.len() / 32 {
+                let entry_type = dir_data[j * 32];
+                if entry_type == 0x00 { break; } // End of directory
+                
+                if entry_type == 0x85 { // File Directory Entry
+                    let secondary_count = dir_data[j * 32 + 1] as usize;
+                    let stream_ext = &dir_data[(j + 1) * 32 .. (j + 2) * 32];
+                    
+                    let first_cluster = u32::from_le_bytes(stream_ext[20..24].try_into().unwrap());
+                    let data_length = u64::from_le_bytes(stream_ext[8..16].try_into().unwrap()); // ValidDataLength!
+                    let name_len = stream_ext[3] as usize;
+
+                    let mut name_utf16 = Vec::new();
+                    for k in 0..(secondary_count - 1) {
+                        let name_entry = &dir_data[(j + 2 + k) * 32 .. (j + 3 + k) * 32];
+                        for char_idx in 0..15 {
+                            if name_utf16.len() < name_len {
+                                let c = u16::from_le_bytes(name_entry[2 + char_idx * 2 .. 4 + char_idx * 2].try_into().unwrap());
+                                name_utf16.push(c);
+                            }
+                        }
+                    }
+                    
+                    let name = String::from_utf16_lossy(&name_utf16);
+                    if name.eq_ignore_ascii_case(part) {
+                        if is_last {
+                            return Ok((first_cluster, data_length));
+                        } else {
+                            current_cluster = first_cluster;
+                            found = true;
+                            break;
+                        }
+                    }
+                    j += secondary_count; // skip the rest of this entry set
+                }
+                j += 1;
+            }
+            
+            if !found { return Err(format!("Not found: {}", part)); }
+        }
+        Err("Invalid path".to_string())
+    }
+
+    /// Walks the entire directory tree and returns a formatted list of all files and folders
+    pub fn inspect_all(&self) -> Result<Vec<String>, String> {
+        let mut found_files = Vec::new();
+        self.walk_dir(self.root_cluster, "", &mut found_files)?;
+        Ok(found_files)
+    }
+
+    /// Recursive helper to walk directory clusters
+    fn walk_dir(&self, cluster: u32, current_path: &str, found_files: &mut Vec<String>) -> Result<(), String> {
+        let offset = self.heap_offset + (cluster as u64 - 2) * self.bytes_per_cluster;
+        let mut dir_data = vec![0u8; self.bytes_per_cluster as usize];
+        
+        // Scope the lock so we drop it before recursing!
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.seek(SeekFrom::Start(offset)).unwrap();
+            inner.read_exact(&mut dir_data).unwrap();
+        }
+
+        let mut j = 0;
+        while j < dir_data.len() / 32 {
+            let entry_type = dir_data[j * 32];
+            if entry_type == 0x00 { break; } // End of directory
+            
+            if entry_type == 0x85 { // File Directory Entry
+                let secondary_count = dir_data[j * 32 + 1] as usize;
+                
+                // Read File Attributes (Offset 4, 2 bytes) -> 0x0010 is Directory
+                let file_attrs = u16::from_le_bytes(dir_data[j * 32 + 4 .. j * 32 + 6].try_into().unwrap());
+                let is_dir = (file_attrs & 0x0010) != 0;
+
+                let stream_ext = &dir_data[(j + 1) * 32 .. (j + 2) * 32];
+                let first_cluster = u32::from_le_bytes(stream_ext[20..24].try_into().unwrap());
+                let name_len = stream_ext[3] as usize;
+
+                let mut name_utf16 = Vec::new();
+                for k in 0..(secondary_count - 1) {
+                    let name_entry = &dir_data[(j + 2 + k) * 32 .. (j + 3 + k) * 32];
+                    for char_idx in 0..15 {
+                        if name_utf16.len() < name_len {
+                            let c = u16::from_le_bytes(name_entry[2 + char_idx * 2 .. 4 + char_idx * 2].try_into().unwrap());
+                            name_utf16.push(c);
+                        }
+                    }
+                }
+                
+                let name = String::from_utf16_lossy(&name_utf16);
+                if name != "." && name != ".." && !name.is_empty() {
+                    let full_path = if current_path.is_empty() { name.clone() } else { format!("{}/{}", current_path, name) };
+                    
+                    if is_dir {
+                        found_files.push(format!("[exFAT DIR ] {}", full_path));
+                        self.walk_dir(first_cluster, &full_path, found_files)?;
+                    } else {
+                        found_files.push(format!("[exFAT FILE] {}", full_path));
+                    }
+                }
+                j += secondary_count; // Skip the secondary entries
+            }
+            j += 1;
+        }
+        Ok(())
+    }
 }
+
+
 
 
 // ── exFAT sprcification utilities
@@ -212,6 +340,7 @@ fn build_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> Vec<[u8
     entries
 }
 
+
 // ── Trait implementations 
 
 impl<T: Read + Write + Seek> UsbWriter for BareExFat<T> {
@@ -255,7 +384,12 @@ impl<T: Read + Write + Seek> UsbWriter for BareExFat<T> {
         
         Ok(BareFileWriter { fs: self, start_offset, bytes_written: 0, max_size: size })
     }
+
+    
 }
+
+
+
 
 pub struct BareFileWriter<'w, T: Read + Write + Seek> {
     fs: &'w BareExFat<T>,
@@ -276,3 +410,5 @@ impl<'w, T: Read + Write + Seek> Write for BareFileWriter<'w, T> {
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
+
+
