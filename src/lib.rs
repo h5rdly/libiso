@@ -15,6 +15,7 @@ mod lzms_arrays;
 mod bootloader;
 mod sbsign;
 mod exfat;
+mod gpt;
 
 
 use drives::{list_removable_drives, DriveInfo};

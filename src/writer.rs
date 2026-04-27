@@ -1,18 +1,11 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write, Seek, SeekFrom},
+    io::{Read, Write, Seek, SeekFrom, copy},
     path::Path,
     thread,
     time::{SystemTime, UNIX_EPOCH},
     sync::{Arc, mpsc, Mutex, atomic::{AtomicBool, Ordering}},
     cell::RefCell
-};
-
-use hadris_part::{
-    GptDisk, GptPartitionEntry, Guid, DiskPartitionScheme,
-    geometry::DiskGeometry,
-    mbr::{MasterBootRecord, MbrPartition, MbrPartitionType},
-    scheme_io::DiskPartitionSchemeWriteExt
 };
 
 use hadris_fat::format::{FormatOptions as Fat32FormatOptions, FatVolumeFormatter, FatTypeSelection};
@@ -28,6 +21,8 @@ use crate::verify;
 use crate::bootloader;
 use crate::udf;
 use crate::exfat;
+use crate::gpt;
+
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
@@ -140,19 +135,6 @@ impl<T: Read + Write + Seek> Seek for PartitionWrapper<T> {
     }
 }
 
-fn pseudo_uuid() -> [u8; 16] {
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let s = t.as_secs();
-    let n = t.subsec_nanos();
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&s.to_le_bytes());
-    bytes[8..12].copy_from_slice(&n.to_le_bytes());
-    let mix = (s as u32) ^ n;
-    bytes[12..16].copy_from_slice(&mix.to_le_bytes());
-    bytes[6] = (bytes[6] & 0x0F) | 0x40;
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    bytes
-}
 
 pub fn get_clean_filename(entry: &DirEntry) -> String {
     let mut name = if entry.record.is_joliet_name() {
@@ -222,33 +204,22 @@ pub fn format_usb_drive(
     }
     dest_file.sync_all()?;
 
-    let geom = DiskGeometry::standard(total_sectors);
-    let start_lba = geom.gpt_first_usable_lba_aligned(128, 128); 
-    let safe_end_lba = geom.gpt_last_usable_lba_aligned(128, 128); 
+    let geom_start_lba = 2048; // 1 MiB alignment
+    let geom_safe_end_lba = ((total_sectors - 34) / 2048) * 2048 - 1; // Align down
 
-    if scheme.eq_ignore_ascii_case("mbr") {
-        let mut mbr = MasterBootRecord::default();
-        mbr.with_partition_table(|pt| {
-            let p_type = if is_exfat { MbrPartitionType::Ntfs } else { MbrPartitionType::Fat32Lba };
-            pt[0] = MbrPartition::new(p_type, start_lba as u32, (safe_end_lba - start_lba + 1) as u32);
-            pt[0].set_bootable(true);
-        });
-        let scheme = DiskPartitionScheme::Mbr(mbr);
-        DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write MBR: {:?}", e)))?;
-    } else {
-        let mut gpt = GptDisk::new(total_sectors, 512);
-        let part1 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::from_bytes(pseudo_uuid()), start_lba, safe_end_lba);
-        gpt.add_partition(part1).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let protective_mbr = gpt.create_protective_mbr();
-        let scheme = DiskPartitionScheme::Gpt { protective_mbr, gpt };
-        DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write GPT: {:?}", e)))?;
-    }
+    gpt::write_partition_table(
+        &mut dest_file,
+        total_sectors,
+        !scheme.eq_ignore_ascii_case("mbr"),
+        (geom_start_lba, geom_safe_end_lba - geom_start_lba + 1),
+        None, None, is_exfat
+    ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     dest_file.sync_all()?;
 
-    let partition_offset = start_lba * 512;
-    let partition_size = (safe_end_lba - start_lba + 1) * 512;
+    let partition_offset = geom_start_lba * 512;
+    let partition_size = (geom_safe_end_lba - geom_start_lba + 1) * 512;
     let mut wrapped_partition = PartitionWrapper { inner: dest_file, offset: partition_offset, size: partition_size };
-    format_partition(&mut wrapped_partition, is_exfat, volume_label, start_lba).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    format_partition(&mut wrapped_partition, is_exfat, volume_label, geom_start_lba).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
     Ok(())
 }
@@ -389,9 +360,9 @@ pub fn write_image_iso(
         return Err(pyo3::exceptions::PyValueError::new_err("MBR partition scheme does not support drives larger than 2TB."));
     }
 
-    let geom = DiskGeometry::standard(total_sectors);
-    let start_lba = geom.gpt_first_usable_lba_aligned(128, 128); 
-    let safe_end_lba = geom.gpt_last_usable_lba_aligned(128, 128);
+    // The exact same alignment math without the heavy DiskGeometry dependency
+    let start_lba = 2048; 
+    let safe_end_lba = ((total_sectors - 34) / 2048) * 2048 - 1;
 
     let persistence_sectors = persistence_size_mb.unwrap_or(0) * 2048; 
     let efi_sectors = if has_large_file { 2048 } else { 0 };
@@ -420,41 +391,19 @@ pub fn write_image_iso(
     dest_file.sync_all()?;
     dest_file.seek(SeekFrom::Start(0))?;
 
-    if scheme.eq_ignore_ascii_case("mbr") {
-        let mut mbr = MasterBootRecord::default();
-        mbr.with_partition_table(|pt| {
-            let p_type = if has_large_file { MbrPartitionType::Ntfs } else { MbrPartitionType::Fat32Lba }; 
-            pt[0] = MbrPartition::new(p_type, start_lba as u32, part1_sectors as u32);
-            pt[0].set_bootable(true);
-            if let Some((start, size)) = efi_part { pt[1] = MbrPartition::new(MbrPartitionType::EfiSystemPartition, start as u32, size as u32); }
-            if let Some((start, size)) = persistence_part { pt[2] = MbrPartition::new(MbrPartitionType::LinuxNative, start as u32, size as u32); }
-        });
+    gpt::write_partition_table(
+        &mut dest_file,
+        total_sectors,
+        !scheme.eq_ignore_ascii_case("mbr"),
+        (start_lba, part1_sectors),
+        efi_part,
+        persistence_part,
+        has_large_file
+    ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        let scheme = DiskPartitionScheme::Mbr(mbr);
-        DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write MBR: {:?}", e)))?;
-    } else {
-        let mut gpt = GptDisk::new(total_sectors, 512);
-        let disk_id = Guid::from_bytes(pseudo_uuid());
-        gpt.primary_header.disk_guid = disk_id;
-        gpt.backup_header.disk_guid = disk_id;
-
-        let part1 = GptPartitionEntry::new(Guid::BASIC_DATA, Guid::from_bytes(pseudo_uuid()), start_lba, part1_end_lba);
-        gpt.add_partition(part1).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Part 1 err: {:?}", e)))?;
-        if let Some((start, size)) = efi_part {
-            let part2 = GptPartitionEntry::new(Guid::EFI_SYSTEM, Guid::from_bytes(pseudo_uuid()), start, start + size - 1);
-            gpt.add_partition(part2).unwrap();
-        }
-        if let Some((start, size)) = persistence_part {
-            let part3 = GptPartitionEntry::new(Guid::LINUX_FILESYSTEM, Guid::from_bytes(pseudo_uuid()), start, start + size - 1);
-            gpt.add_partition(part3).unwrap();
-        }
-
-        let protective_mbr = gpt.create_protective_mbr();
-        let scheme = DiskPartitionScheme::Gpt { protective_mbr, gpt };
-        DiskPartitionSchemeWriteExt::write_to(&scheme, &mut dest_file).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write GPT: {:?}", e)))?;
-    }
     dest_file.sync_all()?;
 
+    // (The Stealth-Mode LBA 0 wipe)
     let mut lba0_bytes = [0u8; 512];
     dest_file.seek(SeekFrom::Start(0))?;
     dest_file.read_exact(&mut lba0_bytes)?;
@@ -462,6 +411,7 @@ pub fn write_image_iso(
     dest_file.write_all(&[0u8; 512])?;
     dest_file.sync_all()?;
 
+    // (Ext4 persistence creation)
     if let Some((start, sectors)) = persistence_part {
         let ext4_offset = start * 512;
         let ext4_size = sectors * 512;
@@ -479,7 +429,7 @@ pub fn write_image_iso(
 
         temp_file.seek(SeekFrom::Start(0))?;
         dest_file.seek(SeekFrom::Start(ext4_offset))?;
-        std::io::copy(&mut temp_file, &mut dest_file)?;
+        copy(&mut temp_file, &mut dest_file)?;
         dest_file.sync_all()?;
     }
 
@@ -509,7 +459,7 @@ pub fn write_image_iso(
         let mut uefi_file = File::open(&uefi_path)?;
         if let Some((start, _)) = efi_part {
             dest_file_for_uefi.seek(SeekFrom::Start(start * 512))?;
-            std::io::copy(&mut uefi_file, &mut dest_file_for_uefi)?;
+            copy(&mut uefi_file, &mut dest_file_for_uefi)?;
             dest_file_for_uefi.sync_all()?;
         }
     }
