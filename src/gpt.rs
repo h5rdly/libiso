@@ -50,7 +50,7 @@ pub fn write_partition_table<T: Write + Seek>(
     mbr[511] = 0xAA;
 
     if is_gpt {
-        // 1. Protective MBR (LBA 0)
+        // Protective MBR (LBA 0)
         let prot_size = if total_sectors > 0xFFFFFFFF { 0xFFFFFFFF } else { (total_sectors - 1) as u32 };
         mbr[446] = 0x00; // Boot indicator
         mbr[447..450].copy_from_slice(&[0x00, 0x02, 0x00]); // Start CHS
@@ -62,7 +62,7 @@ pub fn write_partition_table<T: Write + Seek>(
         drive.seek(SeekFrom::Start(0)).unwrap();
         drive.write_all(&mbr).unwrap();
 
-        // 2. Build Partition Entry Array (128 entries * 128 bytes = 16384 bytes)
+        // Build Partition Entry Array (128 entries * 128 bytes = 16384 bytes)
         let mut entries = vec![0u8; 16384];
         let disk_guid = pseudo_uuid();
         
@@ -90,7 +90,7 @@ pub fn write_partition_table<T: Write + Seek>(
 
         let entries_crc = crc32(&entries);
 
-        // 3. Build Header Function
+        // Build Header Function
         let build_header = |my_lba: u64, alt_lba: u64, array_lba: u64| -> [u8; 512] {
             let mut hdr = [0u8; 512];
             hdr[0..8].copy_from_slice(b"EFI PART");

@@ -13,9 +13,21 @@ else:
 
 
 
+'''
+uefi-ntfs.img is a generic bootloader that is placed on a tiny FAT partition, which 
+allows to load an exFAT/NTFS partition with the ISO. 
 
+This is done for Windows ISOs, since they contain a file (install.wim) which is usually 
+larger than 4GB, thus bypassing the 4GB file limitation of FAT32.
+
+Homepage - 
+https://github.com/pbatard/uefi-ntfs
+
+libiso pulls the image at runtime via ensure_uefi_bridge() below
+'''
 UEFI_BRIDGE_NAME = 'uefi-ntfs.img'
 UEFI_BRIDGE_DOWNLOAD_URL = f'https://raw.githubusercontent.com/pbatard/rufus/master/res/uefi/{UEFI_BRIDGE_NAME}'
+
 DBX_REVOCATION_URL = 'https://raw.githubusercontent.com/microsoft/secureboot_objects/refs/heads/main/PreSignedObjects/DBX/dbx_info_msft_latest.json'
 
 

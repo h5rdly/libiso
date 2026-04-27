@@ -25,7 +25,7 @@ use test_utils::{
 };
 use writer::{
     write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition, extract_image,
-    AbortToken, EventMsg, ProgressStream
+    AbortToken, EventMsg, ProgressStream, get_wim_info_from_iso
 };
 use verify::{destructive_verify_usb_size};
 
@@ -47,6 +47,7 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AbortToken>()?;
     m.add_class::<EventMsg>()?;
     m.add_class::<ProgressStream>()?;
+    m.add_function(wrap_pyfunction!(get_wim_info_from_iso, m)?)?; 
     m.add_function(wrap_pyfunction!(inspect_usb_partition, m)?)?; 
     m.add_function(wrap_pyfunction!(extract_image, m)?)?; 
     m.add_function(wrap_pyfunction!(format_usb_drive, m)?)?; 

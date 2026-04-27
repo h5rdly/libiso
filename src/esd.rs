@@ -1,6 +1,10 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::fmt::Write;
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    fmt::Write,
+    collections::HashMap
+};
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -9,7 +13,9 @@ pub struct WimInfo {
     pub architecture: Option<String>,
     pub editions: Vec<String>,
     pub total_size_bytes: u64,
+    pub raw_xml: String, 
 }
+
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let start_tag = format!("<{}>", tag);
@@ -22,111 +28,6 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
         }
     }
     None
-}
-
-pub fn parse_wim_xml<F>(
-    total_size: u64,
-    mut read_chunk: F,
-) -> Option<WimInfo>
-where
-    F: FnMut(&mut [u8], u64) -> bool,
-{
-    if total_size < 204 {
-        return None;
-    }
-
-    let mut header = [0u8; 204];
-    if !read_chunk(&mut header, 0) {
-        return None;
-    }
-
-    if &header[0..8] != b"MSWIM\x00\x00\x00" && &header[0..8] != b"WLPWM\x00\x00\x00" {
-        return None;
-    }
-
-    let xml_res_offset = 72;
-    let mut size_arr = [0u8; 8];
-    size_arr[..7].copy_from_slice(&header[xml_res_offset..xml_res_offset + 7]);
-    let xml_size = u64::from_le_bytes(size_arr);
-    
-    let mut offset_arr = [0u8; 8];
-    offset_arr.copy_from_slice(&header[xml_res_offset + 8..xml_res_offset + 16]);
-    let xml_offset = u64::from_le_bytes(offset_arr);
-
-    if xml_size == 0 || xml_size > 50 * 1024 * 1024 || xml_offset + xml_size > total_size {
-        return None;
-    }
-
-    let mut xml_bytes = vec![0u8; xml_size as usize];
-    if !read_chunk(&mut xml_bytes, xml_offset) {
-        return None;
-    }
-
-    if xml_bytes.len() < 2 || xml_bytes[0] != 0xFF || xml_bytes[1] != 0xFE || xml_bytes.len() % 2 != 0 {
-        return None;
-    }
-    
-    let utf16_data = &xml_bytes[2..];
-    let mut utf16_chars = Vec::with_capacity(utf16_data.len() / 2);
-    for chunk in utf16_data.chunks_exact(2) {
-        utf16_chars.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    let xml_string = String::from_utf16(&utf16_chars).ok()?;
-
-    let mut architectures = std::collections::HashMap::new();
-    let mut editions = Vec::new();
-    let mut total_bytes = 0u64;
-    let mut start_pos = 0;
-
-    while let Some(image_start) = xml_string[start_pos..].find("<IMAGE") {
-        let absolute_start = start_pos + image_start;
-        if let Some(image_end) = xml_string[absolute_start..].find("</IMAGE>") {
-            let absolute_end = absolute_start + image_end + 8;
-            let image_xml = &xml_string[absolute_start..absolute_end];
-
-            if let Some(bytes_str) = extract_tag(image_xml, "TOTALBYTES") {
-                if let Ok(bytes) = bytes_str.parse::<u64>() {
-                    total_bytes += bytes;
-                }
-            }
-
-            if let Some(arch_val) = extract_tag(image_xml, "ARCH") {
-                let arch_str = match arch_val.as_str() {
-                    "0" => "x86",
-                    "9" => "x64",
-                    "5" => "ARM",
-                    "12" => "ARM64",
-                    _ => "Unknown",
-                };
-                *architectures.entry(arch_str.to_string()).or_insert(0) += 1;
-            }
-
-            let name = extract_tag(image_xml, "DISPLAYNAME").unwrap_or_default().to_lowercase();
-            if name.contains("pro") && !editions.contains(&"Pro".to_string()) {
-                editions.push("Pro".to_string());
-            } else if name.contains("home") && !editions.contains(&"Home".to_string()) {
-                editions.push("Home".to_string());
-            } else if name.contains("enterprise") && !editions.contains(&"Enterprise".to_string()) {
-                editions.push("Enterprise".to_string());
-            } else if name.contains("education") && !editions.contains(&"Education".to_string()) {
-                editions.push("Education".to_string());
-            } else if name.contains("server") && !editions.contains(&"Server".to_string()) {
-                editions.push("Server".to_string());
-            }
-
-            start_pos = absolute_end;
-        } else {
-            break;
-        }
-    }
-
-    let primary_arch = architectures.into_iter().max_by_key(|&(_, count)| count).map(|(arch, _)| arch);
-
-    Some(WimInfo {
-        architecture: primary_arch,
-        editions,
-        total_size_bytes: total_bytes,
-    })
 }
 
 
@@ -330,8 +231,9 @@ impl EsdArchive {
     }
 
     
-    // Parses the WIM XML metadata to extract Windows editions and architecture
+    // Parse the WIM XML metadata to extract Windows editions and architecture
     pub fn get_wim_info<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        
         let total_size = self.file.metadata()?.len();
         
         let info = parse_wim_xml(total_size, |buf, offset| {
@@ -344,7 +246,120 @@ impl EsdArchive {
         }
         dict.set_item("editions", info.editions)?;
         dict.set_item("total_size_bytes", info.total_size_bytes)?;
-        
+        dict.set_item("raw_xml", info.raw_xml)?; 
+
         Ok(dict)
     }
+}
+
+
+pub fn parse_xml_payload(xml_bytes: &[u8]) -> Option<WimInfo> {
+
+    if xml_bytes.len() < 2 || xml_bytes[0] != 0xFF || xml_bytes[1] != 0xFE || xml_bytes.len() % 2 != 0 {
+        return None;
+    }
+    
+    let utf16_data = &xml_bytes[2..];
+    let mut utf16_chars = Vec::with_capacity(utf16_data.len() / 2);
+    for chunk in utf16_data.chunks_exact(2) {
+        utf16_chars.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    let xml_string = String::from_utf16(&utf16_chars).ok()?;
+
+    let mut architectures = HashMap::new();
+    let mut editions = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut start_pos = 0;
+
+    while let Some(image_start) = xml_string[start_pos..].find("<IMAGE") {
+        let absolute_start = start_pos + image_start;
+        if let Some(image_end) = xml_string[absolute_start..].find("</IMAGE>") {
+            let absolute_end = absolute_start + image_end + 8;
+            let image_xml = &xml_string[absolute_start..absolute_end];
+
+            if let Some(bytes_str) = extract_tag(image_xml, "TOTALBYTES") {
+                if let Ok(bytes) = bytes_str.parse::<u64>() {
+                    total_bytes += bytes;
+                }
+            }
+
+            if let Some(arch_val) = extract_tag(image_xml, "ARCH") {
+                let arch_str = match arch_val.as_str() {
+                    "0" => "x86",
+                    "9" => "x64",
+                    "5" => "ARM",
+                    "12" => "ARM64",
+                    _ => "Unknown",
+                };
+                *architectures.entry(arch_str.to_string()).or_insert(0) += 1;
+            }
+
+            let mut name = extract_tag(image_xml, "NAME").unwrap_or_default().to_lowercase();
+            if name.is_empty() {
+                name = extract_tag(image_xml, "EDITIONID").unwrap_or_default().to_lowercase();
+            }
+            if name.is_empty() {
+                name = extract_tag(image_xml, "DISPLAYNAME").unwrap_or_default().to_lowercase();
+            }
+
+            if name.contains("pro") && !editions.contains(&"Pro".to_string()) { editions.push("Pro".to_string()); } 
+            else if name.contains("home") && !editions.contains(&"Home".to_string()) { editions.push("Home".to_string()); } 
+            else if name.contains("enterprise") && !editions.contains(&"Enterprise".to_string()) { editions.push("Enterprise".to_string()); } 
+            else if name.contains("education") && !editions.contains(&"Education".to_string()) { editions.push("Education".to_string()); } 
+            else if name.contains("server") && !editions.contains(&"Server".to_string()) { editions.push("Server".to_string()); }
+
+            start_pos = absolute_end;
+        } else {
+            break;
+        }
+    }
+
+    let primary_arch = architectures.into_iter().max_by_key(|&(_, count)| count).map(|(arch, _)| arch);
+
+    Some(WimInfo { 
+        architecture: primary_arch, 
+        editions, 
+        total_size_bytes: total_bytes,
+        raw_xml: xml_string 
+    })
+}
+
+
+
+pub fn parse_wim_xml<F>(total_size: u64, mut read_chunk: F) -> Option<WimInfo> where
+    F: FnMut(&mut [u8], u64) -> bool 
+{
+
+    if total_size < 204 {
+        return None;
+    }
+
+    let mut header = [0u8; 204];
+    if !read_chunk(&mut header, 0) {
+        return None;
+    }
+
+    if &header[0..8] != b"MSWIM\x00\x00\x00" && &header[0..8] != b"WLPWM\x00\x00\x00" {
+        return None;
+    }
+
+    let xml_res_offset = 72;
+    let mut size_arr = [0u8; 8];
+    size_arr[..7].copy_from_slice(&header[xml_res_offset..xml_res_offset + 7]);
+    let xml_size = u64::from_le_bytes(size_arr);
+    
+    let mut offset_arr = [0u8; 8];
+    offset_arr.copy_from_slice(&header[xml_res_offset + 8..xml_res_offset + 16]);
+    let xml_offset = u64::from_le_bytes(offset_arr);
+
+    if xml_size == 0 || xml_size > 50 * 1024 * 1024 || xml_offset + xml_size > total_size {
+        return None;
+    }
+
+    let mut xml_bytes = vec![0u8; xml_size as usize];
+    if !read_chunk(&mut xml_bytes, xml_offset) {
+        return None;
+    }
+
+    parse_xml_payload(&xml_bytes)
 }
