@@ -14,6 +14,7 @@ use crate::exfat::BareExFat;
 pub trait UsbReader {
     type FileReader<'a>: Read + 'a where Self: 'a;
     fn open_file_reader<'a>(&'a self, path: &str) -> Result<Self::FileReader<'a>, String>;
+    fn get_file_size(&self, path: &str) -> Result<u64, String>; 
 }
 
 pub struct Fat32UsbReader<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { pub fs: &'a FileSystem<T, TP, OCC> }
@@ -27,6 +28,7 @@ impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for Fat32
 
 impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbReader for Fat32UsbReader<'a, T, TP, OCC> {
     type FileReader<'r> = Fat32FileReader<'r, T, TP, OCC> where Self: 'r;
+    
     fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
         let mut curr = self.fs.root_dir();
         let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -38,6 +40,24 @@ impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbReader for 
         }
         let f = curr.open_file(target).map_err(|e| format!("{:?}", e))?;
         Ok(Fat32FileReader { inner: f })
+    }
+
+    fn get_file_size(&self, path: &str) -> Result<u64, String> {
+        let mut curr = self.fs.root_dir();
+        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let target = parts.pop().unwrap_or("");
+        
+        for p in parts { 
+            if !p.is_empty() { 
+                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; 
+            } 
+        }
+        
+        let mut f = curr.open_file(target).map_err(|e| format!("{:?}", e))?;
+        let size = fatfs::Seek::seek(&mut f, fatfs::SeekFrom::End(0))
+            .map_err(|e| format!("{:?}", e))?;
+
+        Ok(size)
     }
 }
 
@@ -68,6 +88,11 @@ impl<'r, T: Read + Write + Seek> Read for BareFileReader<'r, T> {
 impl<T: Read + Write + Seek> UsbReader for BareExFat<T> {
     type FileReader<'r> = BareFileReader<'r, T> where Self: 'r;
 
+    fn get_file_size(&self, path: &str) -> Result<u64, String> {
+        let (_, size) = self.find_file(path)?;
+        Ok(size)
+    }
+
     fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
         let (cluster, size) = self.find_file(path)?;
         let start_offset = if cluster >= 2 {
@@ -83,6 +108,7 @@ impl<T: Read + Write + Seek> UsbReader for BareExFat<T> {
             position: 0,
         })
     }
+
 }
 
 
@@ -93,7 +119,7 @@ pub fn verify<R: ImageReader, U: UsbReader>(
     tx: &mpsc::SyncSender<EventMsg>,
     verified: &mut u64,
     total_size: u64,
-    skip_bootloader: bool, // <-- Add this flag!
+    skip_bootloader: bool, 
 ) -> Result<(), String> {
     let entries = iso_reader.list_dir(current_path)?;
 
@@ -120,6 +146,15 @@ pub fn verify<R: ImageReader, U: UsbReader>(
                 continue;
             }
 
+            let usb_size = usb_reader.get_file_size(&new_path)?;
+            if entry.size != usb_size {
+                let _ = tx.send(EventMsg::error(&format!(
+                    "SIZE MISMATCH: '{}'. ISO expects {} bytes, but USB exFAT DataLength is {} bytes.", 
+                    new_path, entry.size, usb_size
+                )));
+                return Err("Directory entry DataLength corruption detected!".to_string());
+            }
+
             let mut usb_file = usb_reader.open_file_reader(&new_path)?;
             let mut file_read_so_far = 0u64;
             let mut usb_buf = vec![0u8; ISO_CHUNK_SIZE];
@@ -134,23 +169,6 @@ pub fn verify<R: ImageReader, U: UsbReader>(
                     for i in 0..to_read {
                         if iso_chunk[i] != usb_buf[i] { mismatch_idx = i; break; }
                     }
-
-                    // 👇 ---  DEBUG BLOCK --- 👇
-                    println!("\n================ FATAL DATA CORRUPTION ================");
-                    println!("File: {}", new_path);
-                    println!("Absolute Byte Offset: {}", file_read_so_far + mismatch_idx as u64);
-                    
-                    // Take a 32-byte window around the exact point of failure
-                    let window_start = mismatch_idx.saturating_sub(8);
-                    let window_end = (mismatch_idx + 24).min(to_read);
-                    
-                    println!("\nISO Expected Data:");
-                    for b in &iso_chunk[window_start..window_end] { print!("{:02X} ", b); }
-                    
-                    println!("\n\nUSB Actual Data:");
-                    for b in &usb_buf[window_start..window_end] { print!("{:02X} ", b); }
-                    println!("\n=======================================================\n");
-                    // 👆 ---------------------------- 👆
 
                     return Err(format!(
                         "Corruption in '{}'! Mismatch at byte offset {}. ISO byte: {:#04X}, USB byte: {:#04X}", 
