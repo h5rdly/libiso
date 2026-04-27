@@ -27,7 +27,7 @@ use crate::io::{AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread}
 use crate::verify;
 use crate::bootloader;
 use crate::udf;
-use crate::exfat::BareExFat;
+use crate::exfat;
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
@@ -176,9 +176,7 @@ pub fn format_partition<T: Read + Write + Seek>(
     let part_size = wrapped_partition.size;
 
     if is_exfat {
-        let mut options = hadris_fat::exfat::ExFatFormatOptions::new().with_label(volume_label);
-        options.partition_offset = start_lba as u64; 
-        hadris_fat::exfat::format_exfat(&mut *wrapped_partition, part_size, &options)
+        exfat::format_exfat(&mut *wrapped_partition, part_size, volume_label)
             .map_err(|e| format!("exFAT Format failed: {:?}", e))?;
     } else {
         let options = Fat32FormatOptions::new(part_size)
@@ -524,7 +522,7 @@ pub fn write_image_iso(
             let _ = tx.send(EventMsg::phase("Extracting image (exFAT Bare-Metal)"));
             
             // USE OUR NEW ZERO-DEPENDENCY BARE METAL WRITER!
-            let bare_fs = match BareExFat::mount(wp) {
+            let bare_fs = match exfat::BareExFat::mount(wp) {
                 Ok(fs) => fs,
                 Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount Bare exFAT: {}", e))); return; }
             };
@@ -975,7 +973,7 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
     let mut found_files = Vec::new();
 
     if is_exfat {
-        let bare_fs = BareExFat::mount(wrapped_partition).map_err(|e| {
+        let bare_fs = exfat::BareExFat::mount(wrapped_partition).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount bare exFAT: {}", e))
         })?;
         found_files = bare_fs.inspect_all().map_err(|e| {

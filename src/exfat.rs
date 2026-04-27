@@ -412,3 +412,164 @@ impl<'w, T: Read + Write + Seek> Write for BareFileWriter<'w, T> {
 }
 
 
+
+// ── exFAT formatter
+
+pub fn format_exfat<T: Read + Write + Seek>(
+    drive: &mut T,
+    volume_size: u64,
+    volume_label: &str,
+) -> Result<(), String> {
+    let bytes_per_sector: u64 = 512;
+    let vol_sectors = volume_size / bytes_per_sector;
+
+    // 1. Calculate cluster geometry (32KB for standard drives, 128KB for >32GB)
+    let mb = 1024 * 1024u64;
+    let bytes_per_cluster = if volume_size < 256 * mb { 4096 }
+        else if volume_size < 32 * 1024 * mb { 32768 }
+        else { 131072 };
+    let sectors_per_cluster = bytes_per_cluster / bytes_per_sector;
+
+    let fat_offset = 24u64; // Starts right after Boot Region (12) + Backup Boot Region (12)
+    let mut fat_length = 1u64;
+    let mut heap_offset = fat_offset + fat_length;
+    let mut cluster_count = (vol_sectors - heap_offset) / sectors_per_cluster;
+
+    // Iteratively resolve exact FAT size
+    loop {
+        let needed_fat = ((cluster_count + 2) * 4).div_ceil(bytes_per_sector);
+        if needed_fat <= fat_length { break; }
+        fat_length = needed_fat;
+        heap_offset = fat_offset + fat_length;
+        cluster_count = (vol_sectors - heap_offset) / sectors_per_cluster;
+    }
+
+    let serial = 0x12345678u32; // Standard dummy serial
+
+    // 2. The Minimal Compressed Upcase Table
+    let mut upcase_data = Vec::new();
+    upcase_data.extend_from_slice(&0xFFFFu16.to_le_bytes()); upcase_data.extend_from_slice(&97u16.to_le_bytes());
+    for i in 0x0041u16..=0x005A { upcase_data.extend_from_slice(&i.to_le_bytes()); }
+    upcase_data.extend_from_slice(&0xFFFFu16.to_le_bytes()); upcase_data.extend_from_slice(&101u16.to_le_bytes());
+    for i in 0x00C0u16..=0x00D6 { upcase_data.extend_from_slice(&i.to_le_bytes()); }
+    upcase_data.extend_from_slice(&0x00F7u16.to_le_bytes());
+    for i in 0x00D8u16..=0x00DE { upcase_data.extend_from_slice(&i.to_le_bytes()); }
+    upcase_data.extend_from_slice(&0x0178u16.to_le_bytes());
+    upcase_data.extend_from_slice(&0xFFFFu16.to_le_bytes()); upcase_data.extend_from_slice(&32768u16.to_le_bytes());
+    upcase_data.extend_from_slice(&0xFFFFu16.to_le_bytes()); upcase_data.extend_from_slice(&32512u16.to_le_bytes());
+    
+    let mut upcase_checksum = 0u32;
+    for &b in &upcase_data { upcase_checksum = upcase_checksum.rotate_right(1).wrapping_add(b as u32); }
+
+    let upcase_clusters = (upcase_data.len() as u64).div_ceil(bytes_per_cluster) as u32;
+    let bitmap_bytes = cluster_count.div_ceil(8) as u64;
+    let bitmap_clusters = bitmap_bytes.div_ceil(bytes_per_cluster) as u32;
+
+    let bitmap_cluster = 2u32;
+    let upcase_cluster = bitmap_cluster + bitmap_clusters;
+    let root_cluster = upcase_cluster + upcase_clusters;
+
+    // 3. Construct Boot Region
+    let mut boot = vec![0u8; 512];
+    boot[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
+    boot[3..11].copy_from_slice(b"EXFAT   ");
+    boot[72..80].copy_from_slice(&vol_sectors.to_le_bytes());
+    boot[80..84].copy_from_slice(&(fat_offset as u32).to_le_bytes());
+    boot[84..88].copy_from_slice(&(fat_length as u32).to_le_bytes());
+    boot[88..92].copy_from_slice(&(heap_offset as u32).to_le_bytes());
+    boot[92..96].copy_from_slice(&(cluster_count as u32).to_le_bytes());
+    boot[96..100].copy_from_slice(&root_cluster.to_le_bytes());
+    boot[100..104].copy_from_slice(&serial.to_le_bytes());
+    boot[104..106].copy_from_slice(&0x0100u16.to_le_bytes()); // Rev 1.0
+    boot[108] = bytes_per_sector.trailing_zeros() as u8;
+    boot[109] = sectors_per_cluster.trailing_zeros() as u8;
+    boot[110] = 1; // 1 FAT Table
+    boot[111] = 0x80; // Drive select
+    boot[112] = 0xFF; // Percent in use
+    boot[510] = 0x55;
+    boot[511] = 0xAA;
+
+    let mut boot_region = vec![0u8; 12 * 512];
+    boot_region[0..512].copy_from_slice(&boot);
+    for i in 1..=8 {
+        boot_region[i*512 + 510] = 0x55;
+        boot_region[i*512 + 511] = 0xAA;
+    }
+    
+    // Boot Checksum calculation
+    let mut checksum = 0u32;
+    for i in 0..11*512 {
+        if i == 106 || i == 107 || i == 112 { continue; } // Skip flags
+        checksum = checksum.rotate_right(1).wrapping_add(boot_region[i] as u32);
+    }
+    for i in 0..128 {
+        boot_region[11*512 + i*4 .. 11*512 + i*4 + 4].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    drive.seek(SeekFrom::Start(0)).unwrap();
+    drive.write_all(&boot_region).unwrap(); // Main Boot Region
+    drive.write_all(&boot_region).unwrap(); // Backup Boot Region
+
+    // 4. Write FAT Table
+    let fat_byte_offset = fat_offset * bytes_per_sector;
+    drive.seek(SeekFrom::Start(fat_byte_offset)).unwrap();
+    let fat_zeros = vec![0u8; (fat_length * bytes_per_sector) as usize];
+    drive.write_all(&fat_zeros).unwrap(); // Zero the table
+    
+    drive.seek(SeekFrom::Start(fat_byte_offset)).unwrap();
+    drive.write_all(&0xFFFFFFF8u32.to_le_bytes()).unwrap(); // Media type
+    drive.write_all(&0xFFFFFFFFu32.to_le_bytes()).unwrap(); // Reserved 1
+    
+    // Link Bitmap Clusters
+    for i in 0..bitmap_clusters-1 { drive.write_all(&(bitmap_cluster + i + 1).to_le_bytes()).unwrap(); }
+    drive.write_all(&0xFFFFFFFFu32.to_le_bytes()).unwrap();
+    // Link Upcase Clusters
+    for i in 0..upcase_clusters-1 { drive.write_all(&(upcase_cluster + i + 1).to_le_bytes()).unwrap(); }
+    drive.write_all(&0xFFFFFFFFu32.to_le_bytes()).unwrap();
+    // Link Root Directory (1 cluster)
+    drive.write_all(&0xFFFFFFFFu32.to_le_bytes()).unwrap();
+
+    // 5. Write Allocation Bitmap
+    let mut bitmap = vec![0u8; bitmap_bytes as usize];
+    for c in 2..=root_cluster {
+        let idx = (c - 2) as usize;
+        bitmap[idx / 8] |= 1 << (idx % 8);
+    }
+    let heap_byte_offset = heap_offset * bytes_per_sector;
+    drive.seek(SeekFrom::Start(heap_byte_offset)).unwrap();
+    drive.write_all(&bitmap).unwrap();
+
+    // 6. Write Upcase Table
+    let upcase_byte_offset = heap_byte_offset + (upcase_cluster as u64 - 2) * bytes_per_cluster;
+    drive.seek(SeekFrom::Start(upcase_byte_offset)).unwrap();
+    drive.write_all(&upcase_data).unwrap();
+
+    // 7. Write Root Directory
+    let root_byte_offset = heap_byte_offset + (root_cluster as u64 - 2) * bytes_per_cluster;
+    drive.seek(SeekFrom::Start(root_byte_offset)).unwrap();
+    let mut root_data = vec![0u8; bytes_per_cluster as usize];
+    
+    // Vol Label Entry (0x83)
+    root_data[0] = 0x83;
+    let label_utf16: Vec<u16> = volume_label.encode_utf16().take(11).collect();
+    root_data[1] = label_utf16.len() as u8;
+    for (i, &c) in label_utf16.iter().enumerate() {
+        root_data[2 + i*2 .. 4 + i*2].copy_from_slice(&c.to_le_bytes());
+    }
+    
+    // Bitmap Entry (0x81)
+    root_data[32] = 0x81;
+    root_data[52..56].copy_from_slice(&bitmap_cluster.to_le_bytes());
+    root_data[56..64].copy_from_slice(&bitmap_bytes.to_le_bytes());
+    
+    // Upcase Entry (0x82)
+    root_data[64] = 0x82;
+    root_data[68..72].copy_from_slice(&upcase_checksum.to_le_bytes());
+    root_data[84..88].copy_from_slice(&upcase_cluster.to_le_bytes());
+    root_data[88..96].copy_from_slice(&(upcase_data.len() as u64).to_le_bytes());
+
+    drive.write_all(&root_data).unwrap();
+    drive.flush().unwrap();
+    
+    Ok(())
+}
