@@ -129,6 +129,12 @@ pub fn verify<R: ImageReader, U: UsbReader>(
         
         let new_path = if current_path.is_empty() { format!("/{}", clean_name) } else { format!("{}/{}", current_path, clean_name) };
 
+        if skip_bootloader && current_path.is_empty() && clean_name.eq_ignore_ascii_case("EFI")  {
+            *verified += entry.size;
+            let _ = tx.send(EventMsg::progress(*verified, total_size));
+            continue;
+        }
+
         if entry.is_dir {
             verify(iso_reader, usb_reader, &new_path, tx, verified, total_size, skip_bootloader)?;
         } else {

@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use crate::writer::UsbWriter;
 
-
 pub struct BareExFat<T: Read + Write + Seek> {
     pub inner: Mutex<T>,
     pub bytes_per_cluster: u64,
@@ -65,6 +64,7 @@ impl<T: Read + Write + Seek> BareExFat<T> {
         })
     }
 
+
     fn alloc_clusters(&self, bytes: u64) -> Result<u32, String> {
         if bytes == 0 { return Ok(0); }
         let clusters_needed = (bytes + self.bytes_per_cluster - 1) / self.bytes_per_cluster;
@@ -97,6 +97,7 @@ impl<T: Read + Write + Seek> BareExFat<T> {
         }
         Err("ExFAT Drive Full or Fragmented!".to_string())
     }
+
 
     fn append_entries(&self, dir_cluster: u32, entries: &[[u8; 32]]) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
@@ -192,14 +193,14 @@ impl<T: Read + Write + Seek> BareExFat<T> {
         Err("Invalid path".to_string())
     }
 
-    /// Walks the entire directory tree and returns a formatted list of all files and folders
+    // Walks the entire directory tree and returns a formatted list of all files and folders
     pub fn inspect_all(&self) -> Result<Vec<String>, String> {
         let mut found_files = Vec::new();
         self.walk_dir(self.root_cluster, "", &mut found_files)?;
         Ok(found_files)
     }
 
-    /// Recursive helper to walk directory clusters
+    // Recursive helper to walk directory clusters
     fn walk_dir(&self, cluster: u32, current_path: &str, found_files: &mut Vec<String>) -> Result<(), String> {
         let offset = self.heap_offset + (cluster as u64 - 2) * self.bytes_per_cluster;
         let mut dir_data = vec![0u8; self.bytes_per_cluster as usize];
@@ -263,6 +264,7 @@ impl<T: Read + Write + Seek> BareExFat<T> {
 // ── exFAT sprcification utilities
 
 fn split_path(path: &str) -> (&str, &str) {
+
     let path = path.trim_matches('/');
     match path.rfind('/') {
         Some(idx) => (&path[..idx], &path[idx + 1..]),
@@ -270,7 +272,9 @@ fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
+
 fn calc_name_hash(name: &str) -> u16 {
+
     let mut hash = 0u16;
     for c in name.encode_utf16() {
         let upper = if c >= 0x61 && c <= 0x7A { c - 0x20 } else { c };
@@ -280,7 +284,9 @@ fn calc_name_hash(name: &str) -> u16 {
     hash
 }
 
+
 fn calc_checksum(entries: &[[u8; 32]]) -> u16 {
+
     let mut sum = 0u16;
     for (i, entry) in entries.iter().enumerate() {
         for (j, &b) in entry.iter().enumerate() {
@@ -292,6 +298,7 @@ fn calc_checksum(entries: &[[u8; 32]]) -> u16 {
 }
 
 fn build_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> Vec<[u8; 32]> {
+    
     let utf16: Vec<u16> = name.encode_utf16().collect();
     let name_entries = (utf16.len() + 14) / 15;
     let secondary_count = 1 + name_entries;
@@ -309,7 +316,7 @@ fn build_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> Vec<[u8
     fde[16..20].copy_from_slice(&dos_time); 
     entries.push(fde);
     
-    // 2. Stream Extension Entry (0xC0)
+    // Stream Extension Entry (0xC0)
     let mut see = [0u8; 32];
     see[0] = 0xC0;
     see[1] = if size > 0 || cluster > 0 { 0x03 } else { 0x00 }; // 0x03 = AllocPossible | NoFatChain
@@ -320,7 +327,7 @@ fn build_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> Vec<[u8
     see[24..32].copy_from_slice(&size.to_le_bytes()); // DataLength (Fixing the bug!)
     entries.push(see);
     
-    // 3. File Name Entries (0xC1)
+    // File Name Entries (0xC1)
     for i in 0..name_entries {
         let mut ne = [0u8; 32];
         ne[0] = 0xC1;
@@ -389,8 +396,6 @@ impl<T: Read + Write + Seek> UsbWriter for BareExFat<T> {
 }
 
 
-
-
 pub struct BareFileWriter<'w, T: Read + Write + Seek> {
     fs: &'w BareExFat<T>,
     start_offset: u64,
@@ -423,7 +428,7 @@ pub fn format_exfat<T: Read + Write + Seek>(
     let bytes_per_sector: u64 = 512;
     let vol_sectors = volume_size / bytes_per_sector;
 
-    // 1. Calculate cluster geometry (32KB for standard drives, 128KB for >32GB)
+    // Calculate cluster geometry (32KB for standard drives, 128KB for >32GB)
     let mb = 1024 * 1024u64;
     let bytes_per_cluster = if volume_size < 256 * mb { 4096 }
         else if volume_size < 32 * 1024 * mb { 32768 }
@@ -446,7 +451,7 @@ pub fn format_exfat<T: Read + Write + Seek>(
 
     let serial = 0x12345678u32; // Standard dummy serial
 
-    // 2. The Minimal Compressed Upcase Table
+    // The Minimal Compressed Upcase Table
     let mut upcase_data = Vec::new();
     upcase_data.extend_from_slice(&0xFFFFu16.to_le_bytes()); upcase_data.extend_from_slice(&97u16.to_le_bytes());
     for i in 0x0041u16..=0x005A { upcase_data.extend_from_slice(&i.to_le_bytes()); }
@@ -469,7 +474,7 @@ pub fn format_exfat<T: Read + Write + Seek>(
     let upcase_cluster = bitmap_cluster + bitmap_clusters;
     let root_cluster = upcase_cluster + upcase_clusters;
 
-    // 3. Construct Boot Region
+    // Construct Boot Region
     let mut boot = vec![0u8; 512];
     boot[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
     boot[3..11].copy_from_slice(b"EXFAT   ");
@@ -510,7 +515,7 @@ pub fn format_exfat<T: Read + Write + Seek>(
     drive.write_all(&boot_region).unwrap(); // Main Boot Region
     drive.write_all(&boot_region).unwrap(); // Backup Boot Region
 
-    // 4. Write FAT Table
+    // Write FAT Table
     let fat_byte_offset = fat_offset * bytes_per_sector;
     drive.seek(SeekFrom::Start(fat_byte_offset)).unwrap();
     let fat_zeros = vec![0u8; (fat_length * bytes_per_sector) as usize];
@@ -539,12 +544,12 @@ pub fn format_exfat<T: Read + Write + Seek>(
     drive.seek(SeekFrom::Start(heap_byte_offset)).unwrap();
     drive.write_all(&bitmap).unwrap();
 
-    // 6. Write Upcase Table
+    // Write Upcase Table
     let upcase_byte_offset = heap_byte_offset + (upcase_cluster as u64 - 2) * bytes_per_cluster;
     drive.seek(SeekFrom::Start(upcase_byte_offset)).unwrap();
     drive.write_all(&upcase_data).unwrap();
 
-    // 7. Write Root Directory
+    // Write Root Directory
     let root_byte_offset = heap_byte_offset + (root_cluster as u64 - 2) * bytes_per_cluster;
     drive.seek(SeekFrom::Start(root_byte_offset)).unwrap();
     let mut root_data = vec![0u8; bytes_per_cluster as usize];

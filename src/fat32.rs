@@ -1,13 +1,13 @@
-use std::io::{Write, Seek, SeekFrom};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io::{Write, Seek, SeekFrom}, 
+    time::{SystemTime, UNIX_EPOCH}
+};
 
 
 pub fn format_fat32<T: Write + Seek>(
-    drive: &mut T,
-    volume_size: u64,
-    volume_label: &str,
-    start_lba: u32,
+    drive: &mut T, volume_size: u64, volume_label: &str, start_lba: u32,
 ) -> Result<(), String> {
+
     let bytes_per_sector = 512u64;
     let total_sectors = (volume_size / bytes_per_sector) as u32;
 
@@ -141,3 +141,5 @@ pub fn format_fat32<T: Write + Seek>(
     drive.flush().unwrap();
     Ok(())
 }
+
+

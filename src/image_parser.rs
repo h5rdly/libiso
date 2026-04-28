@@ -62,7 +62,9 @@ pub struct ImageStats {
     pub is_isohybrid: bool,
     #[pyo3(get)]
     pub has_large_file: bool,
-    
+    #[pyo3(get)]
+    pub is_unpatchable_linux: bool,
+
     #[pyo3(get)]
     pub boot_info: BootCapabilities,
     
@@ -109,6 +111,7 @@ impl ImageStats {
         dict.set_item("volume_label", &self.volume_label)?;
         dict.set_item("is_isohybrid", self.is_isohybrid)?;
         dict.set_item("has_large_file", self.has_large_file)?;
+        dict.set_item("is_unpatchable_linux", self.is_unpatchable_linux)?; 
         dict.set_item("boot_info", self.boot_info.as_dict(py)?)?;
         if let Some(win_info) = &self.windows_info {
             dict.set_item("windows_info", win_info.as_dict(py)?)?;
@@ -129,25 +132,28 @@ pub fn scan_directory_udf(
     is_windows: &mut bool,
     is_windows_11: &mut bool,
     install_image_type: &mut String,
+    is_unpatchable_linux: &mut bool, 
 ) {
     for entry in entries {
         let name = &entry.name;
         if name == "." || name == ".." { continue; }
-        let clean_name = name.split(';').next().unwrap_or(name);
-        
+        let file_name = name.split(';').next().unwrap_or(name).to_uppercase();
+
+        if file_name.ends_with(".MISO") || file_name.contains("POP-OS") || file_name.contains("POP_OS") {
+            *is_unpatchable_linux = true;
+        }
+
         if entry.is_directory {
             if let Ok(sub_entries) = udf::read_directory(file, partition_start, &entry.icb) {
                 scan_directory_udf(
-                    file, partition_start, &sub_entries, 
-                    has_large_file, supports_uefi, 
-                    is_windows, is_windows_11, install_image_type
+                    file, partition_start, &sub_entries, has_large_file, supports_uefi, 
+                    is_windows, is_windows_11, install_image_type, is_unpatchable_linux
                 );
             }
         } else {
             // Because our custom parser ignores size to speed up parsing,
             // we will let the install type dictate the large file flag
             
-            let file_name = clean_name.to_uppercase();
             if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
                 *supports_uefi = true;
             }
@@ -180,6 +186,7 @@ fn scan_directory(
     is_windows: &mut bool,
     is_windows_11: &mut bool,
     install_image_type: &mut String,
+    is_unpatchable_linux: &mut bool, 
 ) {
     let dir = iso.open_dir(dir_ref); 
     for entry_res in dir.entries() {
@@ -193,14 +200,17 @@ fn scan_directory(
         };
 
         if let Some(pos) = name.rfind(';') { name.truncate(pos); }
-
+        let file_name = name.to_uppercase();
+        if file_name.ends_with(".MISO") || file_name.contains("POP-OS") || file_name.contains("POP_OS") {
+            *is_unpatchable_linux = true;
+        }   
         if entry.is_directory() {
             if let Ok(sub_dir_ref) = entry.as_dir_ref(iso) {
-                scan_directory(iso, sub_dir_ref, has_large_file, supports_uefi, is_windows, is_windows_11, install_image_type);
+                scan_directory(iso, sub_dir_ref, has_large_file, supports_uefi, is_windows,
+                    is_windows_11, install_image_type, is_unpatchable_linux);
             }
         } else {
             if entry.total_size() >= 4_000_000_000 { *has_large_file = true; }
-            let file_name = name.to_uppercase();
             if file_name.ends_with(".EFI") && file_name.contains("BOOT") { *supports_uefi = true; }
             if file_name == "INSTALL.WIM" {
                 *is_windows = true;
@@ -235,6 +245,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
                     volume_label: "WIM/ESD Archive".to_string(), 
                     is_isohybrid: false,
                     has_large_file: true, 
+                    is_unpatchable_linux: false, 
                     boot_info: BootCapabilities {
                         is_bootable: false, supports_bios: false, supports_uefi: false,
                         secure_boot_signed: false, is_microsoft_signed: false, is_revoked: false, signature_size: 0,
@@ -273,6 +284,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     let mut is_windows = false;
     let mut is_windows_11 = false;
     let mut install_image_type = String::new();
+    let mut is_unpatchable_linux = false; 
 
     file.seek(SeekFrom::Start(0))?;
     let mut is_udf_valid = false;
@@ -284,9 +296,9 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
             if !udf_label.is_empty() { volume_label = udf_label.to_string(); }
             
             scan_directory_udf(
-                &mut file, udf_ctx.partition_start, &root_entries, 
-                &mut has_large_file, &mut supports_uefi, 
-                &mut is_windows, &mut is_windows_11, &mut install_image_type
+                &mut file, udf_ctx.partition_start, &root_entries, &mut has_large_file, 
+                &mut supports_uefi, &mut is_windows, &mut is_windows_11, &mut install_image_type,
+                &mut is_unpatchable_linux
             );
             
             if let Some(entry) = udf::find_udf_entry(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb, "EFI/BOOT/BOOTX64.EFI")
@@ -315,7 +327,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
             signature_size = sb_status.signature_size;
 
             let root = iso.root_dir();
-            scan_directory(&iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, &mut is_windows_11, &mut install_image_type);
+            scan_directory(&iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, &mut is_windows_11, &mut install_image_type, &mut is_unpatchable_linux);
         }
     }
 
@@ -332,5 +344,5 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
         })
     } else { None };
 
-    Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, boot_info, windows_info })
+    Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, is_unpatchable_linux, boot_info, windows_info })
 }

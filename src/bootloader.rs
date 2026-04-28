@@ -1,7 +1,5 @@
 use std::io::Write;
 
-use edera_sprout_parsing::{match_kernel_prefix, LINUX_KERNEL_PREFIXES, LINUX_INITRAMFS_PREFIXES}; 
-
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::PyResult;
 
@@ -11,13 +9,12 @@ use crate::writer::UsbWriter;
 const SPROUT_X86_64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_x86_64.efi");
 const SPROUT_AARCH64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_aarch64.efi");
 
+const LINUX_KERNEL_PREFIXES: &[&str] = &["vmlinuz", "bzimage", "image", "kernel"];
+const LINUX_INITRAMFS_PREFIXES: &[&str] = &["initramfs", "initrd", "microcode"];
 
-// Installs the Sprout UEFI bootloader using our generic UsbWriter!
-pub fn install_uefi_sprout<W: UsbWriter>(
-    writer: &W, target_arch: &str, // Expects "x86_64", "aarch64", or "all"
-) -> PyResult<()> {
+
+pub fn install_uefi_sprout<W: UsbWriter>(writer: &W, target_arch: &str,) -> PyResult<()> {
     
-    // We ignore errors here in case the directories already exist
     let _ = writer.create_dir("/EFI");
     let _ = writer.create_dir("/EFI/BOOT");
 
@@ -40,35 +37,31 @@ pub fn install_uefi_sprout<W: UsbWriter>(
     Ok(())
 }
 
+
 // Helper to scan an extracted filename to see if it's a Linux kernel or initramfs
 pub fn detect_linux_payloads(
-    filename: &str,
-    current_path: &str,
-    found_kernel: &mut Option<String>,
-    found_initrd: &mut Option<String>
+    filename: &str, current_path: &str, found_kernel: &mut Option<String>, found_initrd: &mut Option<String>
 ) {
+
     let lower_name = filename.to_lowercase();
     
-    // Blacklist utility payloads / aux kernels so they don't overwrite the real OS kernel
+    // Blacklist utility payloads
     if lower_name.contains("memtest") || lower_name.contains("rescue") {
         return;
     }
 
-    // If we haven't found a kernel yet, check if this file is one
     if found_kernel.is_none() {
-        if match_kernel_prefix(&lower_name, LINUX_KERNEL_PREFIXES).is_some() {
+        // Native Rust iterator checking if the filename starts with any of the prefixes
+        if LINUX_KERNEL_PREFIXES.iter().any(|&prefix| lower_name.starts_with(prefix)) {
             *found_kernel = Some(format!("{}/{}", current_path, filename));
             return;
         }
     }
 
-    // If we haven't found an initrd, check if this file matches common initramfs patterns
     if found_initrd.is_none() {
-        for prefix in LINUX_INITRAMFS_PREFIXES {
-            if lower_name.starts_with(prefix) {
-                *found_initrd = Some(format!("{}/{}", current_path, filename));
-                return;
-            }
+        if LINUX_INITRAMFS_PREFIXES.iter().any(|&prefix| lower_name.starts_with(prefix)) {
+            *found_initrd = Some(format!("{}/{}", current_path, filename));
+            return;
         }
     }
 }

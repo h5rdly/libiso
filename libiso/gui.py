@@ -40,7 +40,9 @@ state = {
     'is_burning': False,
     'abort_token': None,
     'drives': [],
-    'admin': is_admin()
+    'admin': is_admin(),
+    'is_mutant': False,
+    'is_windows': False,
 }
 
 
@@ -85,13 +87,6 @@ def drive_poller():
 
 ## -- Callbacks 
 
-def file_selected_cb(sender, app_data):
-
-    state['iso_path'] = app_data['file_path_name']
-    dpg.set_value('iso_text', state['iso_path'])
-    dpg.set_value('status_text', 'Ready')
-
-
 def cancel_cb():
 
     if state['is_burning'] and state['abort_token']:
@@ -103,6 +98,7 @@ def cleanup_ui():
 
     dpg.configure_item('btn_start', show=True)
     dpg.configure_item('btn_cancel', show=False)
+    dpg.configure_item('advanced_options_group', show=True)
     state['is_burning'] = False
     state['abort_token'] = None
 
@@ -115,112 +111,98 @@ def start_burn_cb():
     threading.Thread(target=burn_worker, daemon=True).start()
 
 
-def burn_worker():
+def file_selected_cb(sender, app_data):
 
-    dpg.configure_item('btn_start', show=False)
-    dpg.configure_item('btn_cancel', show=True)
-    dpg.set_value('progress_bar', 0.0)
-    dpg.set_value('log_console', '--- STARTING BURN PROCESS ---\n')
+    state['iso_path'] = app_data['file_path_name']
+    dpg.set_value('iso_text', state['iso_path'])
+
+    dpg.set_value('status_text', 'Inspecting ISO...')
+    on_iso_loaded(state['iso_path'])
+    dpg.set_value('status_text', 'Ready')
+
+
+def on_iso_loaded(file_path):
+
+    stats = libiso.inspect_image(file_path).as_dict()
     
-    # Extract the raw device path from the dropdown string (e.g., '/dev/sda')
-    selected_str = dpg.get_value('drive_combo')
-    if not selected_str:
-        dpg.set_value('status_text', 'Error: No drive selected.')
-        cleanup_ui()
-        return
+    is_mutant = stats.get('is_unpatchable_linux', False)
+    state['is_mutant'] = is_mutant
+
+    size_gb = round(stats.get('size_bytes', 0) / (1024**3), 2)
+
+    if win_info := stats.get('windows_info'):
+        state['is_windows'] = True
         
-    device_path = selected_str.split('(')[-1].strip(')')
-    
-    try:
-        # Inspect the ISO
-        dpg.set_value('status_text', 'Inspecting ISO...')
-        stats = libiso.inspect_image(state['iso_path'])
-        has_large_file = getattr(stats, 'has_large_file', False)
-        supports_uefi = getattr(getattr(stats, 'boot_info', None), 'supports_uefi', False)
-        partition_scheme = 'GPT' if supports_uefi else 'MBR'
+        # Windows: Hide UEFI and DD entirely!
+        dpg.configure_item('grp_uefi', show=False)
+        dpg.configure_item('grp_dd', show=True)
+        dpg.set_value('chk_dd', False)
         
-        # Get UEFI bridge if needed
-        uefi_path = libiso.ensure_uefi_bridge() if has_large_file else None
+        win_ver = 'Windows 11' if win_info.get('is_windows_11') else 'Windows 10'
+        arch = win_info.get('architecture', 'Unknown')
         
-        # Get ISO label
-        win_info = getattr(stats, 'windows_info', None)
+        dpg.set_value('iso_info_os_name', f'{win_ver}' + (f' ({arch})' if arch else ''))
+        dpg.set_value('iso_info_details', f"Size: {size_gb}GB   Image Type: {win_info.get('install_image_type', '').upper()} Archive")
         
-        if win_info and getattr(win_info, 'is_windows', False):
-            arch = getattr(win_info, 'architecture', 'X64').upper()
-            win_ver = "11" if getattr(win_info, 'is_windows_11', False) else "10"
+    else:
+        state['is_windows'] = False
+        
+        dpg.configure_item('grp_uefi', show=True)
+        dpg.configure_item('grp_dd', show=True)
+        label = stats.get('volume_label', 'Unknown')
+        
+        dpg.set_value('iso_info_os_name', f'Linux ({label})')
+        dpg.set_value('iso_info_details', f"Size: {size_gb}GB  Boot Format: {'Proprietary/Mutant' if is_mutant else 'Standard'}")
+        
+        if is_mutant:
+            dpg.set_value('txt_original_uefi', 'Use Sprout UEFI bootloader (For ISO mode)')
+            dpg.set_value('txt_tooltip_uefi', 'The original bootloader on this distro doesn\'t support ISO mode.\nSprout provides a custom, highly compatible boot environment.')
             
-            # create a FAT32 compliant label like "WIN11_X64"
-            short_label = f"WIN{win_ver}_{arch}"[:11]
-            dpg.set_value('log_console', dpg.get_value('log_console') + f'\n[*] Generated dynamic WIM label: {short_label}')
+            # Mutants: Default to Sprout (ISO mode)
+            dpg.set_value('chk_original_uefi', True)
+            dpg.set_value('chk_dd', False)
         else:
-            # Linux / other ISOs
-            iso_label = getattr(stats, 'volume_label', 'LIBISO')
-            short_label = iso_label[:11].replace(' ', '_').upper()
-            dpg.set_value('log_console', dpg.get_value('log_console') + f'\n[*] Using default ISO label: {short_label}')
-
-        # Create AbortToken
-        state['abort_token'] = libiso.AbortToken()
-        
-        # Call the Rust Backend
-        stream = libiso.write_image_iso(
-            image_path=state['iso_path'],
-            device_path=device_path,
-            has_large_file=has_large_file,
-            usb_label=short_label,
-            partition_scheme=partition_scheme,
-            uefi_ntfs_path=uefi_path,
-            persistence_size_mb=None,
-            verify_written=dpg.get_value('chk_verify'),
-            abort_token=state['abort_token']
-        )
-        
-        last_ui_update = 0
-
-        for event in stream:
-            if event.msg_type == 'PROGRESS':
-                
-                if (current_time := time.time()) - last_ui_update > 0.05 or event.written == event.total:
-                    progress = event.written / event.total if event.total > 0 else 0.0
-                    dpg.set_value('progress_bar', progress)
-                    last_ui_update = current_time
+            dpg.set_value('txt_original_uefi', 'Use original UEFI bootloader (For ISO mode)')
+            dpg.set_value('txt_tooltip_uefi', 'Some Linux distros (Manjaro, Pop!_OS) will not work\n on ISO mode with their original UEFI bootloader')
             
-            elif event.msg_type == 'PHASE':
-                dpg.set_value('status_text', f'Status: {event.text}')
-                log_current = dpg.get_value('log_console')
-                dpg.set_value('log_console', log_current + f'\n[*] {event.text}...')
-                # Auto-scroll log to bottom
-                dpg.set_y_scroll('log_window', dpg.get_y_scroll_max('log_window'))
-                
-            elif event.msg_type == 'LOG':
-                log_current = dpg.get_value('log_console')
-                dpg.set_value('log_console', log_current + f'\n    {event.text}')
-                
-            elif event.msg_type == 'DONE':
-                dpg.set_value('status_text', 'Success!')
-                dpg.set_value('progress_bar', 1.0)
-                
-                # Fetch and print the ASCII map
-                layout_map = libiso.generate_disk_layout_ascii(device_path)
-                log_current = dpg.get_value('log_console')
-                dpg.set_value('log_console', log_current + '\n\n' + layout_map)
-                break
-                
-            elif event.msg_type == 'ERROR':
-                dpg.set_value('status_text', 'FAILED')
-                log_current = dpg.get_value('log_console')
-                dpg.set_value('log_console', log_current + f'\n[!] ERROR: {event.text}')
-                dpg.configure_item('progress_bar', color=(200, 50, 50, 255)) # Turn bar red
-                break
-
-    except Exception as e:
-        dpg.set_value('status_text', 'Exception caught')
-        log_current = dpg.get_value('log_console')
-        dpg.set_value('log_console', log_current + f'\n[!] EXCEPTION: {str(e)}')
-        
-    cleanup_ui()
+            # Standard Linux: Default to Original (ISO mode)
+            dpg.set_value('chk_original_uefi', True)
+            dpg.set_value('chk_dd', False)
+            
+    dpg.configure_item('iso_info_group', show=True)
 
 
-# Dynamic Zooming 
+def dd_toggled_cb(sender, app_data, user_data):
+
+    is_checked = app_data
+    
+    if state['is_mutant']:
+        # Mutant: Act as a radio button
+        if is_checked:
+            dpg.set_value('chk_original_uefi', False)
+        else:
+            dpg.set_value('chk_original_uefi', True)
+    else:
+        # Non-Mutant: collapse the UEFI box 
+        if is_checked:
+            dpg.configure_item('grp_uefi', show=False)
+        else:
+            if not state['is_windows']:
+                dpg.configure_item('grp_uefi', show=True)
+
+
+def uefi_toggled_cb(sender, app_data, user_data):
+
+    # Enforce radio button behavior for mutants
+    is_checked = app_data
+    if state['is_mutant']:
+        if is_checked:
+            dpg.set_value('chk_dd', False)
+        else:
+            dpg.set_value('chk_dd', True)
+
+
+# - Dynamic Zoom setup and callback
 
 scale_factor = get_dpi_scale()
 font_size = 20 * scale_factor
@@ -248,6 +230,124 @@ def zoom_font_cb(sender, app_data):
 
                 current_title_size = int(new_size * 1.6)
                 dpg.configure_item(title_font, size=current_title_size)
+
+
+# -- Burnie
+
+def burn_worker():
+
+    dpg.configure_item('btn_start', show=False)
+    dpg.configure_item('btn_cancel', show=True)
+    dpg.configure_item('advanced_options_group', show=False)
+    dpg.set_value('progress_bar', 0.0)
+    dpg.set_value('log_console', '--- STARTING BURN PROCESS ---\n')
+    
+    # Extract the raw device path from the dropdown string (e.g., '/dev/sda')
+    selected_str = dpg.get_value('drive_combo')
+    if not selected_str:
+        dpg.set_value('status_text', 'Error: No drive selected.')
+        cleanup_ui()
+        return
+        
+    device_path = selected_str.split('(')[-1].strip(')')
+    
+    try:
+        dpg.set_value('status_text', 'Inspecting ISO...')
+        stats = libiso.inspect_image(state['iso_path'])
+        
+        is_dd_mode = dpg.get_value('chk_dd')
+        verify = dpg.get_value('chk_verify')
+
+        # If it's a mutant and we are in ISO Mode, then 'Use Sprout UEFI' was checked
+        use_sprout_bootloader = state['is_mutant'] or not dpg.get_value('chk_original_uefi')
+
+        # Create AbortToken
+        state['abort_token'] = libiso.AbortToken()
+
+        if is_dd_mode:
+            dpg.set_value('log_console', dpg.get_value('log_console') + '\n[*] Initiating Raw DD Sector Copy...')
+            
+            # Call the Rust DD Backend
+            stream = libiso.write_image_dd(
+                image_path=state['iso_path'],
+                device_path=device_path,
+                verify_written=verify
+            )
+            
+        else:
+            has_large_file = getattr(stats, 'has_large_file', False)
+            supports_uefi = getattr(getattr(stats, 'boot_info', None), 'supports_uefi', False)
+            partition_scheme = 'GPT' if supports_uefi else 'MBR'
+            uefi_path = libiso.ensure_uefi_bridge() if has_large_file else None
+            win_info = getattr(stats, 'windows_info', None)
+            
+            if win_info and getattr(win_info, 'is_windows', False):
+                arch = getattr(win_info, 'architecture', 'X64').upper()
+                win_ver = '11' if getattr(win_info, 'is_windows_11', False) else '10'
+                short_label = f'WIN{win_ver}_{arch}'[:11]
+                dpg.set_value('log_console', dpg.get_value('log_console') + f'\n[*] Generated dynamic WIM label: {short_label}')
+            else:
+                iso_label = getattr(stats, 'volume_label', 'LIBISO')
+                short_label = iso_label[:11].replace(' ', '_').upper()
+                dpg.set_value('log_console', dpg.get_value('log_console') + f'\n[*] Using default ISO label: {short_label}')
+
+            # Call the Rust ISO Backend
+            stream = libiso.write_image_iso(
+                image_path=state['iso_path'],
+                device_path=device_path,
+                has_large_file=has_large_file,
+                usb_label=short_label,
+                partition_scheme=partition_scheme,
+                uefi_ntfs_path=uefi_path,
+                persistence_size_mb=None,
+                verify_written=verify,
+                abort_token=state['abort_token'],
+                use_sprout_bootloader=use_sprout_bootloader
+            )
+            
+        # Event loop is the same for ISO and DD mode
+        last_ui_update = 0
+        for event in stream:
+            if event.msg_type == 'PROGRESS':
+                if (current_time := time.time()) - last_ui_update > 0.05 or event.written == event.total:
+                    progress = event.written / event.total if event.total > 0 else 0.0
+                    dpg.set_value('progress_bar', progress)
+                    last_ui_update = current_time
+                    
+            elif event.msg_type == 'PHASE':
+                dpg.set_value('status_text', f'Status: {event.text}')
+                log_current = dpg.get_value('log_console')
+                dpg.set_value('log_console', log_current + f'\n[*] {event.text}...')
+                dpg.set_y_scroll('log_window', dpg.get_y_scroll_max('log_window'))
+                
+            elif event.msg_type == 'LOG':
+                log_current = dpg.get_value('log_console')
+                dpg.set_value('log_console', log_current + f'\n    {event.text}')
+                
+            elif event.msg_type == 'DONE':
+                dpg.set_value('status_text', 'Success!')
+                dpg.set_value('progress_bar', 1.0)
+                
+                # Only print the layout map if we used ISO mode (DD mode destroys GPT tables)
+                if not is_dd_mode:
+                    layout_map = libiso.generate_disk_layout_ascii(device_path)
+                    log_current = dpg.get_value('log_console')
+                    dpg.set_value('log_console', log_current + '\n\n' + layout_map)
+                break
+                
+            elif event.msg_type == 'ERROR':
+                dpg.set_value('status_text', 'FAILED')
+                log_current = dpg.get_value('log_console')
+                dpg.set_value('log_console', log_current + f'\n[!] ERROR: {event.text}')
+                break
+
+    except Exception as e:
+        dpg.set_value('status_text', 'Exception caught')
+        log_current = dpg.get_value('log_console')
+        dpg.set_value('log_console', log_current + f'\n[!] EXCEPTION: {str(e)}')
+        
+    cleanup_ui()
+
 
 
 ## -- DPG Layout 
@@ -279,11 +379,8 @@ with dpg.font_registry():
     else:
         print('Warning: Could not find a TTF system font. Falling back to default.')
 
-# -  Themes 
 
-# listen for a Left-Click to open the hidden file dialog
-with dpg.item_handler_registry(tag='iso_click_handler'):
-    dpg.add_item_clicked_handler(button=dpg.mvMouseButton_Left, callback=lambda: dpg.show_item('file_dialog'))
+# -  Themes 
 
 # Blue theme for buttons and headers
 with dpg.theme(tag='blue_ui_theme'):
@@ -314,7 +411,7 @@ with dpg.theme() as global_theme:
 dpg.bind_theme(global_theme)
 
 
-#   -  Build the UI 
+# --  Build the UI 
 with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True, no_title_bar=True):
     
     # dpg.add_separator()
@@ -329,36 +426,60 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
     dpg.add_combo(tag='drive_combo', items=[], width=-1)
     
     # ISO Selection
-
     dpg.add_spacer(height=50)
     dpg.add_text('ISO Selection')
     
+    with dpg.item_handler_registry(tag='iso_click_handler'): # listen for a Left-Click to open the hidden file dialog
+        dpg.add_item_clicked_handler(button=dpg.mvMouseButton_Left, callback=lambda: dpg.show_item('file_dialog'))
     dpg.add_input_text(tag='iso_text', readonly=True, default_value='Click to select ISO...', width=-1)
+    
     dpg.bind_item_handler_registry('iso_text', 'iso_click_handler')
     with dpg.tooltip('iso_text'):
-        dpg.add_text('Click to browse your computer for an ISO file')
+        dpg.add_text('Click to load an ISO')
 
-    dpg.add_spacer(height=50)
-    dpg.add_separator()
+    dpg.add_spacer(height=30)
                 
-    
+    # ISO Info Panel (Hidden until an ISO is loaded)
+    with dpg.group(tag='iso_info_group', show=False):
+        dpg.add_spacer(height=10)
+        with dpg.group(horizontal=True):
+            dpg.add_text('Detected OS:', color=(52, 152, 219, 255))
+            dpg.add_text('...', tag='iso_info_os_name')
+        with dpg.group(horizontal=True):
+            dpg.add_text('Properties: ', color=(52, 152, 219, 255))
+            dpg.add_text('...', tag='iso_info_details')
+        dpg.add_spacer(height=30)
+
     # Advanced Options
-    dpg.add_text('Advanced Options')
-    with dpg.group(horizontal=True):
-        dpg.add_checkbox(tag='chk_verify', default_value=True)
-        dpg.add_text('Verify written data (Bit-for-bit check)', tag='txt_verify')
+    with dpg.group(tag='advanced_options_group'):
 
-    with dpg.group(horizontal=True):
-        dpg.add_checkbox(tag='chk_dd')
-        dpg.add_text('Force DD (Raw Image) Mode', tag='txt_dd')
+        dpg.add_spacer(height=5)
+        dpg.add_separator()
+        dpg.add_spacer(height=10)
 
-    with dpg.tooltip('txt_verify'):
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(tag='chk_verify', default_value=True)
+            dpg.add_text('Verify written data', tag='txt_verify')
+        with dpg.tooltip('txt_verify'):
+            dpg.add_text('Reads the USB after burning to ensure bit-for-bit\naccuracy')
 
-        dpg.add_text('Reads the USB after burning to ensure bit-for-bit\naccuracy')
-    with dpg.tooltip('txt_dd'):
-        dpg.add_text('''ISO mode is the default, since it doesn't take up\nthe entire drive space''')
+        dpg.add_spacer(height=10)
 
-    dpg.add_spacer(height=50)
+        with dpg.group(horizontal=True, tag='grp_dd'):
+            dpg.add_checkbox(tag='chk_dd', callback=dd_toggled_cb)
+            dpg.add_text('Force DD (Raw Image) mode', tag='txt_dd')
+        with dpg.tooltip('txt_dd'):
+            dpg.add_text('''ISO mode is the default, since it doesn't take up\nthe entire drive space''')
+        
+        with dpg.group(tag='grp_uefi'):
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(tag='chk_original_uefi', callback=uefi_toggled_cb)
+                dpg.add_text('Use original UEFI bootloader (For ISO mode)', tag='txt_original_uefi')
+            with dpg.tooltip('txt_original_uefi'):
+                dpg.add_text('Some Linux distros (Manjaro, Pop!_OS) will not work\n on ISO mode with their original UEFI bootloader', tag='txt_tooltip_uefi')
+            dpg.add_spacer(height=5)
+
+        dpg.add_spacer(height=50)
     
     # Status & Progress
     dpg.add_text('Ready', tag='status_text')
@@ -441,6 +562,8 @@ if len(sys.argv) > 1:
     if os.path.exists(cli_iso_path):
         state['iso_path'] = cli_iso_path
         dpg.set_value('iso_text', cli_iso_path)
+        dpg.set_value('status_text', 'Inspecting ISO...')
+        on_iso_loaded(cli_iso_path)
         dpg.set_value('status_text', 'Ready')
     else:
         print(f'Warning: CLI ISO path does not exist: {cli_iso_path}')

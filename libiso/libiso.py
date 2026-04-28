@@ -140,32 +140,6 @@ pub const TRUSTED_MS_CA_THUMBPRINTS: &[&str] = &[
     print(f'Extracted {len(sorted_hashes)} flat hashes to {output_path}')
 
 
-def extract_iso_label(iso_path: str) -> str:
-    ''' 
-    Extracts the Volume Identifier directly from an ISO 9660 image's 
-    Primary Volume Descriptor (PVD).
-    '''
-
-    try:
-        with open(iso_path, 'rb') as f:
-            # ISO 9660 Volume Descriptors start at Sector 16 (16 * 2048 bytes)
-            f.seek(16 * 2048)
-            pvd = f.read(2048)
-            
-            # Check if it's a valid PVD: Type must be 1, ID must be 'CD001'
-            if pvd[0] == 1 and pvd[1:6] == b'CD001':
-                # The Volume Identifier is 32 bytes long, starting at offset 40
-                raw_label = pvd[40:72]
-                
-                # Decode and strip trailing spaces and null bytes
-                label = raw_label.decode('utf-8', errors='ignore').rstrip('\x00 ')
-                if label:
-                    return label
-    except Exception as e:
-        print(f'Warning: Failed to extract ISO label: {e}')
-        
-    return 'LIBISO_USB' # Fallback
-
 
 def generate_disk_layout_ascii(device_path: str) -> str:
     ''' Generates a human-readable ASCII map of a GPT-formatted drive '''
@@ -357,7 +331,8 @@ def write_image_iso(
     verify_written: bool = False,
     unattend_xml_payload: str = None,
     target_arch: str = None,
-    abort_token = None  
+    abort_token = None,
+    use_sprout_bootloader: bool = False  
 ):
     ''' To avoid using the tempfile crate, which pulls windows-sys, we use a Python wrapper 
         and utilize it's built in tempfile
@@ -373,7 +348,7 @@ def write_image_iso(
         return _libiso.write_image_iso(
             image_path, device_path, has_large_file, usb_label, partition_scheme, 
             uefi_ntfs_path, persistence_size_mb, ext4_temp_path, verify_written, 
-            unattend_xml_payload, target_arch, abort_token
+            unattend_xml_payload, target_arch, abort_token, use_sprout_bootloader
         )
     finally:
         if ext4_temp_path and os.path.exists(ext4_temp_path):
@@ -384,6 +359,7 @@ def burn_image(
     image_path: str, 
     device_path: str, 
     method: str = 'ISO',
+    iso_label: str = '',
     partition_scheme: str = None,     
     persistence_size_mb: int = None,
     verify_written: bool = False   
@@ -395,10 +371,6 @@ def burn_image(
 
     if (method := method.upper()) not in ('ISO', 'DD'):
         raise ValueError(f'Unknown method: {method}. Use iso or dd')
-
-    iso_label = extract_iso_label(image_path)
-    short_usb_label = iso_label[:11].replace(' ', '_').upper()
-    print(f'''Detected ISO Label: '{iso_label}' -> Formatting USB as: '{short_usb_label}' ''')
 
     if method == 'DD':
         print(f'Starting raw DD write from {image_path} to {device_path}...')

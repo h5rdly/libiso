@@ -14,6 +14,8 @@ use sha2::{Sha256, Digest};
 
 use pyo3::prelude::*;
 
+use crate::verify;
+
 
 #[pyfunction]
 #[pyo3(signature = (volume_name, files, is_isohybrid, dummy_file_size_mb=1))]
@@ -217,7 +219,7 @@ pub fn test_verify_fake_drive_sync(mut drive: PyRefMut<'_, FakeDrive>) -> PyResu
     let fake_cap = drive.fake_capacity;
     
     // Dereference `drive` to access the Rust struct inside the Python wrapper
-    crate::verify::verify_hardware_capacity(&mut *drive, fake_cap, &tx, |_| Ok(()))
+    verify::verify_hardware_capacity(&mut *drive, fake_cap, &tx, |_| Ok(()))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
