@@ -254,7 +254,7 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
     use std::ffi::CString;
 
     // Manual FFI bindings to avoid needing the `libc` crate dependency
-    extern "C" {
+    unsafe extern "C" {
         fn sysctlbyname(
             name: *const std::ffi::c_char,
             oldp: *mut std::ffi::c_void,
