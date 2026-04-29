@@ -302,9 +302,12 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
     let extract_tag = |block: &str, tag: &str| -> String {
         let open_tag = format!("<{}>", tag);
         let close_tag = format!("</{}>", tag);
+        
         if let Some(start) = block.find(&open_tag) {
-            if let Some(end) = block[start..].find(&close_tag) {
-                return block[start + open_tag.len()..end].trim().to_string();
+            let content_start = start + open_tag.len();
+            if let Some(end_offset) = block[content_start..].find(&close_tag) {
+                // Add the relative end_offset to our absolute content_start
+                return block[content_start .. content_start + end_offset].trim().to_string();
             }
         }
         String::new()
