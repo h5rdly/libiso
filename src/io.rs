@@ -313,6 +313,13 @@ mod linux_sys {
 // Attempt Unbuffered I/O, fall back to standard buffered I/O if the filesystem rejects it
 pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> {
     let path = Path::new(path_str);
+
+    #[cfg(target_os = "linux")]
+    // Unmount device on linux
+    if write_access {
+        force_unmount(path_str);
+    }
+
     let mut opts = OpenOptions::new();
     
     opts.read(true);
@@ -355,11 +362,10 @@ pub fn open_device(path_str: &str, write_access: bool) -> std::io::Result<File> 
         }
     }
 
-    // --- Mac OS / Fallback ---
+    // -- MacOS / Fallback 
     // (Mac uses F_NOCACHE via fcntl instead of open flags, so we just use standard I/O for now)
     opts.open(path)
 }
-
 
 // helper for trigger_os_reread
 #[cfg(target_os = "linux")]
@@ -449,3 +455,55 @@ pub fn trigger_os_reread(_file: &std::fs::File, _dev_path: &str) -> std::io::Res
     Ok(())
 }
 
+
+#[cfg(target_os = "linux")]
+pub fn force_unmount(path_str: &str) {
+
+    use std::ffi::CString;
+    unsafe extern "C" {
+        fn umount2(target: *const std::ffi::c_char, flags: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    const MNT_DETACH: std::ffi::c_int = 2;
+
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let mut targets = Vec::new();
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let dev = parts[0];
+                let mnt = parts[1];
+                
+                // Match the base device (/dev/sda) AND its partitions (/dev/sda1)
+                let is_match = if dev == path_str {
+                    true
+                } else if let Some(stripped) = dev.strip_prefix(path_str) {
+                    let first_char = stripped.chars().next().unwrap_or('\0');
+                    first_char.is_ascii_digit() || first_char == 'p'
+                } else {
+                    false
+                };
+
+                if is_match {
+                    targets.push(mnt.replace("\\040", " "));
+                }
+            }
+        }
+
+        for target in targets {
+            if let Ok(c_path) = CString::new(target) {
+                unsafe {
+                    // Try standard unmount, fallback to lazy detach (MNT_DETACH)
+                    if umount2(c_path.as_ptr(), 0) != 0 {
+                        umount2(c_path.as_ptr(), MNT_DETACH);
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+#[cfg(not(target_os = "linux"))]
+pub fn force_unmount(_path_str: &str) {
+    // Windows/Mac handles exclusive locking natively via the OS APIs
+}

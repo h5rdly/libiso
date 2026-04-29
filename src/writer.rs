@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write, Seek, SeekFrom, Error, ErrorKind, copy},
+    io::{Read, Write, Seek, SeekFrom, Error, ErrorKind, copy,},
     path::Path,
     thread,
     sync::{Arc, mpsc, Mutex, atomic::{AtomicBool, Ordering}},
@@ -9,12 +9,16 @@ use std::{
 
 use hadris_iso::{sync::IsoImage, directory::DirectoryRef, read::DirEntry};
 
-use pyo3::{prelude::*, types::PyDict, exceptions::PyRuntimeError,};
+use pyo3::{
+    prelude::*, types::PyDict, 
+    exceptions::{PyRuntimeError, PyPermissionError, PyIOError, PyFileNotFoundError, PyValueError}
+};
 
-use crate::io::{AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread};
+use crate::io::{
+    AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread, force_unmount,
+};
 use crate::{fat32, verify, bootloader, udf, exfat, gpt, esd, ext4};
 use crate::events::{EventMsg, ProgressStream, AbortToken};
-
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
@@ -116,15 +120,15 @@ pub fn format_partition<T: Read + Write + Seek>(
 pub fn format_usb_drive(
     device_path: String, fs_type: Option<String>, volume_label: &str, partition_scheme: Option<String>
 ) -> PyResult<()> {
-    let _locker = DriveLocker::new(&device_path).map_err(|e| pyo3::exceptions::PyPermissionError::new_err(e))?;
+    let _locker = DriveLocker::new(&device_path).map_err(|e| PyPermissionError::new_err(e))?;
     let mut dest_file = OpenOptions::new().read(true).write(true).open(&device_path)?;
     let dest_size = dest_file.seek(SeekFrom::End(0))?;
-    if dest_size == 0 { return Err(pyo3::exceptions::PyIOError::new_err("Device has 0 bytes.")); }
+    if dest_size == 0 { return Err(PyIOError::new_err("Device has 0 bytes.")); }
 
     let total_sectors = dest_size / 512;
     let scheme = partition_scheme.unwrap_or_else(|| "gpt".to_string());
     if total_sectors > 0xFFFF_FFFF && scheme.eq_ignore_ascii_case("mbr") {
-        return Err(pyo3::exceptions::PyValueError::new_err("Drive is too large (> 2TB) for standard MBR formatting."));
+        return Err(PyValueError::new_err("Drive is too large (> 2TB) for standard MBR formatting."));
     }
 
     let is_exfat = match fs_type.as_deref() {
@@ -150,7 +154,7 @@ pub fn format_usb_drive(
         !scheme.eq_ignore_ascii_case("mbr"),
         (geom_start_lba, geom_safe_end_lba - geom_start_lba + 1),
         None, None, is_exfat
-    ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    ).map_err(|e| PyIOError::new_err(e))?;
     dest_file.sync_all()?;
 
     let partition_offset = geom_start_lba * 512;
@@ -162,6 +166,32 @@ pub fn format_usb_drive(
 }
 
 
+// -- EFI injection aux
+
+pub fn inject_hidden_efi<W: UsbWriter>(efi_img_bytes: Vec<u8>, target_usb_fs: &W) -> Result<(), String> {
+    println!("[*] Hidden EFI image detected. Parsing raw FAT filesystem...");
+
+    let files = fat32::read_fat_image(&efi_img_bytes)?;
+
+    for (path, data) in files {
+        if path.to_uppercase().starts_with("/EFI") || path.to_uppercase().starts_with("\\EFI") {
+            println!("    Injecting: {}", path);
+            let (dir_path, _) = fat32::split_path(&path);
+            if !dir_path.is_empty() {
+                target_usb_fs.create_dir_all(dir_path)?;
+            }
+            if let Ok(mut writer) = target_usb_fs.open_file_writer(&path, data.len() as u64) {
+                writer.write_all(&data).map_err(|e| e.to_string())?;
+                writer.flush().map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    println!("[+] Hidden EFI extracted to metal successfully.");
+    Ok(())
+}
+
+
 // -- Writing
 
 #[pyfunction]
@@ -169,16 +199,18 @@ pub fn format_usb_drive(
 pub fn write_image_dd(
     image_path: String, device_path: String, verify_written: bool, abort_token: Option<PyRef<'_, AbortToken>>,
 ) -> PyResult<ProgressStream> {
+
+    let _locker = DriveLocker::new(&device_path).map_err(|e| PyPermissionError::new_err(e))?;
     let iso_path = Path::new(&image_path);
-    if !iso_path.exists() { return Err(pyo3::exceptions::PyFileNotFoundError::new_err("Image not found")); }
+    if !iso_path.exists() { return Err(PyFileNotFoundError::new_err("Image not found")); }
     let total_size = iso_path.metadata()?.len();
 
     let mut dest_file = OpenOptions::new().write(true).open(&device_path)
-        .map_err(|e| pyo3::exceptions::PyPermissionError::new_err(format!("Open device err: {}", e)))?;
+        .map_err(|e| PyPermissionError::new_err(format!("Open device err: {}", e)))?;
     let dest_size = dest_file.seek(SeekFrom::End(0))?;
     dest_file.seek(SeekFrom::Start(0))?; 
     if total_size > dest_size {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!("Target device ({} bytes) is too small for this image ({} bytes).", dest_size, total_size)));
+        return Err(PyValueError::new_err(format!("Target device ({} bytes) is too small for this image ({} bytes).", dest_size, total_size)));
     }
     drop(dest_file);
 
@@ -186,6 +218,7 @@ pub fn write_image_dd(
     let abort_flag = abort_token.map(|t| t.flag.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     thread::spawn(move || {
+        let _keep_locker = _locker; // moving locker into thread
         let mut f_iso = match File::open(&image_path) {
             Ok(f) => f, Err(e) => { let _ = tx.send(EventMsg::error(&format!("Open ISO err: {}", e))); return; }
         };
@@ -244,7 +277,9 @@ pub fn write_image_dd(
             let _ = tx.send(EventMsg::done("Verification Complete!"));
         } 
         drop(f_dev); 
+
         if let Ok(f_reread) = OpenOptions::new().read(true).write(true).open(&device_path) {
+            force_unmount(&device_path);
             if let Err(e) = trigger_os_reread(&f_reread, &image_path.clone()) {
                 let _ = tx.send(EventMsg::log(&format!("OS cache flush warning (Kernel EBUSY): {}", e)));
             } else {
@@ -280,25 +315,25 @@ pub fn write_image_iso(
     let scheme = partition_scheme.unwrap_or_else(|| "mbr".to_string());
 
     let iso_path = Path::new(&image_path);
-    if !iso_path.exists() { return Err(pyo3::exceptions::PyFileNotFoundError::new_err("ISO not found")); }
+    if !iso_path.exists() { return Err(PyFileNotFoundError::new_err("ISO not found")); }
 
     let total_size = iso_path.metadata()?.len();
-    let _locker = DriveLocker::new(&device_path).map_err(|e| pyo3::exceptions::PyPermissionError::new_err(e))?;
+    let _locker = DriveLocker::new(&device_path).map_err(|e| PyPermissionError::new_err(e))?;
     let mut dest_file = OpenOptions::new().read(true).write(true).open(&device_path)
-        .map_err(|e| pyo3::exceptions::PyPermissionError::new_err(format!("Failed to open device '{}'. Error: {}", device_path, e)))?;
+        .map_err(|e| PyPermissionError::new_err(format!("Failed to open device '{}'. Error: {}", device_path, e)))?;
 
     let dest_size = dest_file.seek(SeekFrom::End(0))?;
     dest_file.seek(SeekFrom::Start(0))?; 
 
-    if dest_size == 0 { return Err(pyo3::exceptions::PyIOError::new_err("Destination device has 0 bytes.")); }
+    if dest_size == 0 { return Err(PyIOError::new_err("Destination device has 0 bytes.")); }
 
     if total_size > dest_size {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!("Target device ({} bytes) is too small for this image ({} bytes).", dest_size, total_size)));
+        return Err(PyValueError::new_err(format!("Target device ({} bytes) is too small for this image ({} bytes).", dest_size, total_size)));
     }
 
     let total_sectors = dest_size / 512;
     if total_sectors > 0xFFFF_FFFF && scheme.eq_ignore_ascii_case("mbr") {
-        return Err(pyo3::exceptions::PyValueError::new_err("MBR partition scheme does not support drives larger than 2TB."));
+        return Err(PyValueError::new_err("MBR partition scheme does not support drives larger than 2TB."));
     }
 
     let start_lba = 2048; 
@@ -339,7 +374,7 @@ pub fn write_image_iso(
         efi_part,
         persistence_part,
         has_large_file
-    ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    ).map_err(|e| PyIOError::new_err(e))?;
 
     dest_file.sync_all()?;
 
@@ -355,7 +390,7 @@ pub fn write_image_iso(
         let ext4_offset = start * 512;
         let ext4_size = sectors * 512;
         
-        let temp_path_str = ext4_temp_path.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ext4_temp_path must be provided if persistence_size_mb is set"))?;
+        let temp_path_str = ext4_temp_path.ok_or_else(|| PyValueError::new_err("ext4_temp_path must be provided if persistence_size_mb is set"))?;
         let temp_ext4 = Path::new(&temp_path_str);
         
         let mut temp_file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(temp_ext4)?;
@@ -391,7 +426,7 @@ pub fn write_image_iso(
     let new_label_owned = short_usb_label.to_string();
 
     if has_large_file {
-        let uefi_path = uefi_ntfs_path.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("uefi_ntfs_path must be provided for large files (exFAT mode)"))?;
+        let uefi_path = uefi_ntfs_path.ok_or_else(|| PyValueError::new_err("uefi_ntfs_path must be provided for large files (exFAT mode)"))?;
         let mut uefi_file = File::open(&uefi_path)?;
         if let Some((start, _)) = efi_part {
             dest_file_for_uefi.seek(SeekFrom::Start(start * 512))?;
@@ -401,6 +436,7 @@ pub fn write_image_iso(
     }
 
     thread::spawn(move || {
+        let _keep_locker = _locker; 
         let mut wp = wrapped_partition;
         wp.seek(SeekFrom::Start(0)).unwrap();
 
@@ -455,6 +491,23 @@ pub trait UsbWriter {
     type FileWriter<'w>: Write + 'w where Self: 'w;
     fn create_dir(&self, path: &str) -> Result<(), String>;
     fn open_file_writer<'w>(&'w self, path: &str, size: u64) -> Result<Self::FileWriter<'w>, String>;
+
+    fn create_dir_all(&self, path: &str) -> Result<(), String> {
+        let path = path.trim_matches('/');
+        if path.is_empty() { return Ok(()); }
+        
+        let mut current = String::new();
+        for part in path.split('/') {
+            if current.is_empty() {
+                current = part.to_string();
+            } else {
+                current = format!("{}/{}", current, part);
+            }
+            // Ignore - the directory might already exist
+            let _ = self.create_dir(&current); 
+        }
+        Ok(())
+    }
 }
 
 
@@ -701,6 +754,7 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
 
      // Flush the OS cache
     if let Ok(mut f_reread) = OpenOptions::new().read(true).write(true).open(device_path) {
+        force_unmount(device_path);
         f_reread.seek(SeekFrom::Start(0)).unwrap();
         f_reread.write_all(&lba0_bytes).unwrap();
         f_reread.sync_all().unwrap();
@@ -795,7 +849,9 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             
             // Look for configuration files that might contain the hardcoded 32-character ISO label
             let is_config = clean_name.to_lowercase().ends_with(".cfg") || clean_name.to_lowercase().ends_with(".conf");
-            
+            let is_hidden_efi = ["efi.img", "efiboot.img", "macefi.img"].iter()
+                .any(|&name| clean_name.eq_ignore_ascii_case(name));
+
             if is_config {
                 // Buffer the config file entirely in RAM before writing so we can patch the string safely!
                 let mut config_data = Vec::new();
@@ -805,8 +861,8 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
                 })?;
                 
                 let final_data = if let Ok(cfg_str) = std::str::from_utf8(&config_data) {
-                    bootloader::scrape_boot_args(cfg_str, found_args);
-                    let patched = cfg_str.replace(original_iso_label, new_usb_label);
+                    let patched = bootloader::patch_boot_labels(cfg_str, new_usb_label);
+                    bootloader::scrape_boot_args(&patched, found_args, new_usb_label);
                     if patched != cfg_str {
                         let _ = tx.send(EventMsg::log(&format!("Patched boot label inside: {}", new_path)));
                     }
@@ -823,7 +879,30 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
                 // Add the *original* entry size to the progress bar to maintain UI math
                 *bytes_written += entry.size;
                 let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
-
+            } else if is_hidden_efi {
+                // Buffer the image into RAM while also streaming it to the USB
+                let mut img_data = Vec::new();
+                let mut out_file = writer.open_file_writer(&new_path, entry.size)?;
+                
+                reader.stream_file(stream_path, &mut |chunk| {
+                    img_data.extend_from_slice(chunk);
+                    out_file.write_all(chunk).map_err(|e| e.to_string())?;
+                    
+                    *bytes_written += chunk.len() as u64;
+                    let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
+                    Ok(())
+                })?;
+                out_file.flush().map_err(|e| e.to_string())?;
+                
+                // If we aren't using Sprout, inject the hidden EFI directly to the metal
+                if !use_sprout_bootloader {
+                    let _ = tx.send(EventMsg::log(&format!("Intercepted hidden EFI image: {}", clean_name)));
+                    if let Err(e) = inject_hidden_efi(img_data, writer) {
+                        let _ = tx.send(EventMsg::log(&format!("[-] Failed to inject hidden EFI: {}", e)));
+                    } else {
+                        let _ = tx.send(EventMsg::log("[+] Hidden EFI extracted to metal successfully."));
+                    }
+                }
             } else {
                 // Not a config file: stream directly from disk to disk (Ultra Fast!)
                 let mut out_file = writer.open_file_writer(&new_path, entry.size)?;
@@ -921,7 +1000,7 @@ pub fn extract_image(image_path: String, extract_dir: String) -> PyResult<()> {
     }
 
     let mut file = File::open(&image_path).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("Failed to open ISO: {}", e))
+        PyIOError::new_err(format!("Failed to open ISO: {}", e))
     })?;
 
     let is_udf_valid = if let Ok(udf_ctx) = udf::mount_udf(&mut file) {
@@ -1037,7 +1116,7 @@ pub fn get_wim_info_from_iso<'py>(py: Python<'py>, image_path: String, wim_path:
         result
     });
 
-    let info = wim_info_result.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Could not parse WIM info from ISO"))?;
+    let info = wim_info_result.ok_or_else(|| PyValueError::new_err("Could not parse WIM info from ISO"))?;
 
     let dict = PyDict::new(py);
     if let Some(arch) = info.architecture {

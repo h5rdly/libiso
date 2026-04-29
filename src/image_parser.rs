@@ -64,6 +64,8 @@ pub struct ImageStats {
     pub has_large_file: bool,
     #[pyo3(get)]
     pub is_unpatchable_linux: bool,
+    #[pyo3(get)]
+    pub linux_kernel_version: Option<String>,
 
     #[pyo3(get)]
     pub boot_info: BootCapabilities,
@@ -118,7 +120,13 @@ impl ImageStats {
         } else {
             dict.set_item("windows_info", py.None())?;
         }
+        if let Some(version) = &self.linux_kernel_version {
+            dict.set_item("linux_kernel_version", version)?;
+        } else {
+            dict.set_item("linux_kernel_version", py.None())?;
+        }
         Ok(dict)
+        
     }
 }
 
@@ -212,6 +220,24 @@ fn scan_directory(
         } else {
             if entry.total_size() >= 4_000_000_000 { *has_large_file = true; }
             if file_name.ends_with(".EFI") && file_name.contains("BOOT") { *supports_uefi = true; }
+            
+            // bzimage header scraping
+            if file_name.contains("VMLINUZ") || file_name.contains("BZIMAGE") || file_name == "LINUX"
+            {
+                // ISO sectors are exactly 2048 bytes
+                let start_sector = entry.header().extent.read() as u64;
+                let byte_offset = start_sector * 2048;
+                
+                // Read exactly 8192 bytes (or the file size if it's somehow smaller)
+                let read_size = std::cmp::min(8192, entry.total_size()) as usize;
+                let mut header_buf = vec![0u8; read_size];
+                
+                // hadris-iso direct seek-and-read
+                if iso.read_bytes_at(byte_offset, &mut header_buf).is_ok() {
+                    let _linux_kernel_version = extract_bzimage_version(&header_buf);
+                }
+            }
+            
             if file_name == "INSTALL.WIM" {
                 *is_windows = true;
                 *install_image_type = "wim".to_string();
@@ -246,6 +272,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
                     is_isohybrid: false,
                     has_large_file: true, 
                     is_unpatchable_linux: false, 
+                    linux_kernel_version: None,
                     boot_info: BootCapabilities {
                         is_bootable: false, supports_bios: false, supports_uefi: false,
                         secure_boot_signed: false, is_microsoft_signed: false, is_revoked: false, signature_size: 0,
@@ -285,6 +312,8 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     let mut is_windows_11 = false;
     let mut install_image_type = String::new();
     let mut is_unpatchable_linux = false; 
+    let linux_kernel_version = None;
+
 
     file.seek(SeekFrom::Start(0))?;
     let mut is_udf_valid = false;
@@ -346,5 +375,43 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     } else { None };
 
     Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, 
-        is_unpatchable_linux, boot_info, windows_info })
+        is_unpatchable_linux, linux_kernel_version, boot_info, windows_info })
+}
+
+
+// Extract the human-readable kernel version string from a Linux bzImage file
+pub fn extract_bzimage_version(bzimage: &[u8]) -> Option<String> {
+    
+    // The image must be at least large enough to contain the setup header
+    if bzimage.len() < 0x0210 {
+        return None;
+    }
+
+    // Check for "HdrS" magic signature at offset 0x0202
+    if &bzimage[0x0202..0x0206] != b"HdrS" {
+        return None; 
+    }
+
+    // Read the 16-bit pointer to the kernel version string at 0x020E
+    let version_ptr = u16::from_le_bytes([bzimage[0x020E], bzimage[0x020F]]);
+
+    // The pointer is an offset from 0x0200
+    let absolute_offset = 0x0200 + version_ptr as usize;
+
+    if absolute_offset >= bzimage.len() {
+        return None;
+    }
+
+    // Read until we hit a null byte (0x00)
+    let mut end_offset = absolute_offset;
+    while end_offset < bzimage.len() && bzimage[end_offset] != 0 {
+        end_offset += 1;
+    }
+
+    // Extract and convert to a Rust String (lossy handles weird encoding gracefully)
+    let version_slice = &bzimage[absolute_offset..end_offset];
+    
+    let version_str = String::from_utf8_lossy(version_slice).trim().to_string();
+    
+    if version_str.is_empty() { None } else { Some(version_str) }
 }

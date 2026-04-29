@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
 };
 
+
 pub fn format_fat32<T: Write + Seek>(
     drive: &mut T, volume_size: u64, volume_label: &str, start_lba: u32,
 ) -> Result<(), String> {
@@ -162,7 +163,7 @@ pub struct BareFat32<T: Read + Write + Seek> {
 }
 
 
-fn split_path(path: &str) -> (&str, &str) {
+pub fn split_path(path: &str) -> (&str, &str) {
     let path = path.trim_matches('/');
     match path.rfind('/') {
         Some(idx) => (&path[..idx], &path[idx + 1..]),
@@ -411,6 +412,7 @@ impl<T: Read + Write + Seek> BareFat32<T> {
         }
         Ok(())
     }
+
 }
 
 
@@ -517,39 +519,67 @@ impl<T: Read + Write + Seek> UsbWriter for BareFat32<T> {
     type FileWriter<'w> = BareFatFileWriter<'w, T> where Self: 'w;
 
     fn create_dir(&self, path: &str) -> Result<(), String> {
-        let (parent_path, name) = crate::fat32::split_path(path);
+
+        let (parent_path, name) = split_path(path);
         let mut dir_map = self.dir_map.lock().unwrap();
-        let parent_cluster = *dir_map.get(parent_path).unwrap_or(&self.root_cluster);
+        let parent_cluster = *dir_map.get(&parent_path.to_uppercase()).unwrap_or(&self.root_cluster);
         
         let new_cluster = self.alloc_clusters(self.bytes_per_cluster)?;
         
-        // Zero out the new directory
         let offset = self.heap_offset + (new_cluster as u64 - 2) * self.bytes_per_cluster;
+        let mut cluster_data = vec![0u8; self.bytes_per_cluster as usize];
+
+        //  `.` and `..` entries 
+        let mut dot = [0u8; 32];
+        dot[0..11].copy_from_slice(b".          ");
+        dot[11] = 0x10; // Directory attribute
+        let cl_hi = (new_cluster >> 16) as u16;
+        let cl_lo = (new_cluster & 0xFFFF) as u16;
+        dot[20..22].copy_from_slice(&cl_hi.to_le_bytes());
+        dot[26..28].copy_from_slice(&cl_lo.to_le_bytes());
+
+        let mut dotdot = [0u8; 32];
+        dotdot[0..11].copy_from_slice(b"..         ");
+        dotdot[11] = 0x10; // Directory attribute
+        // Per FAT32 spec, if the parent is the Root Directory, the `..` cluster is 0
+        let p_cluster = if parent_cluster == self.root_cluster { 0 } else { parent_cluster };
+        let p_cl_hi = (p_cluster >> 16) as u16;
+        let p_cl_lo = (p_cluster & 0xFFFF) as u16;
+        dotdot[20..22].copy_from_slice(&p_cl_hi.to_le_bytes());
+        dotdot[26..28].copy_from_slice(&p_cl_lo.to_le_bytes());
+
+        // Copy the standard entries to the start of the cluster
+        cluster_data[0..32].copy_from_slice(&dot);
+        cluster_data[32..64].copy_from_slice(&dotdot);
+
         {
             let mut inner = self.inner.lock().unwrap();
             inner.seek(SeekFrom::Start(offset)).unwrap();
-            inner.write_all(&vec![0u8; self.bytes_per_cluster as usize]).unwrap();
+            inner.write_all(&cluster_data).unwrap();
         }
         
-        let entries = crate::fat32::build_fat32_entry_set(name, new_cluster, 0, true);
+        // Add the directory's name to the parent directory's cluster
+        let entries = build_fat32_entry_set(name, new_cluster, 0, true);
         self.append_entries(parent_cluster, &entries)?;
         
-        dir_map.insert(path.trim_matches('/').to_string(), new_cluster);
+        dir_map.insert(path.trim_matches('/').to_uppercase(), new_cluster);
         Ok(())
     }
 
+
     fn open_file_writer<'w>(&'w self, path: &str, size: u64) -> Result<Self::FileWriter<'w>, String> {
-        let (parent_path, name) = crate::fat32::split_path(path);
+        
+        let (parent_path, name) = split_path(path);
         let dir_map = self.dir_map.lock().unwrap();
-        let parent_cluster = *dir_map.get(parent_path).unwrap_or(&self.root_cluster);
+        let parent_cluster = *dir_map.get(&parent_path.to_uppercase()).unwrap_or(&self.root_cluster);
         
         let file_cluster = self.alloc_clusters(size)?;
-        let entries = crate::fat32::build_fat32_entry_set(name, file_cluster, size, false);
+        let entries = build_fat32_entry_set(name, file_cluster, size, false);
         self.append_entries(parent_cluster, &entries)?;
         
-        // Cache the file location in memory so we NEVER have to parse the FAT table during verification!
-        self.file_map.lock().unwrap().insert(path.trim_matches('/').to_string(), (file_cluster, size));
-
+        // Cache the file location in memory so we NEVER have to parse the FAT table during verification
+        self.file_map.lock().unwrap().insert(path.trim_matches('/').to_uppercase(), (file_cluster, size));
+        
         let start_offset = if file_cluster >= 2 {
             self.heap_offset + (file_cluster as u64 - 2) * self.bytes_per_cluster
         } else { 0 };
@@ -582,20 +612,182 @@ impl<T: Read + Write + Seek> UsbReader for BareFat32<T> {
     type FileReader<'r> = BareFatFileReader<'r, T> where Self: 'r;
 
     fn get_file_size(&self, path: &str) -> Result<u64, String> {
-        let clean_path = path.trim_matches('/');
+
+        let clean_path = path.trim_matches('/').to_uppercase();
+
         let file_map = self.file_map.lock().unwrap();
-        if let Some(&(_, size)) = file_map.get(clean_path) { Ok(size) } else { Err(format!("Not found: {}", path)) }
+        if let Some(&(_, size)) = file_map.get(&clean_path) { Ok(size) } else { Err(format!("Not found: {}", path)) }
     }
 
     fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
-        let clean_path = path.trim_matches('/');
+        
+        let clean_path = path.trim_matches('/').to_uppercase();
+        
         let file_map = self.file_map.lock().unwrap();
-        if let Some(&(cluster, size)) = file_map.get(clean_path) {
-            let start_offset = if cluster >= 2 { self.heap_offset + (cluster as u64 - 2) * self.bytes_per_cluster } else { 0 };
+        if let Some(&(cluster, size)) = file_map.get(&clean_path) {
+            let start_offset = if cluster >= 2 { 
+                self.heap_offset + (cluster as u64 - 2) * self.bytes_per_cluster 
+            } else { 0 };
             Ok(BareFatFileReader { fs: self, start_offset, size, position: 0 })
         } else {
             Err(format!("Not found: {}", path))
         }
     }
 }
+
+
+pub fn read_fat_image(img: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    /* Works on FAT16/12 as well */
+
+    if img.len() < 512 { return Err("Image too small".into()); }
+
+    let bps = u16::from_le_bytes([img[11], img[12]]) as usize;
+    let spc = img[13] as usize;
+    let rsvd = u16::from_le_bytes([img[14], img[15]]) as usize;
+    let fats = img[16] as usize;
+    let root_entries = u16::from_le_bytes([img[17], img[18]]) as usize;
+    
+    let mut tot_sec = u16::from_le_bytes([img[19], img[20]]) as usize;
+    if tot_sec == 0 { tot_sec = u32::from_le_bytes([img[32], img[33], img[34], img[35]]) as usize; }
+    
+    let mut spf = u16::from_le_bytes([img[22], img[23]]) as usize;
+    let mut is_fat32 = false;
+    if spf == 0 {
+        spf = u32::from_le_bytes([img[36], img[37], img[38], img[39]]) as usize;
+        is_fat32 = true;
+    }
+
+    let bpc = bps * spc;
+    let fat_offset = rsvd * bps;
+    let root_offset = fat_offset + (fats * spf * bps);
+    let data_offset = root_offset + (root_entries * 32);
+
+    let data_sectors = tot_sec - (rsvd + (fats * spf) + ((root_entries * 32 + bps - 1) / bps));
+    let cluster_count = data_sectors / spc;
+    let fat_type = if is_fat32 { 32 } else if cluster_count < 4085 { 12 } else { 16 };
+
+    let get_next_cluster = |c: usize| -> usize {
+        let fat_idx = match fat_type {
+            12 => c + (c / 2),
+            16 => c * 2,
+            32 => c * 4,
+            _ => 0,
+        };
+        if fat_offset + fat_idx + 2 > img.len() { return 0x0FFFFFF8; }
+        
+        match fat_type {
+            12 => {
+                let val = u16::from_le_bytes([img[fat_offset + fat_idx], img[fat_offset + fat_idx + 1]]) as usize;
+                if c % 2 == 0 { val & 0x0FFF } else { val >> 4 }
+            }
+            16 => u16::from_le_bytes([img[fat_offset + fat_idx], img[fat_offset + fat_idx + 1]]) as usize,
+            32 => (u32::from_le_bytes([img[fat_offset + fat_idx], img[fat_offset + fat_idx + 2], img[fat_offset + fat_idx + 3], img[fat_offset + fat_idx + 3]]) & 0x0FFFFFFF) as usize,
+            _ => 0x0FFFFFF8,
+        }
+    };
+
+    let is_eof = |c: usize| -> bool {
+        match fat_type {
+            12 => c >= 0x0FF8,
+            16 => c >= 0xFFF8,
+            32 => c >= 0x0FFFFFF8,
+            _ => true,
+        }
+    };
+
+    let read_cluster = |c: usize| -> &[u8] {
+        let offset = data_offset + (c - 2) * bpc;
+        if offset + bpc <= img.len() { &img[offset .. offset + bpc] } else { &[] }
+    };
+
+    fn parse_dir<'a>(
+        img: &'a [u8], dir_data: &[u8], current_path: &str, results: &mut Vec<(String, Vec<u8>)>,
+        get_next_cluster: &dyn Fn(usize) -> usize, read_cluster: &dyn Fn(usize) -> &'a [u8], is_eof: &dyn Fn(usize) -> bool
+    ) {
+        let mut i = 0;
+        let mut lfn_buffer = HashMap::new();
+
+        while i + 32 <= dir_data.len() {
+            let entry = &dir_data[i .. i + 32];
+            i += 32;
+
+            let first = entry[0];
+            if first == 0x00 { break; }
+            if first == 0xE5 || first == 0x05 { continue; }
+
+            let attr = entry[11];
+            if attr == 0x0F {
+                let order = first & 0x3F;
+                let mut chars = Vec::new();
+                for j in (1..11).step_by(2) { chars.push(u16::from_le_bytes([entry[j], entry[j+1]])); }
+                for j in (14..26).step_by(2) { chars.push(u16::from_le_bytes([entry[j], entry[j+1]])); }
+                for j in (28..32).step_by(2) { chars.push(u16::from_le_bytes([entry[j], entry[j+1]])); }
+                lfn_buffer.insert(order, chars);
+                continue;
+            }
+
+            if attr & 0x08 != 0 { continue; }
+
+            let is_dir = (attr & 0x10) != 0;
+            let target_cluster = ((u16::from_le_bytes([entry[20], entry[21]]) as u32) << 16)
+                               | (u16::from_le_bytes([entry[26], entry[27]]) as u32);
+            let target_cluster = target_cluster as usize;
+            let file_size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as usize;
+
+            let name = if !lfn_buffer.is_empty() {
+                let mut orders: Vec<u8> = lfn_buffer.keys().cloned().collect();
+                orders.sort();
+                let mut utf16 = Vec::new();
+                for o in orders { utf16.extend_from_slice(&lfn_buffer[&o]); }
+                utf16.retain(|&c| c != 0x0000 && c != 0xFFFF);
+                lfn_buffer.clear();
+                String::from_utf16_lossy(&utf16)
+            } else {
+                let stem = String::from_utf8_lossy(&entry[0..8]).trim().to_string();
+                let ext = String::from_utf8_lossy(&entry[8..11]).trim().to_string();
+                if ext.is_empty() { stem } else { format!("{}.{}", stem, ext) }
+            };
+
+            if name == "." || name == ".." || name.is_empty() { continue; }
+
+            let full_path = if current_path.is_empty() { format!("/{}", name) } else { format!("{}/{}", current_path, name) };
+
+            let mut chain_data = Vec::new();
+            if target_cluster >= 2 {
+                let mut curr = target_cluster;
+                while !is_eof(curr) && curr != 0 {
+                    chain_data.extend_from_slice(read_cluster(curr));
+                    let next = get_next_cluster(curr);
+                    if next == curr { break; } 
+                    curr = next;
+                }
+            }
+
+            if is_dir {
+                parse_dir(img, &chain_data, &full_path, results, get_next_cluster, read_cluster, is_eof);
+            } else {
+                chain_data.truncate(file_size);
+                results.push((full_path, chain_data));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    let root_data = if is_fat32 {
+        let root_cluster = u32::from_le_bytes([img[44], img[45], img[46], img[47]]) as usize;
+        let mut data = Vec::new();
+        let mut curr = root_cluster;
+        while !is_eof(curr) && curr != 0 {
+            data.extend_from_slice(read_cluster(curr));
+            curr = get_next_cluster(curr);
+        }
+        data
+    } else {
+        img[root_offset .. root_offset + (root_entries * 32)].to_vec()
+    };
+
+    parse_dir(img, &root_data, "", &mut files, &get_next_cluster, &read_cluster, &is_eof);
+    Ok(files)
+}
+
 

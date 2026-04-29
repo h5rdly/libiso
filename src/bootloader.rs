@@ -9,8 +9,12 @@ use crate::writer::UsbWriter;
 const SPROUT_X86_64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_x86_64.efi");
 const SPROUT_AARCH64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_aarch64.efi");
 
-const LINUX_KERNEL_PREFIXES: &[&str] = &["vmlinuz", "bzimage", "image", "kernel"];
-const LINUX_INITRAMFS_PREFIXES: &[&str] = &["initramfs", "initrd", "microcode"];
+const LINUX_KERNEL_PREFIXES: &[&str] = &[
+    "vmlinuz", "bzimage", "image", "kernel", "kernel-"
+    ];
+const LINUX_INITRAMFS_PREFIXES: &[&str] = &[
+    "initrd", "initramfs", "microcode", "ucode", "amd-ucode", "intel-ucode"
+];
 
 
 pub fn install_uefi_sprout<W: UsbWriter>(writer: &W, target_arch: &str,) -> PyResult<()> {
@@ -42,19 +46,21 @@ pub fn install_uefi_sprout<W: UsbWriter>(writer: &W, target_arch: &str,) -> PyRe
 pub fn detect_linux_payloads(
     filename: &str, current_path: &str, found_kernel: &mut Option<String>, found_initrd: &mut Option<String>
 ) {
-
     let lower_name = filename.to_lowercase();
+    let lower_path = current_path.to_lowercase();
     
-    // Blacklist utility payloads
-    if lower_name.contains("memtest") || lower_name.contains("rescue") {
+    // Blacklist utility payloads and bootloader modules
+    if lower_name.contains("memtest") || lower_name.contains("rescue") || lower_path.contains("grub") {
         return;
     }
 
     if found_kernel.is_none() {
-        // Native Rust iterator checking if the filename starts with any of the prefixes
         if LINUX_KERNEL_PREFIXES.iter().any(|&prefix| lower_name.starts_with(prefix)) {
-            *found_kernel = Some(format!("{}/{}", current_path, filename));
-            return;
+            // Prevent GRUB/Syslinux modules (like kernel.img or boot.efi) from being flagged as the Linux kernel
+            if !lower_name.ends_with(".img") && !lower_name.ends_with(".efi") && !lower_name.ends_with(".sys") {
+                *found_kernel = Some(format!("{}/{}", current_path, filename));
+                return;
+            }
         }
     }
 
@@ -67,22 +73,66 @@ pub fn detect_linux_payloads(
 }
 
 
-pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>) {
+
+pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
+    let mut result = cfg.to_string();
     
+    // Patch kernel arguments (e.g., root=live:LABEL=Adelie-x86_64)
+    let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel="];
+    for prefix in prefixes {
+        let mut current = 0;
+        while let Some(idx) = result[current..].find(prefix) {
+            let start = current + idx + prefix.len();
+            let end_offset = result[start..]
+                .find(|c: char| c == ' ' || c == '"' || c == '\'' || c == '\n' || c == '\r')
+                .unwrap_or(result[start..].len());
+            let end = start + end_offset;
+            
+            result = format!("{}{}{}", &result[..start], new_label, &result[end..]);
+            current = start + new_label.len();
+        }
+    }
+    
+    // Patch GRUB search commands (e.g., search --label "Adelie-x86_64")
+    let mut current = 0;
+    let prefix = "--label ";
+    while let Some(idx) = result[current..].find(prefix) {
+        let start = current + idx + prefix.len();
+        let has_quote = result[start..].starts_with('"') || result[start..].starts_with('\'');
+        
+        let val_start = if has_quote { start + 1 } else { start };
+        let end_offset = if has_quote {
+            let quote = result[start..].chars().next().unwrap();
+            result[val_start..].find(quote).unwrap_or(result[val_start..].len())
+        } else {
+            result[val_start..].find(|c: char| c == ' ' || c == '\n' || c == '\r').unwrap_or(result[val_start..].len())
+        };
+        
+        let end = val_start + end_offset;
+        result = format!("{}{}{}", &result[..val_start], new_label, &result[end..]);
+        current = val_start + new_label.len() + if has_quote { 1 } else { 0 };
+    }
+
+    result
+}
+
+
+
+pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>, new_usb_label: &str) {
     if found_args.is_some() {
         return; 
     }
 
     for line in config_content.lines() {
         let trimmed = line.trim();
+        let mut extracted_args = String::new();
         
         // Match GRUB style: "linux /casper/vmlinuz boot=casper quiet splash"
         if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() > 2 {
                 // Skip the "linux" command and the "/path/to/kernel"
-                *found_args = Some(parts[2..].join(" "));
-                return;
+                extracted_args = parts[2..].join(" ");
             }
         } 
         // Match Syslinux style: "APPEND boot=casper initrd=/casper/initrd.lz quiet splash"
@@ -93,9 +143,31 @@ pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>) {
                 .collect();
                 
             if !parts.is_empty() {
-                *found_args = Some(parts.join(" "));
-                return;
+                extracted_args = parts.join(" ");
             }
+        }
+
+        // If we found arguments, aggressively patch the label for Sprout
+        if !extracted_args.is_empty() {
+            let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel="];
+            for prefix in prefixes {
+                let mut current = 0;
+                while let Some(idx) = extracted_args[current..].find(prefix) {
+                    let start = current + idx + prefix.len();
+                    // Find the end of the label string (space, quote, or end of line)
+                    let end_offset = extracted_args[start..]
+                        .find(|c: char| c == ' ' || c == '"' || c == '\'')
+                        .unwrap_or(extracted_args[start..].len());
+                    let end = start + end_offset;
+                    
+                    // Replace whatever garbage label they had with our strict 11-char FAT32 label
+                    extracted_args = format!("{}{}{}", &extracted_args[..start], new_usb_label, &extracted_args[end..]);
+                    current = start + new_usb_label.len();
+                }
+            }
+            
+            *found_args = Some(extracted_args);
+            return;
         }
     }
 }

@@ -96,7 +96,12 @@ pub fn verify<R: ImageReader, U: UsbReader>(
             verify(iso_reader, usb_reader, &new_path, tx, verified, total_size, use_sprout_bootloader)?;
         } else {
             let clean_lower = clean_name.to_lowercase();
-            let mut skip_verify = matches!(clean_lower.as_str(), "sprout.toml" | "autounattend.xml" | "autorun.inf");
+            
+            // Skip injected files AND any config files we might have dynamically patched!
+            let mut skip_verify = matches!(
+                clean_lower.as_str(), 
+                "sprout.toml" | "autounattend.xml" | "autorun.inf"
+            ) || clean_lower.ends_with(".cfg") || clean_lower.ends_with(".conf");
             
             // If we injected Sprout, skip verifying the EFI boot files
             if use_sprout_bootloader && matches!(clean_lower.as_str(), "bootx64.efi" | "bootaa64.efi") {

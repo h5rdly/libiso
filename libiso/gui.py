@@ -38,11 +38,24 @@ state = {
     'iso_path': '',
     'target_device': '',
     'is_burning': False,
+    'has_burned': False,       # Locks out tooltips after a burn completes
+    'current_log_text': '',    # Prevents spamming the UI redraw
     'abort_token': None,
     'drives': [],
     'admin': is_admin(),
     'is_mutant': False,
     'is_windows': False,
+    'tooltips': {
+        'iso_text': 
+            'Click to load an ISO file',
+        'chk_verify': 
+            'Read the USB after burning and compare bit-for-bit',
+        'chk_dd': 
+            "ISO mode is the default, as it doesn't turn the USB into read-only",
+        'chk_original_uefi': 
+            'Some Linux distros (Manjaro, Pop!_OS) will not work on ISO mode with their original UEFI bootloader'
+    },
+    'dark_mode': True,
 }
 
 
@@ -108,6 +121,7 @@ def start_burn_cb():
     if not state['iso_path'] or not dpg.get_value('drive_combo'):
         return
     state['is_burning'] = True
+    state['has_burned'] = True  # Prevents mouse hover to present info in the now active log panel
     threading.Thread(target=burn_worker, daemon=True).start()
 
 
@@ -115,6 +129,8 @@ def file_selected_cb(sender, app_data):
 
     state['iso_path'] = app_data['file_path_name']
     dpg.set_value('iso_text', state['iso_path'])
+    state['has_burned'] = False     
+    state['current_log_text'] = ''   
 
     dpg.set_value('status_text', 'Inspecting ISO...')
     on_iso_loaded(state['iso_path'])
@@ -155,15 +171,15 @@ def on_iso_loaded(file_path):
         dpg.set_value('iso_info_details', f"Size: {size_gb}GB  Boot Format: {'Proprietary/Mutant' if is_mutant else 'Standard'}")
         
         if is_mutant:
-            dpg.set_value('txt_original_uefi', 'Use Sprout UEFI bootloader (For ISO mode)')
-            dpg.set_value('txt_tooltip_uefi', 'The original bootloader on this distro doesn\'t support ISO mode.\nSprout provides a custom, highly compatible boot environment.')
+            dpg.configure_item('chk_original_uefi', label='Use Sprout UEFI bootloader (For ISO mode)')
+            state['tooltips']['chk_original_uefi'] = "The original bootloader on this distro doesn't support ISO mode"
             
             # Mutants: Default to Sprout (ISO mode)
             dpg.set_value('chk_original_uefi', True)
             dpg.set_value('chk_dd', False)
         else:
-            dpg.set_value('txt_original_uefi', 'Use original UEFI bootloader (For ISO mode)')
-            dpg.set_value('txt_tooltip_uefi', 'Some Linux distros (Manjaro, Pop!_OS) will not work\n on ISO mode with their original UEFI bootloader')
+            dpg.configure_item('chk_original_uefi', label='Use original UEFI bootloader (For ISO mode)')
+            state['tooltips']['chk_original_uefi'] =  'Some Linux distros (Manjaro, Pop!_OS) will not work on ISO mode with their original UEFI bootloader'
             
             # Standard Linux: Default to Original (ISO mode)
             dpg.set_value('chk_original_uefi', True)
@@ -202,12 +218,31 @@ def uefi_toggled_cb(sender, app_data, user_data):
             dpg.set_value('chk_dd', True)
 
 
+def mouse_move_cb():
+
+    # If a burn is running, or has finished, don't overwrite the log
+    if state['is_burning'] or state['has_burned']:
+        return
+        
+    tags_to_check = ['chk_verify', 'chk_dd', 'chk_original_uefi', 'iso_text']
+    
+    match (hovered_tag := next((tag for tag in tags_to_check if dpg.is_item_hovered(tag)), None)):
+        case 'chk_verify' | 'chk_dd' | 'chk_original_uefi' | 'iso_text':
+            new_text = state['tooltips'][hovered_tag]
+        case _:
+            new_text = 'Waiting for configuration' if not state['iso_path'] else 'Ready to burn'
+        
+    # Only update the GUI if the text actually changed
+    if state['current_log_text'] != new_text:
+        state['current_log_text'] = new_text
+        dpg.set_value('log_console', f'{new_text}')
+
+
 # - Dynamic Zoom setup and callback
 
 scale_factor = get_dpi_scale()
-font_size = 20 * scale_factor
 
-current_font_size = int(20 * get_dpi_scale())
+current_font_size = int(19 * get_dpi_scale())
 current_title_size = int(32 * scale_factor) # Our new bigger font size
 main_font = None # We will store the font ID here so the callback can update it
 title_font = None
@@ -240,6 +275,7 @@ def burn_worker():
     dpg.configure_item('btn_cancel', show=True)
     dpg.configure_item('advanced_options_group', show=False)
     dpg.set_value('progress_bar', 0.0)
+    dpg.configure_item('progress_bar', overlay='')
     dpg.set_value('log_console', '--- STARTING BURN PROCESS ---\n')
     
     # Extract the raw device path from the dropdown string (e.g., '/dev/sda')
@@ -311,7 +347,16 @@ def burn_worker():
             if event.msg_type == 'PROGRESS':
                 if (current_time := time.time()) - last_ui_update > 0.05 or event.written == event.total:
                     progress = event.written / event.total if event.total > 0 else 0.0
+                    
+                    # Calculate GBs
+                    written_gb = event.written / (1024**3)
+                    total_gb = event.total / (1024**3)
+                    overlay_text = f"{written_gb:.2f} GB / {total_gb:.2f} GB"
+                    
+                    # Update bar value and the text overlay
                     dpg.set_value('progress_bar', progress)
+                    dpg.configure_item('progress_bar', overlay=overlay_text)
+                    
                     last_ui_update = current_time
                     
             elif event.msg_type == 'PHASE':
@@ -374,7 +419,9 @@ font_path = current_dir + 'HackNerdFontPropo-Regular.ttf'
 with dpg.font_registry():
     if os.path.exists(font_path):
         main_font = dpg.add_font(font_path, current_font_size)
+        # dpg.add_font_range(0xf000, 0xf3ff)  # unicode emoji support
         title_font = dpg.add_font(font_path, current_title_size)
+
         dpg.bind_font(main_font)
     else:
         print('Warning: Could not find a TTF system font. Falling back to default.')
@@ -450,6 +497,7 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
             dpg.add_text('...', tag='iso_info_details')
         dpg.add_spacer(height=30)
 
+    
     # Advanced Options
     with dpg.group(tag='advanced_options_group'):
 
@@ -457,33 +505,23 @@ with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=Tr
         dpg.add_separator()
         dpg.add_spacer(height=10)
 
-        with dpg.group(horizontal=True):
-            dpg.add_checkbox(tag='chk_verify', default_value=True)
-            dpg.add_text('Verify written data', tag='txt_verify')
-        with dpg.tooltip('txt_verify'):
-            dpg.add_text('Reads the USB after burning to ensure bit-for-bit\naccuracy')
-
+        dpg.add_checkbox(label='Verify written data', tag='chk_verify', default_value=True)
         dpg.add_spacer(height=10)
 
-        with dpg.group(horizontal=True, tag='grp_dd'):
-            dpg.add_checkbox(tag='chk_dd', callback=dd_toggled_cb)
-            dpg.add_text('Force DD (Raw Image) mode', tag='txt_dd')
-        with dpg.tooltip('txt_dd'):
-            dpg.add_text('''ISO mode is the default, since it doesn't take up\nthe entire drive space''')
+        with dpg.group(tag='grp_dd'):
+            dpg.add_checkbox(label='Force DD (Raw Image) mode', tag='chk_dd', callback=dd_toggled_cb)
         
         with dpg.group(tag='grp_uefi'):
-            with dpg.group(horizontal=True):
-                dpg.add_checkbox(tag='chk_original_uefi', callback=uefi_toggled_cb)
-                dpg.add_text('Use original UEFI bootloader (For ISO mode)', tag='txt_original_uefi')
-            with dpg.tooltip('txt_original_uefi'):
-                dpg.add_text('Some Linux distros (Manjaro, Pop!_OS) will not work\n on ISO mode with their original UEFI bootloader', tag='txt_tooltip_uefi')
+            dpg.add_checkbox(label='Use original UEFI bootloader (For ISO mode)', tag='chk_original_uefi', callback=uefi_toggled_cb)
             dpg.add_spacer(height=5)
 
         dpg.add_spacer(height=50)
-    
+
+
     # Status & Progress
     dpg.add_text('Ready', tag='status_text')
-    dpg.add_progress_bar(tag='progress_bar', default_value=0.0, width=-1, height=20)
+    bar_height = int(19 * scale_factor)
+    dpg.add_progress_bar(tag='progress_bar', default_value=0.0, width=-1, height=bar_height)
     
     dpg.add_spacer(height=50)
     
@@ -536,11 +574,12 @@ threading.Thread(target=drive_poller, daemon=True).start()
 
 # Register the global mouse wheel handler
 with dpg.handler_registry():
+    dpg.add_mouse_move_handler(callback=mouse_move_cb)
     dpg.add_mouse_wheel_handler(callback=zoom_font_cb)
 
 # Scale the main window size 
-window_width = int(750 * scale_factor)
-window_height = int(550 * scale_factor)
+window_width = int(720 * scale_factor)
+window_height = int(600 * scale_factor)
 
 dpg.create_viewport(title='Sulfur USB burner', width=window_width, height=window_height, 
     resizable=True)
