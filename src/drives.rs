@@ -251,69 +251,101 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
 #[cfg(target_os = "freebsd")]
 #[pyfunction]
 pub fn list_removable_drives() -> Vec<DriveInfo> {
-    use std::fs;
-    use std::path::Path;
+    use std::ffi::CString;
+
+    // Manual FFI bindings to avoid needing the `libc` crate dependency
+    extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> std::ffi::c_int;
+    }
 
     let mut available_drives = Vec::new();
-    let dev_dir = Path::new("/dev");
 
-    if let Ok(entries) = fs::read_dir(dev_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let name = entry.file_name().into_string().unwrap_or_default();
+    // Ask the FreeBSD kernel for the length of the GEOM XML topology
+    let mib = CString::new("kern.geom.confxml").unwrap();
+    let mut len: usize = 0;
+    
+    unsafe {
+        sysctlbyname(
+            mib.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
 
-            // FreeBSD identifies USB mass storage and SCSI devices as Direct Access (da)
-            // We want pure drives (da0, da1), ignoring partitions (da0p1, da0s1)
-            if name.starts_with("da") && name.chars().skip(2).all(|c| c.is_ascii_digit()) {
-                let device_path = format!("/dev/{}", name);
+    if len == 0 { return available_drives; }
 
-                // Use FreeBSD's `diskinfo` to grab the capacity
-                let size_bytes = if let Ok(out) = std::process::Command::new("diskinfo")
-                    .arg(&device_path)
-                    .output()
-                {
-                    let out_str = String::from_utf8_lossy(&out.stdout);
-                    // diskinfo output format:
-                    // /dev/da0   512   15502147584   30277632   0   0   0   0
-                    // The 3rd column is total bytes.
-                    out_str.split_whitespace().nth(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
-                } else {
-                    0
-                };
+    // Allocate a buffer and fetch the actual XML string directly from kernel memory
+    let mut buffer = vec![0u8; len];
+    let res = unsafe {
+        sysctlbyname(
+            mib.as_ptr(),
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
 
-                // Use camcontrol to fetch the hardware model
-                let hardware_model = if let Ok(out) = std::process::Command::new("camcontrol")
-                    .args(&["inq", &name])
-                    .output()
-                {
-                    let out_str = String::from_utf8_lossy(&out.stdout);
-                    // Usually looks like "pass2: <SanDisk Cruzer Glide 1.00> Removable Direct Access..."
-                    if let Some(start) = out_str.find('<') {
-                        if let Some(end) = out_str[start..].find('>') {
-                            out_str[start + 1..start + end].trim().to_string()
-                        } else {
-                            "FreeBSD USB Drive".to_string()
-                        }
-                    } else {
-                        "FreeBSD USB Drive".to_string()
-                    }
-                } else {
-                    "FreeBSD USB Drive".to_string()
-                };
+    if res != 0 { return available_drives; }
 
-                if size_bytes > 0 {
-                    available_drives.push(DriveInfo {
-                        display_name: format!("{} ({})", hardware_model, device_path),
-                        device_path,
-                        total_space_bytes: size_bytes,
-                        label: None,
-                        hardware_model,
-                    });
-                }
+    let xml = String::from_utf8_lossy(&buffer);
+
+    // Simple XML tag extractor helper
+    let extract_tag = |block: &str, tag: &str| -> String {
+        let open_tag = format!("<{}>", tag);
+        let close_tag = format!("</{}>", tag);
+        if let Some(start) = block.find(&open_tag) {
+            if let Some(end) = block[start..].find(&close_tag) {
+                return block[start + open_tag.len()..end].trim().to_string();
+            }
+        }
+        String::new()
+    };
+
+    // Parse the GEOM XML for hardware providers
+    let mut search_idx = 0;
+    while let Some(provider_start) = xml[search_idx..].find("<provider ") {
+        let abs_start = search_idx + provider_start;
+        let abs_end = xml[abs_start..].find("</provider>").unwrap_or(0) + abs_start;
+        if abs_end <= abs_start { break; }
+
+        let provider_block = &xml[abs_start..abs_end];
+        search_idx = abs_end;
+
+        let name = extract_tag(provider_block, "name");
+        
+        // FreeBSD identifies USB mass storage as Direct Access (da). 
+        // We only want root drives (da0, da1), ignoring partitions (da0p1, da0s1)
+        if name.starts_with("da") && name.chars().skip(2).all(|c| c.is_ascii_digit()) {
+            
+            let size_bytes = extract_tag(provider_block, "mediasize").parse::<u64>().unwrap_or(0);
+            let descr = extract_tag(provider_block, "descr");
+            let hardware_model = if descr.is_empty() { "FreeBSD USB Drive".to_string() } else { descr };
+            let device_path = format!("/dev/{}", name);
+
+            if size_bytes > 0 {
+                available_drives.push(DriveInfo {
+                    display_name: format!("{} ({})", hardware_model, device_path),
+                    device_path,
+                    total_space_bytes: size_bytes,
+                    label: None,
+                    hardware_model,
+                });
             }
         }
     }
+
     available_drives
 }
+
 
 
 // Placeholder for OpenBSD / NetBSD to pass CI
