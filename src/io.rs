@@ -189,6 +189,10 @@ pub mod sys {
         handle: Option<HANDLE>,
     }
 
+    // moving the Windows HANDLE across thread boundaries is safe
+    unsafe impl Send for DriveLocker {}
+    unsafe impl Sync for DriveLocker {}
+
     impl DriveLocker {
         pub fn new(volume_path: &str) -> Result<Self, String> {
             // If the path doesn't start with the Windows device namespace (\\.\),
