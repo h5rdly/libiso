@@ -1,28 +1,18 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write, Seek, SeekFrom, copy},
+    io::{Read, Write, Seek, SeekFrom, Error, ErrorKind, copy},
     path::Path,
     thread,
     sync::{Arc, mpsc, Mutex, atomic::{AtomicBool, Ordering}},
     cell::RefCell
 };
 
-use fatfs::{ Dir, FileSystem, FsOptions, ReadWriteSeek, TimeProvider, OemCpConverter}; 
-
 use hadris_iso::{sync::IsoImage, directory::DirectoryRef, read::DirEntry};
 
-use arcbox_ext4::Formatter as Ext4Formatter;
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::{prelude::*, types::PyDict, exceptions::PyRuntimeError,};
 
 use crate::io::{AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread};
-use crate::verify;
-use crate::bootloader;
-use crate::udf;
-use crate::exfat;
-use crate::fat32;
-use crate::gpt;
-use crate::esd;
+use crate::{fat32, verify, bootloader, udf, exfat, gpt, esd, ext4};
 
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
@@ -113,7 +103,7 @@ impl<T: Read + Write + Seek> Write for PartitionWrapper<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let current_pos = self.seek(SeekFrom::Current(0))?;
         if current_pos >= self.size { 
-            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "Partition boundary exceeded")); 
+            return Err(Error::new(ErrorKind::WriteZero, "Partition boundary exceeded")); 
         }
         let max_write = (self.size - current_pos).min(buf.len() as u64) as usize;
         self.inner.write(&buf[..max_write])
@@ -228,7 +218,7 @@ pub fn format_usb_drive(
     let partition_offset = geom_start_lba * 512;
     let partition_size = (geom_safe_end_lba - geom_start_lba + 1) * 512;
     let mut wrapped_partition = PartitionWrapper { inner: dest_file, offset: partition_offset, size: partition_size };
-    format_partition(&mut wrapped_partition, is_exfat, volume_label, geom_start_lba).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    format_partition(&mut wrapped_partition, is_exfat, volume_label, geom_start_lba).map_err(|e| PyRuntimeError::new_err(e))?;
 
     Ok(())
 }
@@ -422,21 +412,19 @@ pub fn write_image_iso(
     dest_file.write_all(&[0u8; 512])?;
     dest_file.sync_all()?;
 
+    // Create Persistence Partition if requested
     if let Some((start, sectors)) = persistence_part {
         let ext4_offset = start * 512;
         let ext4_size = sectors * 512;
         
         let temp_path_str = ext4_temp_path.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ext4_temp_path must be provided if persistence_size_mb is set"))?;
         let temp_ext4 = Path::new(&temp_path_str);
-        let fmt = Ext4Formatter::new(temp_ext4, 4096, ext4_size).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to init ext4 formatter: {:?}", e)))?;
-        fmt.close().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to finalize ext4 formatting: {:?}", e)))?;
+        
+        let mut temp_file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(temp_ext4)?;
+        ext4::format_ext4(&mut temp_file, ext4_size, "writable")
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to format ext4: {}", e)))?;
 
-        let mut temp_file = OpenOptions::new().read(true).write(true).open(temp_ext4)?;
-        temp_file.seek(SeekFrom::Start(1144))?;
-        let mut label = [0u8; 16];
-        label[..8].copy_from_slice(b"writable"); 
-        temp_file.write_all(&label)?;
-
+        // Copy the freshly formatted ext4 image directly onto the USB flash drive
         temp_file.seek(SeekFrom::Start(0))?;
         dest_file.seek(SeekFrom::Start(ext4_offset))?;
         copy(&mut temp_file, &mut dest_file)?;
@@ -453,7 +441,7 @@ pub fn write_image_iso(
 
     let short_usb_label = iso_label.chars().take(11).collect::<String>().replace(' ', "_").to_uppercase();
     format_partition(&mut wrapped_partition, has_large_file, short_usb_label.as_str(), start_lba)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        .map_err(|e| PyRuntimeError::new_err(e))?;
     
     let iso_path_clone = image_path.clone();
 
@@ -491,22 +479,18 @@ pub fn write_image_iso(
                 has_large_file, &arch_selection, &old_label_owned, &new_label_owned, unattend_xml_payload, 
                 &new_label_owned, abort_flag, verify_written, lba0_bytes, use_sprout_bootloader,
             );
-            
-        } else {
+          } else {
             let _ = tx.send(EventMsg::phase("Extracting image (FAT32)"));
-            let fatfs_partition = fatfs::StdIoWrapper::new(wp);
-            let usb_fs = match FileSystem::new(fatfs_partition, FsOptions::new()) {
+            
+            let usb_fs = match fat32::BareFat32::mount(wp) {
                 Ok(fs) => fs,
-                Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount FAT32: {:?}", e))); return; }
+                Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount BareFAT32: {:?}", e))); return; }
             };
             
-            let writer = Fat32Writer { fs: &usb_fs };
-            let usb_reader = verify::Fat32UsbReader { fs: &usb_fs };
-            
             run_burn_and_verify(
-                &writer, &usb_reader, &iso_path_clone, &device_path_clone, &tx, total_size, has_large_file, 
+                &usb_fs, &usb_fs, &iso_path_clone, &device_path_clone, &tx, total_size, has_large_file, 
                 &arch_selection, &old_label_owned, &new_label_owned, unattend_xml_payload, &new_label_owned, 
-                abort_flag, verify_written, lba0_bytes, use_sprout_bootloader,
+                abort_flag, verify_written, lba0_bytes, use_sprout_bootloader
             );
         }
     });
@@ -818,40 +802,10 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
 }
 
 
-// --- FAT32 WRITER ---
-pub struct Fat32Writer<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { pub fs: &'a FileSystem<T, TP, OCC> }
-pub struct Fat32FileWriter<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { inner: fatfs::File<'a, T, TP, OCC> }
-impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for Fat32FileWriter<'a, T, TP, OCC> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        fatfs::Write::write(&mut self.inner, buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        fatfs::Write::flush(&mut self.inner).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
-    }
-}
-impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Fat32Writer<'a, T, TP, OCC> {
-    fn nav(&self, path: &str) -> Result<(Dir<'a, T, TP, OCC>, String), String> {
-        let mut curr = self.fs.root_dir();
-        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let target = parts.pop().unwrap_or("").to_string();
-        for p in parts { if !p.is_empty() { curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; } }
-        Ok((curr, target))
-    }
-}
-impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbWriter for Fat32Writer<'a, T, TP, OCC> {
-    type FileWriter<'w> = Fat32FileWriter<'w, T, TP, OCC> where Self: 'w;
-    fn create_dir(&self, path: &str) -> Result<(), String> {
-        let (parent, name) = self.nav(path)?;
-        parent.create_dir(&name).map_err(|e| format!("{:?}", e))?;
-        Ok(())
-    }
-    fn open_file_writer<'w>(&'w self, path: &str, _size: u64) -> Result<Self::FileWriter<'w>, String> {
-        let (parent, name) = self.nav(path)?;
-        let mut f = parent.create_file(&name).map_err(|e| format!("{:?}", e))?;
-        f.truncate().map_err(|e| format!("{:?}", e))?; 
-        Ok(Fat32FileWriter { inner: f })
-    }
-}
+
+// -- FAT32 WRITER 
+
+// moved to fat32.rs, consider refactoring traits
 
 
 #[allow(clippy::too_many_arguments)]
@@ -954,38 +908,14 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
 }
 
 
+
 // -- Helper inspection logic and utils for Python
-
-fn inspect_fat32_recursive<IO: fatfs::ReadWriteSeek, TP: fatfs::TimeProvider, OCC: fatfs::OemCpConverter>(
-    dir: &fatfs::Dir<'_, IO, TP, OCC>,
-    current_path: &str,
-    found_files: &mut Vec<String>,
-) {
-    for entry_res in dir.iter() {
-        if let Ok(entry) = entry_res {
-            let short = entry.short_file_name();
-            if short == "." || short == ".." { continue; }
-
-            let long = entry.file_name();
-            let name = if long.is_empty() { short.clone() } else { long };
-            let full_path = if current_path.is_empty() { name.clone() } else { format!("{}/{}", current_path, name) };
-
-            if entry.is_dir() {
-                found_files.push(format!("[DIR ] {}", full_path));
-                if let Ok(sub_dir) = dir.open_dir(&name) {
-                    inspect_fat32_recursive(&sub_dir, &full_path, found_files);
-                }
-            } else {
-                found_files.push(format!("[FILE] {} ({} bytes)", full_path, entry.len()));
-            }
-        }
-    }
-}
 
 
 #[pyfunction]
 #[pyo3(signature = (device_path))]
 pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
+
     let mut file = OpenOptions::new().read(true).open(&device_path)?;
     
     let partition_offset = 2048 * 512;
@@ -1005,22 +935,21 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
     
     wrapped_partition.seek(SeekFrom::Start(0))?;
 
-    let mut found_files = Vec::new();
-
-    if is_exfat {
+    let found_files = if is_exfat {
         let bare_fs = exfat::BareExFat::mount(wrapped_partition).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount bare exFAT: {}", e))
+            PyRuntimeError::new_err(format!("Failed to mount bare exFAT: {}", e))
         })?;
-        found_files = bare_fs.inspect_all().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Inspection failed: {}", e))
-        })?;
+        bare_fs.inspect_all().map_err(|e| {
+            PyRuntimeError::new_err(format!("Inspection failed: {}", e))
+        })?
     } else {
-        let fatfs_partition = fatfs::StdIoWrapper::new(wrapped_partition);
-        let fs = FileSystem::new(fatfs_partition, FsOptions::new()).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to mount FAT32: {:?}", e))
+        let bare_fs = fat32::BareFat32::mount(wrapped_partition).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to mount bare FAT32: {}", e))
         })?;
-        inspect_fat32_recursive(&fs.root_dir(), "", &mut found_files);
-    }
+        bare_fs.inspect_all().map_err(|e| {
+            PyRuntimeError::new_err(format!("Inspection failed: {}", e))
+        })?
+    };
 
     Ok(found_files)
 }
@@ -1072,16 +1001,16 @@ pub fn extract_image(image_path: String, extract_dir: String) -> PyResult<()> {
         let udf_ctx = udf::mount_udf(&mut file).unwrap();
         let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
         extract_to_fs(&reader, "", host_root).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(e)
+            PyRuntimeError::new_err(e)
         })?;
     } else {
         let iso_file = File::open(&image_path)?;
         let iso = IsoImage::open(iso_file).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to parse ISO9660: {:?}", e))
+            PyRuntimeError::new_err(format!("Failed to parse ISO9660: {:?}", e))
         })?;
         let reader = IsoReader { iso: &iso };
         extract_to_fs(&reader, "", host_root).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(e)
+            PyRuntimeError::new_err(e)
         })?;
     }
 

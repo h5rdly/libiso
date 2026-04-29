@@ -1,8 +1,8 @@
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::thread;
-use std::sync::{mpsc, Mutex};
-
-use fatfs::{FileSystem, ReadWriteSeek, TimeProvider, OemCpConverter}; 
+use std::{
+    io::{Read, Seek, SeekFrom, Write},
+    thread,
+    sync::{mpsc, Mutex},
+};
 
 use pyo3::prelude::*;
 
@@ -17,51 +17,7 @@ pub trait UsbReader {
     fn get_file_size(&self, path: &str) -> Result<u64, String>; 
 }
 
-pub struct Fat32UsbReader<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { pub fs: &'a FileSystem<T, TP, OCC> }
-pub struct Fat32FileReader<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> { inner: fatfs::File<'a, T, TP, OCC> }
-
-impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for Fat32FileReader<'a, T, TP, OCC> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        fatfs::Read::read(&mut self.inner, buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
-    }
-}
-
-impl<'a, T: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> UsbReader for Fat32UsbReader<'a, T, TP, OCC> {
-    type FileReader<'r> = Fat32FileReader<'r, T, TP, OCC> where Self: 'r;
-    
-    fn open_file_reader<'r>(&'r self, path: &str) -> Result<Self::FileReader<'r>, String> {
-        let mut curr = self.fs.root_dir();
-        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let target = parts.pop().unwrap_or("");
-        for p in parts { 
-            if !p.is_empty() { 
-                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; 
-            } 
-        }
-        let f = curr.open_file(target).map_err(|e| format!("{:?}", e))?;
-        Ok(Fat32FileReader { inner: f })
-    }
-
-    fn get_file_size(&self, path: &str) -> Result<u64, String> {
-        let mut curr = self.fs.root_dir();
-        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let target = parts.pop().unwrap_or("");
-        
-        for p in parts { 
-            if !p.is_empty() { 
-                curr = curr.open_dir(p).map_err(|e| format!("{:?}", e))?; 
-            } 
-        }
-        
-        let mut f = curr.open_file(target).map_err(|e| format!("{:?}", e))?;
-        let size = fatfs::Seek::seek(&mut f, fatfs::SeekFrom::End(0))
-            .map_err(|e| format!("{:?}", e))?;
-
-        Ok(size)
-    }
-}
-
-
+// -- BareExFat Reader Implementation
 pub struct BareFileReader<'r, T: Read + Write + Seek> {
     fs: &'r BareExFat<T>,
     start_offset: u64,
@@ -83,7 +39,6 @@ impl<'r, T: Read + Write + Seek> Read for BareFileReader<'r, T> {
         Ok(to_read)
     }
 }
-
 
 impl<T: Read + Write + Seek> UsbReader for BareExFat<T> {
     type FileReader<'r> = BareFileReader<'r, T> where Self: 'r;
@@ -108,9 +63,10 @@ impl<T: Read + Write + Seek> UsbReader for BareExFat<T> {
             position: 0,
         })
     }
-
 }
 
+
+// -- Verification Logic
 
 pub fn verify<R: ImageReader, U: UsbReader>(
     iso_reader: &R,
@@ -119,7 +75,7 @@ pub fn verify<R: ImageReader, U: UsbReader>(
     tx: &mpsc::SyncSender<EventMsg>,
     verified: &mut u64,
     total_size: u64,
-    skip_bootloader: bool, 
+    use_sprout_bootloader: bool, 
 ) -> Result<(), String> {
     let entries = iso_reader.list_dir(current_path)?;
 
@@ -129,20 +85,20 @@ pub fn verify<R: ImageReader, U: UsbReader>(
         
         let new_path = if current_path.is_empty() { format!("/{}", clean_name) } else { format!("{}/{}", current_path, clean_name) };
 
-        if skip_bootloader && current_path.is_empty() && clean_name.eq_ignore_ascii_case("EFI")  {
+        if use_sprout_bootloader && current_path.is_empty() && clean_name.eq_ignore_ascii_case("EFI")  {
             *verified += entry.size;
             let _ = tx.send(EventMsg::progress(*verified, total_size));
             continue;
         }
 
         if entry.is_dir {
-            verify(iso_reader, usb_reader, &new_path, tx, verified, total_size, skip_bootloader)?;
+            verify(iso_reader, usb_reader, &new_path, tx, verified, total_size, use_sprout_bootloader)?;
         } else {
             let clean_lower = clean_name.to_lowercase();
             let mut skip_verify = matches!(clean_lower.as_str(), "sprout.toml" | "autounattend.xml" | "autorun.inf");
             
             // If we injected Sprout, skip verifying the EFI boot files
-            if skip_bootloader && matches!(clean_lower.as_str(), "bootx64.efi" | "bootaa64.efi") {
+            if use_sprout_bootloader && matches!(clean_lower.as_str(), "bootx64.efi" | "bootaa64.efi") {
                 skip_verify = true;
             }
 

@@ -16,6 +16,7 @@ mod bootloader;
 mod sbsign;
 mod exfat;
 mod fat32;
+mod ext4;
 mod gpt;
 
 

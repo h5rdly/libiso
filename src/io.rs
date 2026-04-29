@@ -103,34 +103,63 @@ pub mod sys {
 }
 
 
+
 #[cfg(windows)]
 pub mod sys {
+    
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::os::raw::c_void;
 
     // Minimal Win32 FFI Definitions
-    type HANDLE = *mut c_void;
-    type DWORD = u32;
-    type BOOL = i32;
-    type LPCWSTR = *const u16;
-    type LPVOID = *mut c_void;
+    pub type HANDLE = *mut c_void;
+    pub type DWORD = u32;
+    pub type BOOL = i32;
+    pub type LPCWSTR = *const u16;
+    pub type LPVOID = *mut c_void;
 
-    const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
-    const GENERIC_READ: DWORD = 0x80000000;
-    const GENERIC_WRITE: DWORD = 0x40000000;
-    const FILE_SHARE_READ: DWORD = 0x00000001;
-    const FILE_SHARE_WRITE: DWORD = 0x00000002;
-    const OPEN_EXISTING: DWORD = 3;
+    pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+    pub const GENERIC_READ: DWORD = 0x80000000;
+    pub const GENERIC_WRITE: DWORD = 0x40000000;
+    pub const FILE_SHARE_READ: DWORD = 0x00000001;
+    pub const FILE_SHARE_WRITE: DWORD = 0x00000002;
+    pub const OPEN_EXISTING: DWORD = 3;
 
-    const FSCTL_LOCK_VOLUME: DWORD = 0x00090018;
-    const FSCTL_UNLOCK_VOLUME: DWORD = 0x0009001C;
-    const FSCTL_DISMOUNT_VOLUME: DWORD = 0x00090020;
+    pub const FSCTL_LOCK_VOLUME: DWORD = 0x00090018;
+    pub const FSCTL_UNLOCK_VOLUME: DWORD = 0x0009001C;
+    pub const FSCTL_DISMOUNT_VOLUME: DWORD = 0x00090020;
 
+    // --- Added for Physical Drive Polling ---
+    pub const IOCTL_STORAGE_QUERY_PROPERTY: DWORD = 0x002D1400;
+    pub const IOCTL_DISK_GET_LENGTH_INFO: DWORD = 0x0007405C;
+
+    #[repr(C)]
+    pub struct STORAGE_PROPERTY_QUERY {
+        pub PropertyId: u32,
+        pub QueryType: u32,
+        pub AdditionalParameters: [u8; 1],
+    }
+
+    #[repr(C)]
+    pub struct STORAGE_DEVICE_DESCRIPTOR {
+        pub Version: u32,
+        pub Size: u32,
+        pub DeviceType: u8,
+        pub DeviceTypeModifier: u8,
+        pub RemovableMedia: u8,
+        pub CommandQueueing: u8,
+        pub VendorIdOffset: u32,
+        pub ProductIdOffset: u32,
+        pub ProductRevisionOffset: u32,
+        pub SerialNumberOffset: u32,
+        pub BusType: u32,
+        pub RawPropertiesLength: u32,
+        pub RawDeviceProperties: [u8; 1],
+    }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn CreateFileW(
+        pub fn CreateFileW(
             lpFileName: LPCWSTR,
             dwDesiredAccess: DWORD,
             dwShareMode: DWORD,
@@ -140,7 +169,7 @@ pub mod sys {
             hTemplateFile: HANDLE,
         ) -> HANDLE;
 
-        fn DeviceIoControl(
+        pub fn DeviceIoControl(
             hDevice: HANDLE,
             dwIoControlCode: DWORD,
             lpInBuffer: LPVOID,
@@ -151,9 +180,9 @@ pub mod sys {
             lpOverlapped: LPVOID,
         ) -> BOOL;
 
-        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        pub fn CloseHandle(hObject: HANDLE) -> BOOL;
     }
-    // -------------------------------------
+
 
     pub struct DriveLocker {
         // 'None' if it's just a file.
@@ -254,6 +283,7 @@ pub mod sys {
         }
     }
 }
+
 
 
 // -- Helper IO functions

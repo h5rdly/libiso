@@ -9,25 +9,23 @@ name = "_libiso"
 crate-type = ["cdylib"]
 
 
-[target.'cfg(target_os = "linux")'.dependencies]
-drives = "0.6.1"   # Get drive data directly from
-
 [dependencies]
-sysinfo = "0.38.4"
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+
+bytemuck = "1.25"
+rand = "0.10.1"    # For UUIDs and rsa for sbsign
 
 hadris-iso = "1.1.2"
-bytemuck = "1.25"
-fatfs = { features = ["lfn", "std", "alloc"], git = "https://github.com/rafalh/rust-fatfs.git"}
-arcbox-ext4 = "0.1.2"   # https://github.com/arcboxlabs/ext4-rs
 
+# See if these need removing
 temp-file = "=0.1.4"
-log = "0.4.1"
+log = "0.4.29"
 
+# Examining Windows installer signatures
 pelite = "0.10.0"
 cms = { version = "0.3.0-pre.2" }
 der = { version = "0.8", features = ["alloc", "derive"] } 
-
-sha1 = "0.11"
+sha1 = "0.11"  
 sha2 = "0.11"
 
 # sbsign specific
@@ -35,17 +33,13 @@ spki = "0.8.0"
 x509-cert = { version = " 0.3.0-rc.4", features = ["pem", "builder"] }
 signature = "3.0.0-rc.10"
 rsa = { version = "0.10.0-rc.17", features = ["sha2"] }
-rand = "0.10.1"
-
-pyo3 = { version = "0.28.3", features = ["extension-module"] }
-
 
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort" 
+# panic = "abort" 
 strip = true 
 
 [profile.release-local]   # maturin develop --profile release-local  
