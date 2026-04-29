@@ -327,7 +327,8 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
             signature_size = sb_status.signature_size;
 
             let root = iso.root_dir();
-            scan_directory(&iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, &mut is_windows_11, &mut install_image_type, &mut is_unpatchable_linux);
+            scan_directory(&iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, 
+            &mut is_windows_11, &mut install_image_type, &mut is_unpatchable_linux);
         }
     }
 
@@ -344,5 +345,6 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
         })
     } else { None };
 
-    Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, is_unpatchable_linux, boot_info, windows_info })
+    Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, 
+        is_unpatchable_linux, boot_info, windows_info })
 }

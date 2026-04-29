@@ -13,76 +13,13 @@ use pyo3::{prelude::*, types::PyDict, exceptions::PyRuntimeError,};
 
 use crate::io::{AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread};
 use crate::{fat32, verify, bootloader, udf, exfat, gpt, esd, ext4};
+use crate::events::{EventMsg, ProgressStream, AbortToken};
 
 
 pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
 
 
-#[pyclass(skip_from_py_object)]
-#[derive(Clone)]
-pub struct AbortToken {
-    pub(crate) flag: Arc<AtomicBool>,
-}
-
-#[pymethods]
-impl AbortToken {
-    #[new]
-    pub fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)) }
-    }
-    pub fn abort(&self) {
-        self.flag.store(true, Ordering::Relaxed);
-    }
-}
-
-#[pyclass(skip_from_py_object)]
-#[derive(Clone)]
-pub struct EventMsg {
-    #[pyo3(get)]
-    pub msg_type: String,
-    #[pyo3(get)]
-    pub written: u64,
-    #[pyo3(get)]
-    pub total: u64,
-    #[pyo3(get)]
-    pub text: String,
-}
-
-impl EventMsg {
-    pub fn progress(written: u64, total: u64) -> Self {
-        Self { msg_type: "PROGRESS".to_string(), written, total, text: String::new() }
-    }
-    pub fn phase(text: &str) -> Self {
-        Self { msg_type: "PHASE".to_string(), written: 0, total: 0, text: text.to_string() }
-    }
-    pub fn log(text: &str) -> Self {
-        Self { msg_type: "LOG".to_string(), written: 0, total: 0, text: text.to_string() }
-    }
-    pub fn done(text: &str) -> Self {
-        Self { msg_type: "DONE".to_string(), written: 0, total: 0, text: text.to_string() }
-    }
-    pub fn error(text: &str) -> Self {
-        Self { msg_type: "ERROR".to_string(), written: 0, total: 0, text: text.to_string() }
-    }
-}
-
-#[pyclass]
-pub struct ProgressStream {
-    pub(crate) rx: Mutex<mpsc::Receiver<EventMsg>>,
-}
-
-#[pymethods]
-impl ProgressStream {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
-
-    fn __next__(&self, py: Python) -> PyResult<Option<EventMsg>> {
-        match py.detach(|| self.rx.lock().unwrap().recv()) {
-            Ok(msg) => Ok(Some(msg)),
-            Err(_) => Ok(None), 
-        }
-    }
-}
 
 pub struct PartitionWrapper<T: Read + Write + Seek> {
     pub inner: T,
@@ -137,7 +74,8 @@ pub fn get_clean_filename(entry: &DirEntry) -> String {
     name
 }
 
-// Cleanly resolves internal ISO symlinks like "../../boot/grub/grubx64.efi"
+
+// resolve internal ISO symlinks like "../../boot/grub/grubx64.efi"
 pub fn resolve_iso_path(base_dir: &str, relative: &str) -> String {
 
     let mut parts: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
@@ -520,7 +458,7 @@ pub trait UsbWriter {
 }
 
 
-// --- ISO9660 READER ---
+// -- ISO9660 reader
 pub struct IsoReader<'a> { pub iso: &'a IsoImage<File> }
 impl<'a> IsoReader<'a> {
     fn resolve_dir(&self, path: &str) -> Result<DirectoryRef, String> {
@@ -565,7 +503,7 @@ impl<'a> ImageReader for IsoReader<'a> {
             let mut size = entry.total_size() as u64;
             let mut symlink_target = None;
 
-            // RRIP Magic: Dynamically intercept the symlink target and calculate the real file's size!
+            // RRIP - intercept the symlink target and calculate the real file's size
             if let Some(rrip) = &entry.rrip {
                 if let Some(target) = &rrip.symlink_target {
                     let resolved_path = resolve_iso_path(path, target);
@@ -601,7 +539,7 @@ impl<'a> ImageReader for IsoReader<'a> {
 }
 
 
-// --- UDF READER ---
+// -- UDF READER 
 pub struct UdfReader<'a> { pub file: RefCell<&'a mut File>, pub ctx: &'a udf::UdfContext }
 impl<'a> ImageReader for UdfReader<'a> {
     fn list_dir(&self, path: &str) -> Result<Vec<ImageNode>, String> {
@@ -801,11 +739,6 @@ fn run_burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
     let _ = tx.send(EventMsg::done(msg));
 }
 
-
-
-// -- FAT32 WRITER 
-
-// moved to fat32.rs, consider refactoring traits
 
 
 #[allow(clippy::too_many_arguments)]

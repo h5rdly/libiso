@@ -325,37 +325,36 @@ pub fn sign_efi_binary(pe_bytes: &[u8], priv_key_pem: &str, cert_pem: &str) -> P
 pub fn generate_secure_boot_keys(common_name: &str) -> PyResult<(String, String)> {
     let mut rng = rand::rng(); 
     
-    // 1. Generate RSA 2048 Key
+    // - Generate RSA 2048 Key
     let priv_key = RsaPrivateKey::new(&mut rng, 2048).map_err(|e| {
         PyRuntimeError::new_err(format!("RSA key generation failed: {}", e))
     })?;
     let pub_key = rsa::RsaPublicKey::from(&priv_key);
 
-    // 2. Build the Subject Name (Required for the Profile)
+    // - Build the Subject Name (Required for the Profile)
     let name_str = format!("CN={}", common_name);
     let name = Name::from_str(&name_str).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to parse distinguished name: {}", e))
     })?;
 
-    // 3. Create a CAB Forum compliant Root Profile
-    // The source shows cabf::Root::new(emits_ocsp_response, subject)
+    // - Create a CAB Forum compliant Root Profile
     let profile = cabf::Root::new(false, name).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to create cert profile: {}", e))
     })?;
 
-    // 4. Setup Serial Number and Validity
+    // - Setup Serial Number and Validity
     let serial_number = SerialNumber::from(1u32);
     let now = SystemTime::now();
     let not_before = UtcTime::from_system_time(now).unwrap();
     let not_after = UtcTime::from_system_time(now + Duration::from_secs(3650 * 24 * 60 * 60)).unwrap();
     let validity = Validity::new(Time::UtcTime(not_before), Time::UtcTime(not_after));
 
-    // 5. Get SubjectPublicKeyInfo
+    // - Get SubjectPublicKeyInfo
     let spki = spki::SubjectPublicKeyInfoOwned::from_key(&pub_key).map_err(|e| {
         PyRuntimeError::new_err(format!("SPKI creation failed: {}", e))
     })?;
 
-    // 6. Initialize Builder and Sign
+    // - Initialize Builder and Sign
     let signer = SigningKey::<Sha256>::new(priv_key.clone());
     
     let builder = CertificateBuilder::new(
@@ -365,13 +364,13 @@ pub fn generate_secure_boot_keys(common_name: &str) -> PyResult<(String, String)
         spki,
     ).map_err(|e| PyRuntimeError::new_err(format!("Builder init failed: {}", e)))?;
 
-    // IMPORTANT: In your source, the build method is part of the Builder trait.
-    // It requires the signer AND the signature type (for RSA, it's usually just inferred)
+    // the build method is part of the Builder trait.
+    // requires the signer and the signature type (for RSA, it's usually just inferred)
     let cert = builder.build(&signer).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to build/sign certificate: {}", e))
     })?;
 
-    // 7. Serialize to PEM strings
+    // - Serialize to PEM strings
     let priv_key_pem = priv_key.to_pkcs8_pem(LineEnding::LF).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to encode private key PEM: {}", e))
     })?.to_string();

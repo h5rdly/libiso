@@ -6,7 +6,8 @@ use std::{
 
 use pyo3::prelude::*;
 
-use crate::writer::{ImageReader, EventMsg, ProgressStream, ISO_CHUNK_SIZE, DD_CHUNK_SIZE};
+use crate::events::{EventMsg, ProgressStream,};
+use crate::writer::{ImageReader, ISO_CHUNK_SIZE, DD_CHUNK_SIZE};
 use crate::io::{AlignedBuffer};
 use crate::exfat::BareExFat;
 

@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::fs;
-use std::path::Path;
+
 
 
 #[pyclass(skip_from_py_object)]
@@ -52,6 +51,9 @@ impl DriveInfo {
 #[cfg(target_os = "linux")]
 #[pyfunction]
 pub fn list_removable_drives() -> Vec<DriveInfo> {
+
+    use std::{fs, path::Path};
+
     let mut available_drives = Vec::new();
     let block_dir = Path::new("/sys/block");
     
@@ -242,4 +244,86 @@ pub fn list_removable_drives() -> Vec<DriveInfo> {
     }
 
     drives
+}
+
+
+// -- FreeBSD
+#[cfg(target_os = "freebsd")]
+#[pyfunction]
+pub fn list_removable_drives() -> Vec<DriveInfo> {
+    use std::fs;
+    use std::path::Path;
+
+    let mut available_drives = Vec::new();
+    let dev_dir = Path::new("/dev");
+
+    if let Ok(entries) = fs::read_dir(dev_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().into_string().unwrap_or_default();
+
+            // FreeBSD identifies USB mass storage and SCSI devices as Direct Access (da)
+            // We want pure drives (da0, da1), ignoring partitions (da0p1, da0s1)
+            if name.starts_with("da") && name.chars().skip(2).all(|c| c.is_ascii_digit()) {
+                let device_path = format!("/dev/{}", name);
+
+                // Use FreeBSD's `diskinfo` to grab the capacity
+                let size_bytes = if let Ok(out) = std::process::Command::new("diskinfo")
+                    .arg(&device_path)
+                    .output()
+                {
+                    let out_str = String::from_utf8_lossy(&out.stdout);
+                    // diskinfo output format:
+                    // /dev/da0   512   15502147584   30277632   0   0   0   0
+                    // The 3rd column is total bytes.
+                    out_str.split_whitespace().nth(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+                } else {
+                    0
+                };
+
+                // Use camcontrol to fetch the hardware model
+                let hardware_model = if let Ok(out) = std::process::Command::new("camcontrol")
+                    .args(&["inq", &name])
+                    .output()
+                {
+                    let out_str = String::from_utf8_lossy(&out.stdout);
+                    // Usually looks like "pass2: <SanDisk Cruzer Glide 1.00> Removable Direct Access..."
+                    if let Some(start) = out_str.find('<') {
+                        if let Some(end) = out_str[start..].find('>') {
+                            out_str[start + 1..start + end].trim().to_string()
+                        } else {
+                            "FreeBSD USB Drive".to_string()
+                        }
+                    } else {
+                        "FreeBSD USB Drive".to_string()
+                    }
+                } else {
+                    "FreeBSD USB Drive".to_string()
+                };
+
+                if size_bytes > 0 {
+                    available_drives.push(DriveInfo {
+                        display_name: format!("{} ({})", hardware_model, device_path),
+                        device_path,
+                        total_space_bytes: size_bytes,
+                        label: None,
+                        hardware_model,
+                    });
+                }
+            }
+        }
+    }
+    available_drives
+}
+
+
+// Placeholder for OpenBSD / NetBSD to pass CI
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd"
+)))]
+#[pyfunction]
+pub fn list_removable_drives() -> Vec<DriveInfo> {
+    Vec::new()
 }

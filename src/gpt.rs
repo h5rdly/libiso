@@ -2,7 +2,7 @@ use std::io::{Write, Seek, SeekFrom};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 
-// ── MINIMAL SOFTWARE CRC32 (ISO-HDLC) ──
+// Minimal ISO-HDLC  CRC32
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFFFFFFu32;
     for &b in data {
@@ -16,7 +16,6 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 
-// ── UUID GENERATOR ──
 pub fn pseudo_uuid() -> [u8; 16] {
 
     let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -33,7 +32,7 @@ pub fn pseudo_uuid() -> [u8; 16] {
 }
 
 
-// ── BARE METAL PARTITIONER ──
+// ── GPT partitioner
 
 pub fn write_partition_table<T: Write + Seek>(
     drive: &mut T,

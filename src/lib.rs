@@ -18,18 +18,20 @@ mod exfat;
 mod fat32;
 mod ext4;
 mod gpt;
-
+mod events;
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};
 use test_utils::{
     create_mock_iso, FakeDrive, test_verify_fake_drive_sync, create_mock_esd, hash_sha256
 };
+use events::{EventMsg, ProgressStream, AbortToken};
 use writer::{
     write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition, extract_image,
-    AbortToken, EventMsg, ProgressStream, get_wim_info_from_iso
+    get_wim_info_from_iso
 };
 use verify::{destructive_verify_usb_size};
+
 
 
 #[pymodule]
