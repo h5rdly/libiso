@@ -1,4 +1,4 @@
-import os, sys, time, threading
+import os, sys, time, traceback, threading
 
 import dearpygui.dearpygui as dpg
 
@@ -275,7 +275,7 @@ def burn_worker():
     dpg.configure_item('btn_cancel', show=True)
     dpg.configure_item('advanced_options_group', show=False)
     dpg.set_value('progress_bar', 0.0)
-    dpg.configure_item('progress_bar', overlay='')
+    # dpg.configure_item('progress_bar', overlay='')
     dpg.set_value('log_console', '--- STARTING BURN PROCESS ---\n')
     
     # Extract the raw device path from the dropdown string (e.g., '/dev/sda')
@@ -355,7 +355,7 @@ def burn_worker():
                     
                     # Update bar value and the text overlay
                     dpg.set_value('progress_bar', progress)
-                    dpg.configure_item('progress_bar', overlay=overlay_text)
+                    dpg.set_value('progress_text', overlay_text)
                     
                     last_ui_update = current_time
                     
@@ -387,21 +387,19 @@ def burn_worker():
                 break
 
     except Exception as e:
+        error_trace = traceback.format_exc() # Captures the exact line number!
+        print(error_trace) # Prints to your terminal
+
         dpg.set_value('status_text', 'Exception caught')
         log_current = dpg.get_value('log_console')
-        dpg.set_value('log_console', log_current + f'\n[!] EXCEPTION: {str(e)}')
+        dpg.set_value('log_console', log_current + f'\n[!] EXCEPTION: {str(error_trace)}')
         
     cleanup_ui()
 
 
-
-## -- DPG Layout 
-
-
-dpg.create_context()
-
-# -   Fonts 
+# --   Fonts 
 # must be loaded before the UI is built 
+
 if os.name == 'nt':
     font_path = 'C:/Windows/Fonts/segoeui.ttf'
 else:
@@ -416,200 +414,213 @@ else:
 current_dir = __file__.replace('\\', '/').rsplit('/', 1)[0] + os.sep
 font_path = current_dir + 'HackNerdFontPropo-Regular.ttf'
 
-with dpg.font_registry():
-    if os.path.exists(font_path):
-        main_font = dpg.add_font(font_path, current_font_size)
-        # dpg.add_font_range(0xf000, 0xf3ff)  # unicode emoji support
-        title_font = dpg.add_font(font_path, current_title_size)
-
-        dpg.bind_font(main_font)
-    else:
-        print('Warning: Could not find a TTF system font. Falling back to default.')
 
 
-# -  Themes 
+## -- DPG Layout 
 
-# Blue theme for buttons and headers
-with dpg.theme(tag='blue_ui_theme'):
-    with dpg.theme_component(dpg.mvAll): 
-        dpg.add_theme_color(dpg.mvThemeCol_Button, (41, 128, 185, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (52, 152, 219, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (31, 97, 141, 255))
+def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
+
+    dpg.create_context()
+
+    with dpg.font_registry():
+        if os.path.exists(font_path):
+            main_font = dpg.add_font(font_path, current_font_size)
+            # dpg.add_font_range(0xf000, 0xf3ff)  # unicode emoji support
+            title_font = dpg.add_font(font_path, current_title_size)
+
+            dpg.bind_font(main_font)
+        else:
+            print('Warning: Could not find a TTF system font. Falling back to default.')
+
+    # -  Themes 
+
+    # Blue theme for buttons and headers
+    with dpg.theme(tag='blue_ui_theme'):
+        with dpg.theme_component(dpg.mvAll): 
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (41, 128, 185, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (52, 152, 219, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (31, 97, 141, 255))
+            
+            dpg.add_theme_color(dpg.mvThemeCol_Header, (41, 128, 185, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (52, 152, 219, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (31, 97, 141, 255))
+
+    # Global Theme
+    with dpg.theme() as global_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 6)
+
+        with dpg.theme_component(dpg.mvButton):
+            # 0 extra horizontal padding, and 10 pixels of vertical padding for buttons
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 10)
         
-        dpg.add_theme_color(dpg.mvThemeCol_Header, (41, 128, 185, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (52, 152, 219, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (31, 97, 141, 255))
+        with dpg.theme_component(dpg.mvCheckbox):
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (70, 70, 70, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (41, 128, 185, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (255, 255, 255, 255))
+            
+    dpg.bind_theme(global_theme)
 
-# Global Theme
-with dpg.theme() as global_theme:
-    with dpg.theme_component(dpg.mvAll):
-        dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
-        dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 6)
 
-    with dpg.theme_component(dpg.mvButton):
-        # 0 extra horizontal padding, and 10 pixels of vertical padding for buttons
-        dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 10)
-    
-    with dpg.theme_component(dpg.mvCheckbox):
-        dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (70, 70, 70, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (41, 128, 185, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (255, 255, 255, 255))
+    # --  Build the UI 
+    with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True, no_title_bar=True):
         
-dpg.bind_theme(global_theme)
-
-
-# --  Build the UI 
-with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True, no_title_bar=True):
-    
-    # dpg.add_separator()
-    dpg.add_spacer(height=10)
-    
-    # Admin Warning
-    if not state['admin']:
-        dpg.add_text('libiso needs to run as Administrator/Root to access to USB devices', color=(255, 100, 100))
-        dpg.add_separator()
-
-    dpg.add_text('Drive Properties')
-    dpg.add_combo(tag='drive_combo', items=[], width=-1)
-    
-    # ISO Selection
-    dpg.add_spacer(height=50)
-    dpg.add_text('ISO Selection')
-    
-    with dpg.item_handler_registry(tag='iso_click_handler'): # listen for a Left-Click to open the hidden file dialog
-        dpg.add_item_clicked_handler(button=dpg.mvMouseButton_Left, callback=lambda: dpg.show_item('file_dialog'))
-    dpg.add_input_text(tag='iso_text', readonly=True, default_value='Click to select ISO...', width=-1)
-    
-    dpg.bind_item_handler_registry('iso_text', 'iso_click_handler')
-    with dpg.tooltip('iso_text'):
-        dpg.add_text('Click to load an ISO')
-
-    dpg.add_spacer(height=30)
-                
-    # ISO Info Panel (Hidden until an ISO is loaded)
-    with dpg.group(tag='iso_info_group', show=False):
+        # dpg.add_separator()
         dpg.add_spacer(height=10)
-        with dpg.group(horizontal=True):
-            dpg.add_text('Detected OS:', color=(52, 152, 219, 255))
-            dpg.add_text('...', tag='iso_info_os_name')
-        with dpg.group(horizontal=True):
-            dpg.add_text('Properties: ', color=(52, 152, 219, 255))
-            dpg.add_text('...', tag='iso_info_details')
+        
+        # Admin Warning
+        if not state['admin']:
+            dpg.add_text('libiso needs to run as Administrator/Root to access to USB devices', color=(255, 100, 100))
+            dpg.add_separator()
+
+        dpg.add_text('Drive Properties')
+        dpg.add_combo(tag='drive_combo', items=[], width=-1)
+        
+        # ISO Selection
+        dpg.add_spacer(height=50)
+        dpg.add_text('ISO Selection')
+        
+        with dpg.item_handler_registry(tag='iso_click_handler'): # listen for a Left-Click to open the hidden file dialog
+            dpg.add_item_clicked_handler(button=dpg.mvMouseButton_Left, callback=lambda: dpg.show_item('file_dialog'))
+        dpg.add_input_text(tag='iso_text', readonly=True, default_value='Click to select ISO...', width=-1)
+        
+        dpg.bind_item_handler_registry('iso_text', 'iso_click_handler')
+        with dpg.tooltip('iso_text'):
+            dpg.add_text('Click to load an ISO')
+
         dpg.add_spacer(height=30)
+                    
+        # ISO Info Panel (Hidden until an ISO is loaded)
+        with dpg.group(tag='iso_info_group', show=False):
+            dpg.add_spacer(height=10)
+            with dpg.group(horizontal=True):
+                dpg.add_text('Detected OS:', color=(52, 152, 219, 255))
+                dpg.add_text('...', tag='iso_info_os_name')
+            with dpg.group(horizontal=True):
+                dpg.add_text('Properties: ', color=(52, 152, 219, 255))
+                dpg.add_text('...', tag='iso_info_details')
+            dpg.add_spacer(height=30)
 
-    
-    # Advanced Options
-    with dpg.group(tag='advanced_options_group'):
-
-        dpg.add_spacer(height=5)
-        dpg.add_separator()
-        dpg.add_spacer(height=10)
-
-        dpg.add_checkbox(label='Verify written data', tag='chk_verify', default_value=True)
-        dpg.add_spacer(height=10)
-
-        with dpg.group(tag='grp_dd'):
-            dpg.add_checkbox(label='Force DD (Raw Image) mode', tag='chk_dd', callback=dd_toggled_cb)
         
-        with dpg.group(tag='grp_uefi'):
-            dpg.add_checkbox(label='Use original UEFI bootloader (For ISO mode)', tag='chk_original_uefi', callback=uefi_toggled_cb)
+        # Advanced Options
+        with dpg.group(tag='advanced_options_group'):
+
             dpg.add_spacer(height=5)
+            dpg.add_separator()
+            dpg.add_spacer(height=10)
+
+            dpg.add_checkbox(label='Verify written data', tag='chk_verify', default_value=True)
+            dpg.add_spacer(height=10)
+
+            with dpg.group(tag='grp_dd'):
+                dpg.add_checkbox(label='Force DD (Raw Image) mode', tag='chk_dd', callback=dd_toggled_cb)
+            
+            with dpg.group(tag='grp_uefi'):
+                dpg.add_checkbox(label='Use original UEFI bootloader (For ISO mode)', tag='chk_original_uefi', callback=uefi_toggled_cb)
+                dpg.add_spacer(height=5)
+
+            dpg.add_spacer(height=50)
+
+
+        # Status & Progress
+        dpg.add_text('Ready', tag='status_text')
+        bar_height = int(19 * scale_factor)
+        dpg.add_progress_bar(tag='progress_bar', default_value=0.0, width=-1, height=bar_height)
+        dpg.add_text('', tag='progress_text', color=(52, 152, 219, 255))
 
         dpg.add_spacer(height=50)
+        
+        # Buttons
+        with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False, borders_outerH=False, borders_outerV=False):
+            # Left spacer column - stretches to push the buttons right
+            # Right spacer column - stretches to push the buttons left
+            dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+            dpg.add_table_column(width_fixed=True, init_width_or_weight=200)
+            dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
 
-
-    # Status & Progress
-    dpg.add_text('Ready', tag='status_text')
-    bar_height = int(19 * scale_factor)
-    dpg.add_progress_bar(tag='progress_bar', default_value=0.0, width=-1, height=bar_height)
-    
-    dpg.add_spacer(height=50)
-    
-    # Buttons
-    with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False, borders_outerH=False, borders_outerV=False):
-        # Left spacer column - stretches to push the buttons right
-        # Right spacer column - stretches to push the buttons left
-        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
-        dpg.add_table_column(width_fixed=True, init_width_or_weight=200)
-        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
-
-        with dpg.table_row():
-            dpg.add_spacer() # Empty left cell
-            
-            # Put BOTH buttons in the center cell group
-            # When one hides and the other shows, they will both be centered
-            with dpg.group():
-                dpg.add_button(tag='btn_start', label='START', width=200, callback=start_burn_cb, enabled=state['admin'])
-                dpg.add_button(tag='btn_cancel', label='CANCEL', width=200, callback=cancel_cb, show=False)
+            with dpg.table_row():
+                dpg.add_spacer() # Empty left cell
                 
-            dpg.add_spacer() # Empty right cell
+                # Put BOTH buttons in the center cell group
+                # When one hides and the other shows, they will both be centered
+                with dpg.group():
+                    dpg.add_button(tag='btn_start', label='START', width=200, callback=start_burn_cb, enabled=state['admin'])
+                    dpg.add_button(tag='btn_cancel', label='CANCEL', width=200, callback=cancel_cb, show=False)
+                    
+                dpg.add_spacer() # Empty right cell
 
-    dpg.add_spacer(height=50)
-    
-    # Live Log Window
-    with dpg.child_window(tag='log_window', width=-1, height=-1):
-        dpg.add_text('', tag='log_console', wrap=0)
-    
-    dpg.add_spacer(height=10)
+        dpg.add_spacer(height=50)
+        
+        # Live Log Window
+        with dpg.child_window(tag='log_window', width=-1, height=-1):
+            dpg.add_text('', tag='log_console', wrap=0)
+        
+        dpg.add_spacer(height=10)
 
-    with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False, borders_outerH=False, borders_outerV=False):
-        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
-        dpg.add_table_column(width_fixed=True, init_width_or_weight=250)
-        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
-        with dpg.table_row():
-            dpg.add_spacer()
-            dpg.add_button(label='Copy', width=250, callback=lambda: dpg.set_clipboard_text(dpg.get_value('log_console')))
-            dpg.add_spacer()
+        with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False, borders_outerH=False, borders_outerV=False):
+            dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+            dpg.add_table_column(width_fixed=True, init_width_or_weight=250)
+            dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+            with dpg.table_row():
+                dpg.add_spacer()
+                dpg.add_button(label='Copy', width=250, callback=lambda: dpg.set_clipboard_text(dpg.get_value('log_console')))
+                dpg.add_spacer()
 
-# Hidden File Dialog
-dialog_width = int(700 * scale_factor)
-dialog_height = int(400 * scale_factor)
+    # Hidden File Dialog
+    dialog_width = int(700 * scale_factor)
+    dialog_height = int(400 * scale_factor)
 
-with dpg.file_dialog(directory_selector=False, show=False, tag='file_dialog', callback=file_selected_cb, width=dialog_width, height=dialog_height):
-    dpg.add_file_extension('ISO Files (*.iso){.iso}', color=(0, 255, 0, 255))
-    dpg.add_file_extension('.*')
+    with dpg.file_dialog(directory_selector=False, show=False, tag='file_dialog', callback=file_selected_cb, width=dialog_width, height=dialog_height):
+        dpg.add_file_extension('ISO Files (*.iso){.iso}', color=(0, 255, 0, 255))
+        dpg.add_file_extension('.*')
 
-# Start background poller
-threading.Thread(target=drive_poller, daemon=True).start()
+    # Start background poller
+    threading.Thread(target=drive_poller, daemon=True).start()
 
-# Register the global mouse wheel handler
-with dpg.handler_registry():
-    dpg.add_mouse_move_handler(callback=mouse_move_cb)
-    dpg.add_mouse_wheel_handler(callback=zoom_font_cb)
+    # Register the global mouse wheel handler
+    with dpg.handler_registry():
+        dpg.add_mouse_move_handler(callback=mouse_move_cb)
+        dpg.add_mouse_wheel_handler(callback=zoom_font_cb)
 
-# Scale the main window size 
-window_width = int(720 * scale_factor)
-window_height = int(600 * scale_factor)
+    # Scale the main window size 
+    window_width = int(720 * scale_factor)
+    window_height = int(600 * scale_factor)
 
-dpg.create_viewport(title='Sulfur USB burner', width=window_width, height=window_height, 
-    resizable=True)
+    dpg.create_viewport(title='Sulfur USB burner', width=window_width, height=window_height, 
+        resizable=True)
 
-icon_path = current_dir + 'libiso.png'
-if not os.path.exists(icon_path):
-    import tempfile
-    TRANSPARENT_PNG_B64 = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDATx\xdacd`\x00\x00\x00\x06\x00\x020\x81\xd0/\x00\x00\x00\x00IEND\xaeB`\x82'
-    fd, icon_path = tempfile.mkstemp(suffix='.png')
-    with os.fdopen(fd, 'wb') as f:
-        f.write(TRANSPARENT_PNG_B64)
-    
-dpg.set_viewport_small_icon(icon_path)
-dpg.set_viewport_large_icon(icon_path)
+    icon_path = current_dir + 'libiso.png'
+    if not os.path.exists(icon_path):
+        import tempfile
+        TRANSPARENT_PNG_B64 = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDATx\xdacd`\x00\x00\x00\x06\x00\x020\x81\xd0/\x00\x00\x00\x00IEND\xaeB`\x82'
+        fd, icon_path = tempfile.mkstemp(suffix='.png')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(TRANSPARENT_PNG_B64)
+        
+    dpg.set_viewport_small_icon(icon_path)
+    dpg.set_viewport_large_icon(icon_path)
 
-# Auto-load ISO from command line arguments
-if len(sys.argv) > 1:
-    cli_iso_path = sys.argv[1]
-    if os.path.exists(cli_iso_path):
-        state['iso_path'] = cli_iso_path
-        dpg.set_value('iso_text', cli_iso_path)
-        dpg.set_value('status_text', 'Inspecting ISO...')
-        on_iso_loaded(cli_iso_path)
-        dpg.set_value('status_text', 'Ready')
-    else:
-        print(f'Warning: CLI ISO path does not exist: {cli_iso_path}')
+    # Auto-load ISO from command line arguments
+    if iso_path:
+        if os.path.exists(iso_path):
+            state['iso_path'] = iso_path
+            dpg.set_value('iso_text', iso_path)
+            dpg.set_value('status_text', 'Inspecting ISO...')
+            on_iso_loaded(iso_path)
+            dpg.set_value('status_text', 'Ready')
+        else:
+            print(f'Warning: CLI ISO path does not exist: {iso_path}')
 
-dpg.setup_dearpygui()
-# dpg.show_font_manager()
-dpg.set_primary_window('main_window', True)
-dpg.show_viewport()
-dpg.start_dearpygui()
-dpg.destroy_context()
+    dpg.setup_dearpygui()
+    # dpg.show_font_manager()
+    dpg.set_primary_window('main_window', True)
+    dpg.show_viewport()
+    dpg.start_dearpygui()
+    dpg.destroy_context()
+
+
+if __name__ == '__main__':
+
+    iso_path = sys.argv[1] if len(sys.argv) > 1 else None
+    gui(iso_path)

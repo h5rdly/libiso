@@ -7,7 +7,7 @@ use std::{
 use pyo3::prelude::*;
 
 use crate::events::{EventMsg, ProgressStream,};
-use crate::writer::{ImageReader, ISO_CHUNK_SIZE, DD_CHUNK_SIZE};
+use crate::image_parser::{ImageReader, ISO_CHUNK_SIZE, DD_CHUNK_SIZE};
 use crate::io::{AlignedBuffer};
 use crate::exfat::BareExFat;
 
@@ -98,8 +98,7 @@ pub fn verify<R: ImageReader, U: UsbReader>(
             let clean_lower = clean_name.to_lowercase();
             
             // Skip injected files AND any config files we might have dynamically patched!
-            let mut skip_verify = matches!(
-                clean_lower.as_str(), 
+            let mut skip_verify = matches!(clean_lower.as_str(), 
                 "sprout.toml" | "autounattend.xml" | "autorun.inf"
             ) || clean_lower.ends_with(".cfg") || clean_lower.ends_with(".conf");
             

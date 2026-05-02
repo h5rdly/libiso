@@ -11,6 +11,12 @@ if sys.platform == 'win32':
 else:
     import termios, tty, select
 
+# `pip install dearpygui` to use Sulfur graphical interface
+try:
+    import sulfur
+except ImportError:
+    sulfur = None
+
 
 
 '''
@@ -323,23 +329,31 @@ def _progress_bar(written: int, total: int, prefix: str = 'Progress'):
 def write_image_iso(
     image_path: str,
     device_path: str,
-    has_large_file: bool,
-    usb_label: str,
-    partition_scheme: str = 'gpt',
-    uefi_ntfs_path: str = None,
+    stats=None,                 
+    partition_scheme: str = None, 
     persistence_size_mb: int = None,
     verify_written: bool = False,
     unattend_xml_payload: str = None,
     target_arch: str = None,
-    abort_token = None,
-    use_sprout_bootloader: bool = False  
+    abort_token = None
 ):
-    ''' To avoid using the tempfile crate, which pulls windows-sys, we use a Python wrapper 
-        and utilize it's built in tempfile
-    '''
+    ''' High-level Python wrapper that auto-configures the Rust burner based on ISO stats '''
+
+    # Auto-inspect if the caller didn't provide stats
+    if not stats:
+        stats = _libiso.inspect_image(image_path)
+
+    has_large_file = stats.has_large_file
+    if partition_scheme is None:
+        partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
+
+    uefi_ntfs_path = ensure_uefi_bridge() if has_large_file else None
+    usb_label = stats.volume_label[:11].replace(' ', '_').upper()
+    
+    kver = stats.linux_kernel_version
+    use_sprout_bootloader = bool(kver) or stats.is_unpatchable_linux
 
     ext4_temp_path = None
-    
     if persistence_size_mb:
         fd, ext4_temp_path = tempfile.mkstemp(suffix='.ext4')
         os.close(fd)
@@ -348,7 +362,8 @@ def write_image_iso(
         return _libiso.write_image_iso(
             image_path, device_path, has_large_file, usb_label, partition_scheme, 
             uefi_ntfs_path, persistence_size_mb, ext4_temp_path, verify_written, 
-            unattend_xml_payload, target_arch, abort_token, use_sprout_bootloader
+            unattend_xml_payload, target_arch, abort_token, use_sprout_bootloader,
+            kver
         )
     finally:
         if ext4_temp_path and os.path.exists(ext4_temp_path):
@@ -392,26 +407,13 @@ def burn_image(
         print(f'\n{phase} Complete!')
 
     if method == 'ISO':
-        print(f'Inspecting ISO: {image_path}')
-        stats = _libiso.inspect_image(image_path)
-        has_large_file = stats.has_large_file
-        
-        if partition_scheme is None:
-            # If we detect UEFI, use GPT. Otherwise, fallback to MBR.
-            # Using getattr is a safe way to check properties without crashing!
-            partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
-
-        uefi_path = ensure_uefi_bridge() if has_large_file else None
-
-        print(f'Starting ISO filesystem extraction ({partition_scheme.upper()}) to {device_path}...')       
+        print(f'Starting ISO filesystem extraction to {device_path}...')       
         stream = write_image_iso(
-            image_path, 
-            device_path, 
-            has_large_file,
-            iso_label,
-            partition_scheme, 
-            uefi_path, 
-            persistence_size_mb
+            image_path=image_path, 
+            device_path=device_path, 
+            partition_scheme=partition_scheme, 
+            persistence_size_mb=persistence_size_mb,
+            verify_written=verify_written
         )
 
     for event in stream:
@@ -590,24 +592,14 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
             stream = _libiso.write_image_dd(iso_path, device_path, verify)
         else:
             ui_queue.put(('PHASE', 'ISO Extraction'))
-            has_large_file = stats.has_large_file
-            partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
-            uefi_path = ensure_uefi_bridge() if has_large_file else None
-            
-            iso_label = extract_iso_label(iso_path)
-            short_usb_label = iso_label[:11].replace(' ', '_').upper()
-            
+        
             stream = write_image_iso(
                 image_path=iso_path, 
                 device_path=device_path, 
-                has_large_file=has_large_file, 
-                usb_label=short_usb_label,
-                partition_scheme=partition_scheme, 
-                uefi_ntfs_path=uefi_path, 
-                persistence_size_mb=None, 
+                stats=stats,          
                 verify_written=verify
             )
-        
+
         for event in stream:
             if event.msg_type == 'PROGRESS':
                 if event.written < highest_written:
@@ -773,6 +765,9 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='libiso - Cross-platform USB image flasher')
+    subparsers = parser.add_subparsers(dest='command')
+    parser_gui = subparsers.add_parser('sulfur', help = 'Launch Sulfur GUI if available')
+
     parser.add_argument('iso_path', type=str, help='Path to the source ISO file')
     parser.add_argument('--mode', type=str, choices=['iso', 'ISO', 'dd', 'DD'], default=None, help='Write method (ISO extraction or Raw DD)')
     # We use a custom flag for verify to support a tri-state (True, False, or None if omitted)
@@ -780,6 +775,12 @@ if __name__ == '__main__':
     parser.add_argument('--no-verify', dest='verify', action='store_false', help='Disable verification')
 
     args = parser.parse_args()
+
+    if args.command == 'sulfur':
+        if not sulfur:
+            print(f'Sulfur GUI dependency not available, try `pip install dearpgui`')
+            sys.exit()
+        sulfur.gui(args.iso_path, args.mode, args.verify)
 
     if not os.path.exists(args.iso_path):
         print(f'''Error: ISO file not found at '{args.iso_path}' ''')

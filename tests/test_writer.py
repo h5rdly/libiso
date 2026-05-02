@@ -104,7 +104,8 @@ class TestWriterIso(unittest.TestCase):
             self.assertEqual(len(dest_data), expected_size)
 
 
-    def test_iso_extraction_full_cycle(self):
+    @patch('libiso.ensure_uefi_bridge')
+    def test_iso_extraction_full_cycle(self, mock_uefi_bridge):
 
         print('\n--- Testing ISO Extraction (exFAT) ---')
         
@@ -113,25 +114,28 @@ class TestWriterIso(unittest.TestCase):
         uefi_fd.write(b'\x00' * (1024 * 1024)) # 1MB of zeros
         uefi_fd.close()
         uefi_path = uefi_fd.name
+        
+        # Intercept the download!
+        mock_uefi_bridge.return_value = uefi_path
+
+        stats = libiso.ImageStats(
+            has_large_file=True, 
+            boot_info=libiso.BootCapabilities(is_bootable=True, supports_uefi=True)
+        )
 
         stream = libiso.write_image_iso(
-            self.source_path, 
-            self.dest_path, 
-            True,  # has_large_file - Force exFAT
-            'TEST LABEL',
-            'GPT',
-            uefi_ntfs_path=uefi_path
+            image_path=self.source_path, 
+            device_path=self.dest_path, 
+            stats=stats,
+            partition_scheme='GPT'
         )
 
         for event in stream:
-
             if event.msg_type != 'PROGRESS':
                 continue
 
             # slow down the loop so the human eye can see it
-            # This triggers backpressure on the Rust thread
             time.sleep(10** -4) 
-            ratio = event.written / event.total
             ratio = event.written / event.total
             percent = (ratio) * 100 if event.total > 0 else 0
             bar = '█' * int(40 * ratio)
@@ -149,7 +153,9 @@ class TestWriterIso(unittest.TestCase):
             self.assertEqual(first_chunk[510:], b'\x55\xAA')
 
 
-    def test_strict_uefi_compliance_and_ascii_map(self):
+
+    @patch('libiso.ensure_uefi_bridge')
+    def test_strict_uefi_compliance_and_ascii_map(self, mock_uefi_bridge):
         
         print('\n--- Testing Strict UEFI/GPT Compliance & Generating ASCII Map ---')
         
@@ -158,16 +164,22 @@ class TestWriterIso(unittest.TestCase):
         uefi_fd.write(b'\x00' * (1024 * 1024))
         uefi_fd.close()
         uefi_path = uefi_fd.name
+        
+        # Intercept the download!
+        mock_uefi_bridge.return_value = uefi_path
+
+        stats = libiso.ImageStats(
+            has_large_file=True, 
+            boot_info=libiso.BootCapabilities(is_bootable=True, supports_uefi=True)
+        )
 
         try:
             # 1. Run the burn process to format the FakeDrive
             stream = libiso.write_image_iso(
-                self.source_path, 
-                self.dest_path, 
-                True,          # has_large_file
-                'LIBISO_USB',  # usb_label
-                'GPT',         # partition_scheme
-                uefi_ntfs_path=uefi_path
+                image_path=self.source_path, 
+                device_path=self.dest_path, 
+                stats=stats,
+                partition_scheme='GPT'
             )
             for _ in stream: pass
 
@@ -224,6 +236,7 @@ class TestWriterIso(unittest.TestCase):
         finally:
             if os.path.exists(uefi_path):
                 os.remove(uefi_path)
+
 
 
 if __name__ == '__main__':

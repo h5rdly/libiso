@@ -19,6 +19,9 @@ mod fat32;
 mod ext4;
 mod gpt;
 mod events;
+mod initramfs_patcher;
+mod kmod;
+
 
 use drives::{list_removable_drives, DriveInfo};
 use image_parser::{inspect_image, ImageStats, BootCapabilities, WindowsMetadata};
@@ -31,7 +34,7 @@ use writer::{
     get_wim_info_from_iso
 };
 use verify::{destructive_verify_usb_size};
-
+use initramfs_patcher::{patch_initramfs_py, extract_file_from_squashfs_py};
 
 
 #[pymodule]
@@ -69,6 +72,10 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sbsign::sign_efi_binary, m)?)?;
     m.add_function(wrap_pyfunction!(sbsign::generate_secure_boot_keys, m)?)?;
     
+    // Patching
+    m.add_function(wrap_pyfunction!(patch_initramfs_py, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_file_from_squashfs_py, m)?)?;
+
     // Windows .esd file parsing
     m.add_class::<esd::WimFileEntry>()?;
     m.add_class::<esd::EsdArchive>()?;

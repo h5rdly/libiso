@@ -1,7 +1,6 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::{fs::File, cell::RefCell, io::{Read, Seek, SeekFrom}};
 
-use hadris_iso::{sync::IsoImage, directory::DirectoryRef};
+use hadris_iso::{sync::IsoImage, read::DirEntry, directory::DirectoryRef};
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -9,6 +8,191 @@ use pyo3::types::PyDict;
 use crate::signature::{inspect_secure_boot, inspect_secure_boot_bytes};
 use crate::esd::{parse_wim_xml};
 use crate::udf;
+
+
+pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
+pub const DD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+
+pub struct ImageNode {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64, 
+    pub symlink_target: Option<String>,
+}
+
+pub trait ImageReader {
+    fn list_dir(&self, path: &str) -> Result<Vec<ImageNode>, String>;
+    fn stream_file(&self, path: &str, on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<(), String>;
+    fn get_file_location(&self, path: &str) -> Result<(u64, u64), String>;
+}
+
+
+pub fn get_clean_filename(entry: &DirEntry) -> String {
+    let mut name = if entry.record.is_joliet_name() {
+        entry.record.joliet_name()
+    } else {
+        entry.display_name().into_owned()
+    };
+    if let Some(pos) = name.rfind(';') { name.truncate(pos); }
+    name
+}
+
+
+pub fn resolve_iso_path(base_dir: &str, relative: &str) -> String {
+    let mut parts: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+    for part in relative.split('/').filter(|s| !s.is_empty()) {
+        if part == "." { continue; }
+        if part == ".." { parts.pop(); }
+        else { parts.push(part); }
+    }
+    parts.join("/")
+}
+
+
+
+// -- ISO9660 reader
+pub struct IsoReader<'a> { pub iso: &'a IsoImage<File> }
+impl<'a> IsoReader<'a> {
+    fn resolve_dir(&self, path: &str) -> Result<DirectoryRef, String> {
+        let mut curr = self.iso.root_dir().dir_ref();
+        for part in path.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
+            let mut found = None;
+            for entry in self.iso.open_dir(curr).entries().filter_map(Result::ok) {
+                if get_clean_filename(&entry).eq_ignore_ascii_case(part) && entry.is_directory() {
+                    found = entry.as_dir_ref(self.iso).ok();
+                    break;
+                }
+            }
+            curr = found.ok_or_else(|| format!("Dir not found: {}", part))?;
+        }
+        Ok(curr)
+    }
+
+    fn resolve_entry(&self, path: &str) -> Result<DirEntry, String> {
+        let parent_path = if let Some(idx) = path.rfind('/') { &path[..idx] } else { "" };
+        let file_name = if let Some(idx) = path.rfind('/') { &path[idx+1..] } else { path };
+        
+        let parent_ref = self.resolve_dir(parent_path)?;
+        for entry in self.iso.open_dir(parent_ref).entries().filter_map(Result::ok) {
+            if get_clean_filename(&entry).eq_ignore_ascii_case(file_name) {
+                return Ok(entry);
+            }
+        }
+        Err(format!("Entry not found: {}", file_name))
+    }
+}
+
+
+impl<'a> ImageReader for IsoReader<'a> {
+
+    fn list_dir(&self, path: &str) -> Result<Vec<ImageNode>, String> {
+
+        let dir_ref = self.resolve_dir(path)?;
+        let mut nodes = Vec::new();
+        for entry in self.iso.open_dir(dir_ref).entries().filter_map(Result::ok) {
+            let name = get_clean_filename(&entry);
+            if name == "\x00" || name == "\x01" || name == "." || name == ".." { continue; }
+            
+            let mut is_dir = entry.is_directory();
+            let mut size = entry.total_size() as u64;
+            let mut symlink_target = None;
+
+            // RRIP - intercept the symlink target and calculate the real file's size
+            if let Some(rrip) = &entry.rrip {
+                if let Some(target) = &rrip.symlink_target {
+                    let resolved_path = resolve_iso_path(path, target);
+                    if let Ok(target_entry) = self.resolve_entry(&resolved_path) {
+                        is_dir = target_entry.is_directory();
+                        size = target_entry.total_size() as u64;
+                        symlink_target = Some(resolved_path);
+                    }
+                }
+            }
+
+            nodes.push(ImageNode { name, is_dir, size, symlink_target });
+        }
+        Ok(nodes)
+    }
+
+
+    fn stream_file(&self, path: &str, on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
+        
+        let entry = self.resolve_entry(path)?;
+        let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
+        for extent in entry.extents() {
+            let mut extent_offset = 0u64;
+            let extent_len = extent.length as u64;
+            while extent_offset < extent_len {
+                let read_size = (extent_len - extent_offset).min(ISO_CHUNK_SIZE as u64) as usize;
+                let byte_offset = (extent.sector.0 as u64 * 2048) + extent_offset;
+                self.iso.read_bytes_at(byte_offset, &mut chunk_buf[..read_size]).map_err(|e| e.to_string())?;
+                on_chunk(&chunk_buf[..read_size])?;
+                extent_offset += read_size as u64;
+            }
+        }
+        Ok(())
+    }
+
+
+    fn get_file_location(&self, path: &str) -> Result<(u64, u64), String> {
+
+        let entry = self.resolve_entry(path)?;
+        let extent = entry.extents().next().ok_or("No data extents found")?;
+
+        // Convert LBA sector to physical byte offset (Sector * 2048)
+        let offset = extent.sector.0 as u64 * 2048;
+        let size = entry.total_size() as u64;
+
+        Ok((offset, size))
+    }
+
+}
+
+
+// -- UDF READER 
+pub struct UdfReader<'a> { pub file: RefCell<&'a mut File>, pub ctx: &'a udf::UdfContext }
+impl<'a> ImageReader for UdfReader<'a> {
+
+    fn list_dir(&self, path: &str) -> Result<Vec<ImageNode>, String> {
+
+        let mut f = self.file.borrow_mut();
+        let icb = if path.is_empty() || path == "/" {
+            self.ctx.root_icb
+        } else {
+            udf::find_udf_entry(&mut f, self.ctx.partition_start, &self.ctx.root_icb, path)
+                .ok_or_else(|| "UDF dir not found".to_string())?.icb
+        };
+        let mut nodes = Vec::new();
+        for e in udf::read_directory(&mut f, self.ctx.partition_start, &icb)? {
+            let name = e.name.split(';').next().unwrap_or(&e.name).to_string();
+            let size = if e.is_directory { 
+                0 
+            } else {
+                udf::get_file_size(&mut f, self.ctx.partition_start, &e.icb).unwrap_or(0)
+            };
+            
+            nodes.push(ImageNode { name, is_dir: e.is_directory, size, symlink_target: None });
+        }
+        Ok(nodes)
+    }
+
+    fn stream_file(&self, path: &str, on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
+        
+        let mut f = self.file.borrow_mut();
+        let entry = udf::find_udf_entry(&mut f, self.ctx.partition_start, &self.ctx.root_icb, path)
+            .ok_or_else(|| "UDF file not found".to_string())?;
+        let mut chunk_buf = vec![0u8; ISO_CHUNK_SIZE];
+        udf::stream_file_data(&mut f, self.ctx.partition_start, &entry, &mut chunk_buf, |c| on_chunk(c))
+    }
+
+    fn get_file_location(&self, path: &str) -> Result<(u64, u64), String> {
+        // We use the squashfs virtual bridge for funky Linux distros which use ISO9660
+        _ = path;
+        Err("Virtual Bridge requires ISO9660 structure. UDF fragmentation not supported.".to_string())
+    }
+}
+
 
 
 #[pyclass(from_py_object)]
@@ -77,6 +261,13 @@ pub struct ImageStats {
 
 #[pymethods]
 impl BootCapabilities {
+
+    #[new]
+    #[pyo3(signature = (is_bootable=false, supports_bios=false, supports_uefi=false, secure_boot_signed=false, is_microsoft_signed=false, is_revoked=false, signature_size=0))]
+    pub fn new(is_bootable: bool, supports_bios: bool, supports_uefi: bool, secure_boot_signed: bool, is_microsoft_signed: bool, is_revoked: bool, signature_size: usize) -> Self {
+        Self { is_bootable, supports_bios, supports_uefi, secure_boot_signed, is_microsoft_signed, is_revoked, signature_size }
+    }
+
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("is_bootable", self.is_bootable)?;
@@ -92,6 +283,13 @@ impl BootCapabilities {
 
 #[pymethods]
 impl WindowsMetadata {
+    
+    #[new]
+    #[pyo3(signature = (is_windows=false, is_windows_11=false, install_image_type=String::new(), supports_wintogo=false, architecture=String::new(), editions=Vec::new()))]
+    pub fn new(is_windows: bool, is_windows_11: bool, install_image_type: String, supports_wintogo: bool, architecture: String, editions: Vec<String>) -> Self {
+        Self { is_windows, is_windows_11, install_image_type, supports_wintogo, architecture, editions }
+    }
+
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("is_windows", self.is_windows)?;
@@ -104,8 +302,22 @@ impl WindowsMetadata {
     }
 }
 
+
 #[pymethods]
 impl ImageStats {
+
+    #[new]
+    #[pyo3(signature = (file_path=String::new(), size_bytes=0, volume_label=String::from("TEST_LABEL"), is_isohybrid=false, has_large_file=false, is_unpatchable_linux=false, linux_kernel_version=None, boot_info=None, windows_info=None))]
+    pub fn new(
+        file_path: String, size_bytes: u64, volume_label: String, is_isohybrid: bool, 
+        has_large_file: bool, is_unpatchable_linux: bool, linux_kernel_version: Option<String>, 
+        boot_info: Option<BootCapabilities>, windows_info: Option<WindowsMetadata>
+    ) -> Self {
+        // If Python doesn't provide boot_info, generate a default one
+        let boot = boot_info.unwrap_or_else(|| BootCapabilities::new(false, false, false, false, false, false, 0));
+        Self { file_path, size_bytes, volume_label, is_isohybrid, has_large_file, is_unpatchable_linux, linux_kernel_version, boot_info: boot, windows_info }
+    }
+
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("file_path", &self.file_path)?;
@@ -209,7 +421,11 @@ fn scan_directory(
 
         if let Some(pos) = name.rfind(';') { name.truncate(pos); }
         let file_name = name.to_uppercase();
-        if file_name.ends_with(".MISO") || file_name.contains("POP-OS") || file_name.contains("POP_OS") {
+        if file_name.ends_with(".MISO") || 
+           file_name.contains("POP-OS") || 
+           file_name.contains("POP_OS") 
+           
+        {
             *is_unpatchable_linux = true;
         }   
         if entry.is_directory() {
@@ -415,3 +631,4 @@ pub fn extract_bzimage_version(bzimage: &[u8]) -> Option<String> {
     
     if version_str.is_empty() { None } else { Some(version_str) }
 }
+

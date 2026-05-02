@@ -9,11 +9,11 @@ use crate::writer::UsbWriter;
 const SPROUT_X86_64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_x86_64.efi");
 const SPROUT_AARCH64: &[u8] = include_bytes!("../libiso/sprout_0-0-28_aarch64.efi");
 
-const LINUX_KERNEL_PREFIXES: &[&str] = &[
+pub const LINUX_KERNEL_PREFIXES: &[&str] = &[
     "vmlinuz", "bzimage", "image", "kernel", "kernel-"
     ];
-const LINUX_INITRAMFS_PREFIXES: &[&str] = &[
-    "initrd", "initramfs", "microcode", "ucode", "amd-ucode", "intel-ucode"
+pub const LINUX_INITRAMFS_PREFIXES: &[&str] = &[
+    "initrd", "initramfs", "microcode", "ucode", "amd-ucode", "intel-ucode", "liveinitrd",
 ];
 
 
@@ -77,19 +77,22 @@ pub fn detect_linux_payloads(
 pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
     let mut result = cfg.to_string();
     
-    // Patch kernel arguments (e.g., root=live:LABEL=Adelie-x86_64)
-    let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel="];
+    // Patch kernel arguments (e.g., root=live:UUID=... -> root=live:LABEL=NEW_LABEL)
+    let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "UUID=", "uuid="];
     for prefix in prefixes {
         let mut current = 0;
         while let Some(idx) = result[current..].find(prefix) {
-            let start = current + idx + prefix.len();
-            let end_offset = result[start..]
+            let start = current + idx; // Start BEFORE the prefix
+            let val_start = start + prefix.len();
+            let end_offset = result[val_start..]
                 .find(|c: char| c == ' ' || c == '"' || c == '\'' || c == '\n' || c == '\r')
-                .unwrap_or(result[start..].len());
-            let end = start + end_offset;
+                .unwrap_or(result[val_start..].len());
+            let end = val_start + end_offset;
             
-            result = format!("{}{}{}", &result[..start], new_label, &result[end..]);
-            current = start + new_label.len();
+            // Rip out the whole "PREFIX=OLD_VAL" and replace it with "LABEL=NEW_LABEL"
+            let replacement = format!("LABEL={}", new_label);
+            result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
+            current = start + replacement.len();
         }
     }
     
@@ -119,27 +122,47 @@ pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
 
 
 pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>, new_usb_label: &str) {
+    
     if found_args.is_some() {
         return; 
     }
 
+    // Pass 1: Collect GRUB variables (e.g., set boot_default='...')
+    let mut variables = std::collections::HashMap::new();
+    for line in config_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("set ") {
+            let expr = &trimmed[4..]; // strip "set "
+            if let Some(eq_idx) = expr.find('=') {
+                let key = expr[..eq_idx].trim();
+                let mut val = expr[eq_idx+1..].trim();
+                // Strip surrounding single or double quotes
+                if (val.starts_with('\'') && val.ends_with('\'')) || 
+                   (val.starts_with('"') && val.ends_with('"')) {
+                    val = &val[1..val.len()-1];
+                }
+                variables.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+
+    // Pass 2: Find and expand the boot arguments
     for line in config_content.lines() {
         let trimmed = line.trim();
         let mut extracted_args = String::new();
         
-        // Match GRUB style: "linux /casper/vmlinuz boot=casper quiet splash"
+        // Match GRUB style
         if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() > 2 {
-                // Skip the "linux" command and the "/path/to/kernel"
                 extracted_args = parts[2..].join(" ");
             }
         } 
-        // Match Syslinux style: "APPEND boot=casper initrd=/casper/initrd.lz quiet splash"
+        // Match Syslinux style
         else if trimmed.starts_with("APPEND ") || trimmed.starts_with("append ") {
             let parts: Vec<&str> = trimmed.split_whitespace()
-                .skip(1) // Skip the "APPEND" command
-                .filter(|p| !p.starts_with("initrd=")) // Strip out initrd mapping, Sprout handles this!
+                .skip(1)
+                .filter(|p| !p.starts_with("initrd="))
                 .collect();
                 
             if !parts.is_empty() {
@@ -147,30 +170,45 @@ pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>, n
             }
         }
 
-        // If we found arguments, aggressively patch the label for Sprout
+        // If we found arguments, process them!
         if !extracted_args.is_empty() {
-            let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel="];
+            // Expand the GRUB variables! (e.g., replace ${boot_default} with actual string)
+            for (key, val) in &variables {
+                // Handle ${var} syntax
+                extracted_args = extracted_args.replace(&format!("${{{}}}", key), val);
+                // Handle $var syntax
+                extracted_args = extracted_args.replace(&format!("${}", key), val);
+            }
+
+            // Patch the labels for Sprout
+            let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "UUID=", "uuid="];
             for prefix in prefixes {
                 let mut current = 0;
                 while let Some(idx) = extracted_args[current..].find(prefix) {
-                    let start = current + idx + prefix.len();
-                    // Find the end of the label string (space, quote, or end of line)
-                    let end_offset = extracted_args[start..]
-                        .find(|c: char| c == ' ' || c == '"' || c == '\'')
-                        .unwrap_or(extracted_args[start..].len());
-                    let end = start + end_offset;
+                    let start = current + idx;
+                    let val_start = start + prefix.len();
+                    let end_offset = extracted_args[val_start..]
+                        .find(|c: char| c == ' ' || c == '"' || c == '\'' || c == '\n' || c == '\r')
+                        .unwrap_or(extracted_args[val_start..].len());
+                    let end = val_start + end_offset;
                     
-                    // Replace whatever garbage label they had with our strict 11-char FAT32 label
-                    extracted_args = format!("{}{}{}", &extracted_args[..start], new_usb_label, &extracted_args[end..]);
-                    current = start + new_usb_label.len();
+                    let replacement = format!("LABEL={}", new_usb_label);
+                    extracted_args = format!("{}{}{}", &extracted_args[..start], replacement, &extracted_args[end..]);
+                    current = start + replacement.len();
                 }
             }
             
-            *found_args = Some(extracted_args);
+            // Clean up any double spaces caused by variable expansion
+            while extracted_args.contains("  ") {
+                extracted_args = extracted_args.replace("  ", " ");
+            }
+            
+            *found_args = Some(extracted_args.trim().to_string());
             return;
         }
     }
 }
+
 
 
 pub fn write_sprout_toml<W: UsbWriter>(
@@ -178,7 +216,8 @@ pub fn write_sprout_toml<W: UsbWriter>(
     kernel_path: Option<&str>, 
     initrd_path: Option<&str>, 
     kernel_args: Option<&str>, 
-    os_name: &str 
+    os_name: &str,
+    inject_fat_drivers: bool 
 ) -> PyResult<()> {
     
     let mut toml = String::new();
@@ -205,9 +244,18 @@ pub fn write_sprout_toml<W: UsbWriter>(
             toml.push_str(&format!("linux-initrd = '{}'\n", efi_initrd_path));
         }
         
-        let args = kernel_args.unwrap_or("quiet splash");
+        // --- KERNEL ARGUMENT INJECTION ---
+        let mut args = kernel_args.unwrap_or("quiet splash").to_string();
+        
+        if inject_fat_drivers {
+            // rd.driver.pre=... forces Dracut (Fedora, OpenMandriva, Mageia) to load modules early
+            // modules=... forces mkinitcpio (Arch) and initramfs-tools (Debian) to load modules early
+            args.push_str(" rd.driver.pre=vfat,nls_cp437,nls_iso8859_1 modules=vfat,nls_cp437,nls_iso8859_1");
+        }
+        
         toml.push_str(&format!("options = ['{}']\n", args));
     }
+    
     let toml_bytes = toml.as_bytes();
     let mut config_file = writer.open_file_writer("/sprout.toml", toml_bytes.len() as u64).map_err(|e| {
         PyRuntimeError::new_err(format!("Failed to create sprout.toml: {:?}", e))
