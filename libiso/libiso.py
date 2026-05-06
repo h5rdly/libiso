@@ -1,4 +1,4 @@
-import os, sys, importlib.util, tempfile, struct, xml.etree.ElementTree as ET
+import os, sys, importlib.util, time, tempfile, struct, xml.etree.ElementTree as ET
 from typing import Callable
 
 # TUI imports
@@ -90,6 +90,15 @@ globals().update({k: v for k, v in vars(_libiso).items() if not k.startswith('__
 
 ## -- General helper functions
 
+def fat32_time():
+
+    now = time.localtime()
+    fat_date = ((now.tm_year - 1980) << 9) | (now.tm_mon << 5) | now.tm_mday
+    fat_time = (now.tm_hour << 11) | (now.tm_min << 5) | (now.tm_sec // 2)
+
+    return fat_date, fat_time
+
+
 def ensure_uefi_bridge(cache_dir='.'):
     ''' Downloads the UEFI bridge image if it's not available '''
 
@@ -144,6 +153,38 @@ pub const TRUSTED_MS_CA_THUMBPRINTS: &[&str] = &[
         f.write('];\n')
 
     print(f'Extracted {len(sorted_hashes)} flat hashes to {output_path}')
+
+
+def scan_grub_binary(grub_efi_path: str):
+
+    # keep printable ASCII (32 to 126) 
+    # turn every other binary byte into a null byte (0).
+    trans_table = bytes([i if 32 <= i <= 126 else 0 for i in range(256)])
+
+    data = open(grub_efi_path, "rb").read()
+    clean_data = data.translate(trans_table)
+
+    ascii_strings = [
+        s.decode('ascii').lower() for s in clean_data.split(b'\x00') if len(s) >= 8
+    ]
+
+    patterns_to_test = [
+        " ' \"(cd0)\" ",
+        " ' \"($root)/boot/grub\" ", 
+        " ' \"configfile\" "
+    ]
+
+    for pat in patterns_to_test:
+        print(f"Testing Pelite Pattern: {pat.strip()}")
+        try:
+            offsets = libiso.scan_efi_pattern(efi_file, pat)
+            if offsets:
+                for offset in offsets:
+                    print(f"  [+] Match found at physical file offset: {hex(offset)}")
+            else:
+                print("  [-] No matches found.")
+        except Exception as e:
+            print(f"  [!] Error: {e}")
 
 
 
@@ -329,13 +370,15 @@ def _progress_bar(written: int, total: int, prefix: str = 'Progress'):
 def write_image_iso(
     image_path: str,
     device_path: str,
-    stats=None,                 
+    stats=None,            
+    usb_label: str = None,     
     partition_scheme: str = None, 
     persistence_size_mb: int = None,
     verify_written: bool = False,
     unattend_xml_payload: str = None,
     target_arch: str = None,
-    abort_token = None
+    abort_token = None,
+    use_sprout_bootloader: bool = None 
 ):
     ''' High-level Python wrapper that auto-configures the Rust burner based on ISO stats '''
 
@@ -348,22 +391,24 @@ def write_image_iso(
         partition_scheme = 'GPT' if getattr(stats.boot_info, 'supports_uefi', False) else 'MBR'
 
     uefi_ntfs_path = ensure_uefi_bridge() if has_large_file else None
-    usb_label = stats.volume_label[:11].replace(' ', '_').upper()
+    usb_label = usb_label or stats.volume_label[:11].replace(' ', '_').upper()
     
     kver = stats.linux_kernel_version
-    use_sprout_bootloader = bool(kver) or stats.is_unpatchable_linux
+    if use_sprout_bootloader is None:
+        use_sprout_bootloader = stats.is_unpatchable_linux
 
     ext4_temp_path = None
     if persistence_size_mb:
         fd, ext4_temp_path = tempfile.mkstemp(suffix='.ext4')
         os.close(fd)
 
+    fat_date, fat_time = fat32_time()
     try:
         return _libiso.write_image_iso(
             image_path, device_path, has_large_file, usb_label, partition_scheme, 
             uefi_ntfs_path, persistence_size_mb, ext4_temp_path, verify_written, 
             unattend_xml_payload, target_arch, abort_token, use_sprout_bootloader,
-            kver
+            kver, fat_date, fat_time
         )
     finally:
         if ext4_temp_path and os.path.exists(ext4_temp_path):
@@ -592,12 +637,11 @@ def tui_burn_worker(ui_queue: queue.Queue, iso_path: str, device_path: str, mode
             stream = _libiso.write_image_dd(iso_path, device_path, verify)
         else:
             ui_queue.put(('PHASE', 'ISO Extraction'))
-        
             stream = write_image_iso(
                 image_path=iso_path, 
                 device_path=device_path, 
                 stats=stats,          
-                verify_written=verify
+                verify_written=verify,
             )
 
         for event in stream:
@@ -781,6 +825,7 @@ if __name__ == '__main__':
             print(f'Sulfur GUI dependency not available, try `pip install dearpgui`')
             sys.exit()
         sulfur.gui(args.iso_path, args.mode, args.verify)
+        sys.exit(0)
 
     if not os.path.exists(args.iso_path):
         print(f'''Error: ISO file not found at '{args.iso_path}' ''')

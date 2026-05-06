@@ -43,7 +43,6 @@ state = {
     'abort_token': None,
     'drives': [],
     'admin': is_admin(),
-    'is_mutant': False,
     'is_windows': False,
     'tooltips': {
         'iso_text': 
@@ -51,9 +50,9 @@ state = {
         'chk_verify': 
             'Read the USB after burning and compare bit-for-bit',
         'chk_dd': 
-            "ISO mode is the default, as it doesn't turn the USB into read-only",
-        'chk_original_uefi': 
-            'Some Linux distros (Manjaro, Pop!_OS) will not work on ISO mode with their original UEFI bootloader'
+            "Raw sector-by-sector clone. Destroys formatting but maximizes compatibility.",
+        'chk_iso_mode': 
+            'Extract files to a standard FAT32/exFAT partition.'
     },
     'dark_mode': True,
 }
@@ -64,16 +63,11 @@ def drive_poller():
     ''' mimics the Windows WM_DEVICECHANGE hook by polling in the background '''
 
     def drive_display_name(d):
-
         size_gb = int(d.total_space_bytes / (1024 * 1024 * 1024))
-
         if d.label:
-            drive_display_name = f'{d.hardware_model} - {d.label} - {size_gb} GB ({d.device_path})'
+            return f'{d.hardware_model} - {d.label} - {size_gb} GB ({d.device_path})'
         else:
-            drive_display_name = f'{d.hardware_model} - {size_gb} GB ({d.device_path})'
-
-        return drive_display_name
-
+            return f'{d.hardware_model} - {size_gb} GB ({d.device_path})'
 
     while True:
         if state['is_burning']:
@@ -101,32 +95,25 @@ def drive_poller():
 ## -- Callbacks 
 
 def cancel_cb():
-
     if state['is_burning'] and state['abort_token']:
         dpg.set_value('status_text', 'Cancelling...')
         state['abort_token'].abort()
 
-
 def cleanup_ui():
-
     dpg.configure_item('btn_start', show=True)
     dpg.configure_item('btn_cancel', show=False)
     dpg.configure_item('advanced_options_group', show=True)
     state['is_burning'] = False
     state['abort_token'] = None
 
-
 def start_burn_cb():
-    
     if not state['iso_path'] or not dpg.get_value('drive_combo'):
         return
     state['is_burning'] = True
     state['has_burned'] = True  # Prevents mouse hover to present info in the now active log panel
     threading.Thread(target=burn_worker, daemon=True).start()
 
-
 def file_selected_cb(sender, app_data):
-
     state['iso_path'] = app_data['file_path_name']
     dpg.set_value('iso_text', state['iso_path'])
     state['has_burned'] = False     
@@ -137,20 +124,30 @@ def file_selected_cb(sender, app_data):
     dpg.set_value('status_text', 'Ready')
 
 
-def on_iso_loaded(file_path):
+def iso_mode_toggled_cb(sender, app_data, user_data):
+    if app_data:
+        dpg.set_value('chk_dd', False)
+    else:
+        dpg.set_value('chk_dd', True)
 
+def dd_toggled_cb(sender, app_data, user_data):
+    if app_data:
+        dpg.set_value('chk_iso_mode', False)
+    else:
+        dpg.set_value('chk_iso_mode', True)
+
+
+def on_iso_loaded(file_path):
     stats = libiso.inspect_image(file_path).as_dict()
     
-    is_mutant = stats.get('is_unpatchable_linux', False)
-    state['is_mutant'] = is_mutant
-
+    grub_status = stats.get('grub_status', 'Unknown')
     size_gb = round(stats.get('size_bytes', 0) / (1024**3), 2)
 
     if win_info := stats.get('windows_info'):
         state['is_windows'] = True
         
-        # Windows: Hide UEFI and DD entirely!
-        dpg.configure_item('grp_uefi', show=False)
+        # Windows: Hide ISO Mode toggle, Force DD box
+        dpg.configure_item('grp_iso_mode', show=False)
         dpg.configure_item('grp_dd', show=True)
         dpg.set_value('chk_dd', False)
         
@@ -163,71 +160,39 @@ def on_iso_loaded(file_path):
     else:
         state['is_windows'] = False
         
-        dpg.configure_item('grp_uefi', show=True)
+        dpg.configure_item('grp_iso_mode', show=True)
         dpg.configure_item('grp_dd', show=True)
         label = stats.get('volume_label', 'Unknown')
         
         dpg.set_value('iso_info_os_name', f'Linux ({label})')
-        dpg.set_value('iso_info_details', f"Size: {size_gb}GB  Boot Format: {'Proprietary/Mutant' if is_mutant else 'Standard'}")
+        dpg.set_value('iso_info_details', f"Size: {size_gb}GB  Bootloader: {grub_status}")
         
-        if is_mutant:
-            dpg.configure_item('chk_original_uefi', label='Use Sprout UEFI bootloader (For ISO mode)')
-            state['tooltips']['chk_original_uefi'] = "The original bootloader on this distro doesn't support ISO mode"
+        if grub_status == 'Native':
+            dpg.configure_item('chk_iso_mode', label= 'ISO mode (Native Boot)')
+            state['tooltips']['chk_iso_mode'] = 'The GRUB bootloader on this distro is portable. No patching required'
+        elif grub_status == 'Patchable':
+            dpg.configure_item('chk_iso_mode', label='Vanilla ISO mode (Auto-Patch GRUB)')
+            state['tooltips']['chk_iso_mode'] = 'The GRUB bootloader on this distro hardcodes CD-ROM paths. Sulfur will patch it during the burn'
+        else: # Unpatchable / Not Found
+            dpg.configure_item('chk_iso_mode', label='Sprout UEFI Bootloader (ISO mode)')
+            state['tooltips']['chk_iso_mode'] = 'The bootloader on this distro  is unpatchable. Will use Sprout bootloader for ISO mode'    
             
-            # Mutants: Default to Sprout (ISO mode)
-            dpg.set_value('chk_original_uefi', True)
-            dpg.set_value('chk_dd', False)
-        else:
-            dpg.configure_item('chk_original_uefi', label='Use original UEFI bootloader (For ISO mode)')
-            state['tooltips']['chk_original_uefi'] =  'Some Linux distros (Manjaro, Pop!_OS) will not work on ISO mode with their original UEFI bootloader'
-            
-            # Standard Linux: Default to Original (ISO mode)
-            dpg.set_value('chk_original_uefi', True)
-            dpg.set_value('chk_dd', False)
+        # Default to ISO mode
+        dpg.set_value('chk_iso_mode', True)
+        dpg.set_value('chk_dd', False)
             
     dpg.configure_item('iso_info_group', show=True)
 
 
-def dd_toggled_cb(sender, app_data, user_data):
-
-    is_checked = app_data
-    
-    if state['is_mutant']:
-        # Mutant: Act as a radio button
-        if is_checked:
-            dpg.set_value('chk_original_uefi', False)
-        else:
-            dpg.set_value('chk_original_uefi', True)
-    else:
-        # Non-Mutant: collapse the UEFI box 
-        if is_checked:
-            dpg.configure_item('grp_uefi', show=False)
-        else:
-            if not state['is_windows']:
-                dpg.configure_item('grp_uefi', show=True)
-
-
-def uefi_toggled_cb(sender, app_data, user_data):
-
-    # Enforce radio button behavior for mutants
-    is_checked = app_data
-    if state['is_mutant']:
-        if is_checked:
-            dpg.set_value('chk_dd', False)
-        else:
-            dpg.set_value('chk_dd', True)
-
-
 def mouse_move_cb():
-
     # If a burn is running, or has finished, don't overwrite the log
     if state['is_burning'] or state['has_burned']:
         return
         
-    tags_to_check = ['chk_verify', 'chk_dd', 'chk_original_uefi', 'iso_text']
+    tags_to_check = ['chk_verify', 'chk_dd', 'chk_iso_mode', 'iso_text']
     
     match (hovered_tag := next((tag for tag in tags_to_check if dpg.is_item_hovered(tag)), None)):
-        case 'chk_verify' | 'chk_dd' | 'chk_original_uefi' | 'iso_text':
+        case 'chk_verify' | 'chk_dd' | 'chk_iso_mode' | 'iso_text':
             new_text = state['tooltips'][hovered_tag]
         case _:
             new_text = 'Waiting for configuration' if not state['iso_path'] else 'Ready to burn'
@@ -248,7 +213,6 @@ main_font = None # We will store the font ID here so the callback can update it
 title_font = None
 
 def zoom_font_cb(sender, app_data):
-
     global current_font_size, main_font, current_title_size, title_font
     
     if dpg.is_key_down(dpg.mvKey_ModCtrl):
@@ -270,12 +234,10 @@ def zoom_font_cb(sender, app_data):
 # -- Burnie
 
 def burn_worker():
-
     dpg.configure_item('btn_start', show=False)
     dpg.configure_item('btn_cancel', show=True)
     dpg.configure_item('advanced_options_group', show=False)
     dpg.set_value('progress_bar', 0.0)
-    # dpg.configure_item('progress_bar', overlay='')
     dpg.set_value('log_console', '--- STARTING BURN PROCESS ---\n')
     
     # Extract the raw device path from the dropdown string (e.g., '/dev/sda')
@@ -294,8 +256,9 @@ def burn_worker():
         is_dd_mode = dpg.get_value('chk_dd')
         verify = dpg.get_value('chk_verify')
 
-        # If it's a mutant and we are in ISO Mode, then 'Use Sprout UEFI' was checked
-        use_sprout_bootloader = state['is_mutant'] or not dpg.get_value('chk_original_uefi')
+        # Determine if we need Sprout based on our hard evidence
+        grub_status = getattr(stats, 'grub_status', 'Unknown')
+        use_sprout_bootloader = (grub_status in ['Unpatchable', 'Not Found', 'Unknown']) and not is_dd_mode
 
         # Create AbortToken
         state['abort_token'] = libiso.AbortToken()
@@ -307,14 +270,14 @@ def burn_worker():
             stream = libiso.write_image_dd(
                 image_path=state['iso_path'],
                 device_path=device_path,
-                verify_written=verify
+                verify_written=verify,
+                abort_token=state['abort_token']
             )
             
         else:
-            has_large_file = getattr(stats, 'has_large_file', False)
             supports_uefi = getattr(getattr(stats, 'boot_info', None), 'supports_uefi', False)
             partition_scheme = 'GPT' if supports_uefi else 'MBR'
-            uefi_path = libiso.ensure_uefi_bridge() if has_large_file else None
+            # partition_scheme = 'MBR'
             win_info = getattr(stats, 'windows_info', None)
             
             if win_info and getattr(win_info, 'is_windows', False):
@@ -331,14 +294,12 @@ def burn_worker():
             stream = libiso.write_image_iso(
                 image_path=state['iso_path'],
                 device_path=device_path,
-                has_large_file=has_large_file,
-                usb_label=short_label,
+                stats=stats,                    
+                usb_label=short_label,            
                 partition_scheme=partition_scheme,
-                uefi_ntfs_path=uefi_path,
-                persistence_size_mb=None,
                 verify_written=verify,
                 abort_token=state['abort_token'],
-                use_sprout_bootloader=use_sprout_bootloader
+                use_sprout_bootloader=use_sprout_bootloader 
             )
             
         # Event loop is the same for ISO and DD mode
@@ -415,7 +376,6 @@ current_dir = __file__.replace('\\', '/').rsplit('/', 1)[0] + os.sep
 font_path = current_dir + 'HackNerdFontPropo-Regular.ttf'
 
 
-
 ## -- DPG Layout 
 
 def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
@@ -425,9 +385,7 @@ def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
     with dpg.font_registry():
         if os.path.exists(font_path):
             main_font = dpg.add_font(font_path, current_font_size)
-            # dpg.add_font_range(0xf000, 0xf3ff)  # unicode emoji support
             title_font = dpg.add_font(font_path, current_title_size)
-
             dpg.bind_font(main_font)
         else:
             print('Warning: Could not find a TTF system font. Falling back to default.')
@@ -452,7 +410,6 @@ def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
             dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 6)
 
         with dpg.theme_component(dpg.mvButton):
-            # 0 extra horizontal padding, and 10 pixels of vertical padding for buttons
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 10)
         
         with dpg.theme_component(dpg.mvCheckbox):
@@ -466,7 +423,6 @@ def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
     # --  Build the UI 
     with dpg.window(tag='main_window', label='libiso', no_collapse=True, no_close=True, no_title_bar=True):
         
-        # dpg.add_separator()
         dpg.add_spacer(height=10)
         
         # Admin Warning
@@ -516,11 +472,11 @@ def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
             with dpg.group(tag='grp_dd'):
                 dpg.add_checkbox(label='Force DD (Raw Image) mode', tag='chk_dd', callback=dd_toggled_cb)
             
-            with dpg.group(tag='grp_uefi'):
-                dpg.add_checkbox(label='Use original UEFI bootloader (For ISO mode)', tag='chk_original_uefi', callback=uefi_toggled_cb)
+            with dpg.group(tag='grp_iso_mode'):
+                dpg.add_checkbox(label='Vanilla ISO mode', tag='chk_iso_mode', callback=iso_mode_toggled_cb)
                 dpg.add_spacer(height=5)
 
-            dpg.add_spacer(height=50)
+        dpg.add_spacer(height=50)
 
 
         # Status & Progress
@@ -613,14 +569,15 @@ def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
             print(f'Warning: CLI ISO path does not exist: {iso_path}')
 
     dpg.setup_dearpygui()
-    # dpg.show_font_manager()
     dpg.set_primary_window('main_window', True)
+    # dpg.show_item_registry()  # UI DOM tree
+    # dpg.show_metrics()        # Performance profiling
+    # dpg.show_debug()          # UI State debugger
     dpg.show_viewport()
     dpg.start_dearpygui()
     dpg.destroy_context()
 
 
 if __name__ == '__main__':
-
     iso_path = sys.argv[1] if len(sys.argv) > 1 else None
     gui(iso_path)

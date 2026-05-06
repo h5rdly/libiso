@@ -2,12 +2,13 @@ use std::{fs::File, cell::RefCell, io::{Read, Seek, SeekFrom}};
 
 use hadris_iso::{sync::IsoImage, read::DirEntry, directory::DirectoryRef};
 
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::{
+    prelude::*, types::PyDict, exceptions::PyValueError
+};
 
 use crate::signature::{inspect_secure_boot, inspect_secure_boot_bytes};
 use crate::esd::{parse_wim_xml};
-use crate::udf;
+use crate::{udf, grub_patcher};
 
 
 pub const ISO_CHUNK_SIZE: usize = 100 * 1024;
@@ -53,6 +54,7 @@ pub fn resolve_iso_path(base_dir: &str, relative: &str) -> String {
 
 // -- ISO9660 reader
 pub struct IsoReader<'a> { pub iso: &'a IsoImage<File> }
+
 impl<'a> IsoReader<'a> {
     fn resolve_dir(&self, path: &str) -> Result<DirectoryRef, String> {
         let mut curr = self.iso.root_dir().dir_ref();
@@ -247,6 +249,8 @@ pub struct ImageStats {
     #[pyo3(get)]
     pub has_large_file: bool,
     #[pyo3(get)]
+    pub grub_status: String,
+    #[pyo3(get)]
     pub is_unpatchable_linux: bool,
     #[pyo3(get)]
     pub linux_kernel_version: Option<String>,
@@ -307,15 +311,15 @@ impl WindowsMetadata {
 impl ImageStats {
 
     #[new]
-    #[pyo3(signature = (file_path=String::new(), size_bytes=0, volume_label=String::from("TEST_LABEL"), is_isohybrid=false, has_large_file=false, is_unpatchable_linux=false, linux_kernel_version=None, boot_info=None, windows_info=None))]
+    #[pyo3(signature = (file_path=String::new(), size_bytes=0, volume_label=String::from("TEST_LABEL"), is_isohybrid=false, has_large_file=false, grub_status=String::new(), is_unpatchable_linux=false, linux_kernel_version=None, boot_info=None, windows_info=None))]
     pub fn new(
         file_path: String, size_bytes: u64, volume_label: String, is_isohybrid: bool, 
-        has_large_file: bool, is_unpatchable_linux: bool, linux_kernel_version: Option<String>, 
-        boot_info: Option<BootCapabilities>, windows_info: Option<WindowsMetadata>
+        has_large_file: bool, grub_status: String, is_unpatchable_linux: bool,
+        linux_kernel_version: Option<String>, boot_info: Option<BootCapabilities>, windows_info: Option<WindowsMetadata>
     ) -> Self {
-        // If Python doesn't provide boot_info, generate a default one
+         // If Python doesn't provide boot_info, generate a default one
         let boot = boot_info.unwrap_or_else(|| BootCapabilities::new(false, false, false, false, false, false, 0));
-        Self { file_path, size_bytes, volume_label, is_isohybrid, has_large_file, is_unpatchable_linux, linux_kernel_version, boot_info: boot, windows_info }
+        Self { file_path, size_bytes, volume_label, is_isohybrid, has_large_file, is_unpatchable_linux, grub_status, linux_kernel_version, boot_info: boot, windows_info }
     }
 
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -325,6 +329,7 @@ impl ImageStats {
         dict.set_item("volume_label", &self.volume_label)?;
         dict.set_item("is_isohybrid", self.is_isohybrid)?;
         dict.set_item("has_large_file", self.has_large_file)?;
+        dict.set_item("grub_status", &self.grub_status)?; 
         dict.set_item("is_unpatchable_linux", self.is_unpatchable_linux)?; 
         dict.set_item("boot_info", self.boot_info.as_dict(py)?)?;
         if let Some(win_info) = &self.windows_info {
@@ -353,6 +358,8 @@ pub fn scan_directory_udf(
     is_windows_11: &mut bool,
     install_image_type: &mut String,
     is_unpatchable_linux: &mut bool, 
+    iso_label: &str,          
+    grub_status: &mut String, 
 ) {
     for entry in entries {
         let name = &entry.name;
@@ -366,8 +373,8 @@ pub fn scan_directory_udf(
         if entry.is_directory {
             if let Ok(sub_entries) = udf::read_directory(file, partition_start, &entry.icb) {
                 scan_directory_udf(
-                    file, partition_start, &sub_entries, has_large_file, supports_uefi, 
-                    is_windows, is_windows_11, install_image_type, is_unpatchable_linux
+                    file, partition_start, &sub_entries, has_large_file, supports_uefi, is_windows, is_windows_11, 
+                    install_image_type, is_unpatchable_linux, iso_label, grub_status
                 );
             }
         } else {
@@ -376,6 +383,19 @@ pub fn scan_directory_udf(
             
             if file_name.ends_with(".EFI") && file_name.contains("BOOT") {
                 *supports_uefi = true;
+
+                if file_name == "BOOTX64.EFI" || file_name == "GRUBX64.EFI" {
+                    // UDF's read_file_bytes returns the allocated Vec<u8> directly
+                    if let Ok(efi_buf) = udf::read_file_bytes(file, partition_start, entry) {
+                        let status = crate::grub_patcher::analyze_grub_efi(&efi_buf, iso_label, "LIBISO_USB1");
+                        *grub_status = match status {
+                            crate::grub_patcher::GrubPatchStatus::Native => "Native".to_string(),
+                            crate::grub_patcher::GrubPatchStatus::Patchable => "Patchable".to_string(),
+                            crate::grub_patcher::GrubPatchStatus::Unpatchable => "Unpatchable".to_string(),
+                            crate::grub_patcher::GrubPatchStatus::NotFound => "Not Found".to_string(), 
+                        };
+                    }
+                }
             }
             if file_name == "INSTALL.WIM" {
                 *is_windows = true;
@@ -407,6 +427,9 @@ fn scan_directory(
     is_windows_11: &mut bool,
     install_image_type: &mut String,
     is_unpatchable_linux: &mut bool, 
+    linux_kernel_version: &mut Option<String>, 
+    iso_label: &str,               
+    grub_status: &mut String,     
 ) {
     let dir = iso.open_dir(dir_ref); 
     for entry_res in dir.entries() {
@@ -430,27 +453,59 @@ fn scan_directory(
         }   
         if entry.is_directory() {
             if let Ok(sub_dir_ref) = entry.as_dir_ref(iso) {
-                scan_directory(iso, sub_dir_ref, has_large_file, supports_uefi, is_windows,
-                    is_windows_11, install_image_type, is_unpatchable_linux);
+                scan_directory(
+                    iso, sub_dir_ref, has_large_file, supports_uefi, is_windows, is_windows_11, 
+                    install_image_type, is_unpatchable_linux, linux_kernel_version, iso_label, 
+                    grub_status
+                );
             }
         } else {
             if entry.total_size() >= 4_000_000_000 { *has_large_file = true; }
-            if file_name.ends_with(".EFI") && file_name.contains("BOOT") { *supports_uefi = true; }
+            if file_name.ends_with(".EFI") && file_name.contains("BOOT") { 
+                *supports_uefi = true;
+
+                if file_name == "BOOTX64.EFI" || file_name == "GRUBX64.EFI" {
+                    let start_sector = entry.header().extent.read() as u64;
+                    let byte_offset = start_sector * 2048;
+                    // Usually 1MB - 5MB. Just buffer it in for a quick scan
+                    let read_size = entry.total_size() as usize; 
+                    let mut efi_buf = vec![0u8; read_size];
+                    
+                    if iso.read_bytes_at(byte_offset, &mut efi_buf).is_ok() {
+                        // Pass a dummy 11-char USB label for the length check
+                        let status = grub_patcher::analyze_grub_efi(&efi_buf, iso_label, "LIBISO_USB1");
+                        *grub_status = match status {
+                            grub_patcher::GrubPatchStatus::Native => "Native".to_string(),
+                            grub_patcher::GrubPatchStatus::Patchable => "Patchable".to_string(),
+                            grub_patcher::GrubPatchStatus::Unpatchable => "Unpatchable".to_string(),
+                            crate::grub_patcher::GrubPatchStatus::NotFound => "Not Found".to_string(), 
+                        };
+                    }
+                }
+            }
             
             // bzimage header scraping
             if file_name.contains("VMLINUZ") || file_name.contains("BZIMAGE") || file_name == "LINUX"
-            {
-                // ISO sectors are exactly 2048 bytes
+            {   
+                println!("[DEBUG] Found potential kernel candidate: {}", file_name);
+                // ISO sectors are 2048 bytes
                 let start_sector = entry.header().extent.read() as u64;
                 let byte_offset = start_sector * 2048;
-                
-                // Read exactly 8192 bytes (or the file size if it's somehow smaller)
-                let read_size = std::cmp::min(8192, entry.total_size()) as usize;
+                let read_size = std::cmp::min(65536, entry.total_size()) as usize;
+                println!("[DEBUG] Size: {}, Target Read Size: {}, Byte Offset: {}", entry.total_size(), read_size, byte_offset);
                 let mut header_buf = vec![0u8; read_size];
                 
                 // hadris-iso direct seek-and-read
                 if iso.read_bytes_at(byte_offset, &mut header_buf).is_ok() {
-                    let _linux_kernel_version = extract_bzimage_version(&header_buf);
+                    println!("[DEBUG] Successfully read {} bytes from {}", read_size, file_name);         
+                   if let Some(ver) = extract_bzimage_version(&header_buf) {
+                        println!("[DEBUG] >>> SUCCESS! Extracted Version: {}", ver);
+                        *linux_kernel_version = Some(ver); 
+                    } else {
+                        println!("[DEBUG] extract_bzimage_version returned None for {}", file_name);
+                    }
+                } else {
+                    println!("[DEBUG] Failed to read bytes from ISO for {}", file_name);
                 }
             }
             
@@ -487,6 +542,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
                     volume_label: "WIM/ESD Archive".to_string(), 
                     is_isohybrid: false,
                     has_large_file: true, 
+                    grub_status: "Not Found".to_string(),
                     is_unpatchable_linux: false, 
                     linux_kernel_version: None,
                     boot_info: BootCapabilities {
@@ -500,7 +556,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
                     }),
                 });
             } else {
-                return Err(pyo3::exceptions::PyValueError::new_err("Invalid or corrupted WIM/ESD file"));
+                return Err(PyValueError::new_err("Invalid or corrupted WIM/ESD file"));
             }
         }
     }
@@ -527,8 +583,9 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     let mut is_windows = false;
     let mut is_windows_11 = false;
     let mut install_image_type = String::new();
+    let mut grub_status = String::from("Not Found");
     let mut is_unpatchable_linux = false; 
-    let linux_kernel_version = None;
+    let mut linux_kernel_version: Option<String> = None;
 
 
     file.seek(SeekFrom::Start(0))?;
@@ -541,9 +598,9 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
             if !udf_label.is_empty() { volume_label = udf_label.to_string(); }
             
             scan_directory_udf(
-                &mut file, udf_ctx.partition_start, &root_entries, &mut has_large_file, 
-                &mut supports_uefi, &mut is_windows, &mut is_windows_11, &mut install_image_type,
-                &mut is_unpatchable_linux
+                &mut file, udf_ctx.partition_start, &root_entries, &mut has_large_file, &mut supports_uefi, 
+                &mut is_windows, &mut is_windows_11, &mut install_image_type, &mut is_unpatchable_linux,
+                &volume_label, &mut grub_status,
             );
             
             if let Some(entry) = udf::find_udf_entry(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb, "EFI/BOOT/BOOTX64.EFI")
@@ -572,8 +629,11 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
             signature_size = sb_status.signature_size;
 
             let root = iso.root_dir();
-            scan_directory(&iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, 
-            &mut is_windows_11, &mut install_image_type, &mut is_unpatchable_linux);
+            scan_directory(
+                &iso, root.dir_ref(), &mut has_large_file, &mut supports_uefi, &mut is_windows, 
+                &mut is_windows_11, &mut install_image_type, &mut is_unpatchable_linux, &mut linux_kernel_version, 
+                &volume_label, &mut grub_status
+            );
         }
     }
 
@@ -591,7 +651,7 @@ pub fn inspect_image(file_path: String) -> PyResult<ImageStats> {
     } else { None };
 
     Ok(ImageStats { file_path, size_bytes: total_size, volume_label, is_isohybrid, has_large_file, 
-        is_unpatchable_linux, linux_kernel_version, boot_info, windows_info })
+        grub_status, is_unpatchable_linux, linux_kernel_version, boot_info, windows_info })
 }
 
 
@@ -600,11 +660,13 @@ pub fn extract_bzimage_version(bzimage: &[u8]) -> Option<String> {
     
     // The image must be at least large enough to contain the setup header
     if bzimage.len() < 0x0210 {
+        println!("[DEBUG] EXTRACTOR: Buffer too small! Only {} bytes.", bzimage.len());
         return None;
     }
 
     // Check for "HdrS" magic signature at offset 0x0202
     if &bzimage[0x0202..0x0206] != b"HdrS" {
+        println!("[DEBUG] EXTRACTOR: Missing 'HdrS' magic bytes. Found: {:?}", &bzimage[0x0202..0x0206]);
         return None; 
     }
 
@@ -613,8 +675,10 @@ pub fn extract_bzimage_version(bzimage: &[u8]) -> Option<String> {
 
     // The pointer is an offset from 0x0200
     let absolute_offset = 0x0200 + version_ptr as usize;
+    println!("[DEBUG] EXTRACTOR: HdrS found! Version string points to absolute offset 0x{:X}", absolute_offset);
 
     if absolute_offset >= bzimage.len() {
+        println!("[DEBUG] EXTRACTOR: Offset 0x{:X} is out of bounds for buffer of size {}", absolute_offset, bzimage.len());
         return None;
     }
 
@@ -628,7 +692,7 @@ pub fn extract_bzimage_version(bzimage: &[u8]) -> Option<String> {
     let version_slice = &bzimage[absolute_offset..end_offset];
     
     let version_str = String::from_utf8_lossy(version_slice).trim().to_string();
-    
+    println!("[DEBUG] EXTRACTOR: Raw extracted string: '{}'", version_str);
     if version_str.is_empty() { None } else { Some(version_str) }
 }
 

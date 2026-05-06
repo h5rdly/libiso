@@ -219,7 +219,7 @@ impl<'a> KmodBinaryParser<'a> {
         self.walk_node(root_offset & 0x0FFFFFFF, target_module.as_bytes())
     }
 
-    fn walk_node(&self, mut offset: u32, mut search_key: &[u8]) -> Option<&'a str> {
+    fn walk_node(&self, offset: u32, mut search_key: &[u8]) -> Option<&'a str> {
         let flags = offset & 0xF0000000;
         let mut curr_idx = (offset & 0x0FFFFFFF) as usize;
 

@@ -4,13 +4,13 @@ use std::{
     path::Path,
     thread,
     sync::{Arc, mpsc, Mutex, atomic::{AtomicBool, Ordering}},
-    cell::RefCell
+    cell::RefCell, collections::HashSet,
 };
 
-use hadris_iso::{sync::IsoImage, read::DirEntry};
+use hadris_iso::{sync::IsoImage,};
 
 use pyo3::{
-    prelude::*, types::PyDict, 
+    prelude::*,
     exceptions::{PyRuntimeError, PyPermissionError, PyIOError, PyFileNotFoundError, PyValueError}
 };
 
@@ -18,8 +18,14 @@ use crate::io::{
     AlignedBuffer, sys::DriveLocker, open_device, trigger_os_reread, force_unmount,
 };
 use crate::image_parser::{ImageReader, IsoReader, UdfReader, DD_CHUNK_SIZE};
-use crate::{fat32, verify, bootloader, udf, exfat, gpt, esd, ext4, initramfs_patcher};
+use crate::{fat32, verify, bootloader, udf, exfat, gpt, ext4, initramfs_patcher, grub_patcher};
 use crate::events::{EventMsg, ProgressStream, AbortToken};
+
+
+
+thread_local! {
+    pub static WRITTEN_PATHS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
 
 
 
@@ -63,30 +69,6 @@ impl<T: Read + Write + Seek> Seek for PartitionWrapper<T> {
         let res = self.inner.seek(actual_pos)?;
         Ok(res.saturating_sub(self.offset))
     }
-}
-
-
-pub fn get_clean_filename(entry: &DirEntry) -> String {
-    let mut name = if entry.record.is_joliet_name() {
-        entry.record.joliet_name()
-    } else {
-        entry.display_name().into_owned()
-    };
-    if let Some(pos) = name.rfind(';') { name.truncate(pos); }
-    name
-}
-
-
-// resolve internal ISO symlinks like "../../boot/grub/grubx64.efi"
-pub fn resolve_iso_path(base_dir: &str, relative: &str) -> String {
-
-    let mut parts: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
-    for part in relative.split('/').filter(|s| !s.is_empty()) {
-        if part == "." { continue; }
-        if part == ".." { parts.pop(); }
-        else { parts.push(part); }
-    }
-    parts.join("/")
 }
 
 
@@ -168,18 +150,42 @@ pub fn format_usb_drive(
 
 // -- EFI injection aux
 
-pub fn inject_hidden_efi<W: UsbWriter>(efi_img_bytes: Vec<u8>, target_usb_fs: &W) -> Result<(), String> {
+pub fn inject_hidden_efi<W: UsbWriter>(
+    efi_img_bytes: Vec<u8>, 
+    target_usb_fs: &W,
+    tx: &mpsc::SyncSender<EventMsg>,
+    new_usb_label: &str 
+) -> Result<(), String> {
+
     println!("[*] Hidden EFI image detected. Parsing raw FAT filesystem...");
 
     let files = fat32::read_fat_image(&efi_img_bytes)?;
 
-    for (path, data) in files {
-        if path.to_uppercase().starts_with("/EFI") || path.to_uppercase().starts_with("\\EFI") {
-            println!("    Injecting: {}", path);
+    for (path, mut data) in files {
+
+        let path_upper = path.to_uppercase().replace('\\', "/").replace("//", "/");
+        
+        if path_upper.starts_with("/EFI") {
+            let is_new_file = WRITTEN_PATHS.with(|paths| paths.borrow_mut().insert(path_upper.clone()));
+            if !is_new_file {
+                let _ = tx.send(EventMsg::log(&format!("    [CACHE HIT] Ledger blocked duplicate: {}", path_upper)));
+                continue; 
+            }
+            
+            let _ = tx.send(EventMsg::log(&format!("    [CACHE MISS] Extracting: {}", path_upper)));
+            
             let (dir_path, _) = fat32::split_path(&path);
             if !dir_path.is_empty() {
                 target_usb_fs.create_dir_all(dir_path)?;
             }
+
+            // If the extracted file is an EFI executable, patch it before writing it to the USB!
+            if path_upper.ends_with(".EFI") {
+                if grub_patcher::patch_memdisk_uuid_to_label(&mut data, new_usb_label) {
+                    let _ = tx.send(EventMsg::log(&format!("    [+] Binary-patched memdisk UUID search in {}", path)));
+                }
+            }
+
             if let Ok(mut writer) = target_usb_fs.open_file_writer(&path, data.len() as u64) {
                 writer.write_all(&data).map_err(|e| e.to_string())?;
                 writer.flush().map_err(|e| e.to_string())?;
@@ -295,7 +301,7 @@ pub fn write_image_dd(
 #[pyo3(signature = (image_path, device_path, has_large_file, iso_label, partition_scheme=None, 
     uefi_ntfs_path=None, persistence_size_mb=None, ext4_temp_path=None, verify_written=false, 
     unattend_xml_payload=None, target_arch=None, abort_token=None, use_sprout_bootloader=false,
-    squashfs_patch_path=None, kernel_version_for_patch=None))]
+    kernel_version_for_patch=None, fat_date=0, fat_time=0))]
 pub fn write_image_iso(
     image_path: String,
     device_path: String,
@@ -310,8 +316,9 @@ pub fn write_image_iso(
     target_arch: Option<String>, 
     abort_token: Option<PyRef<'_, AbortToken>>,
     use_sprout_bootloader: bool, 
-    squashfs_patch_path: Option<String>,
     kernel_version_for_patch: Option<String>,
+    fat_date: u16, 
+    fat_time: u16,
 ) -> PyResult<ProgressStream> {
     
     let arch_selection = target_arch.unwrap_or_else(|| "all".to_string());
@@ -455,12 +462,12 @@ pub fn write_image_iso(
                 &bare_fs, &bare_fs, &iso_path_clone, &device_path_clone, &tx, total_size, 
                 has_large_file, &arch_selection, &old_label_owned, &new_label_owned, unattend_xml_payload, 
                 &new_label_owned, abort_flag, verify_written, lba0_bytes, use_sprout_bootloader, 
-                squashfs_patch_path, kernel_version_for_patch,
+                kernel_version_for_patch,
             );
           } else {
             let _ = tx.send(EventMsg::phase("Extracting image (FAT32)"));
             
-            let usb_fs = match fat32::BareFat32::mount(wp) {
+            let usb_fs = match fat32::BareFat32::mount(wp, fat_date, fat_time) {
                 Ok(fs) => fs,
                 Err(e) => { let _ = tx.send(EventMsg::error(&format!("Failed to mount BareFAT32: {:?}", e))); return; }
             };
@@ -468,7 +475,7 @@ pub fn write_image_iso(
             burn_and_verify(
                 &usb_fs, &usb_fs, &iso_path_clone, &device_path_clone, &tx, total_size, has_large_file, 
                 &arch_selection, &old_label_owned, &new_label_owned, unattend_xml_payload, &new_label_owned, 
-                abort_flag, verify_written, lba0_bytes, use_sprout_bootloader, squashfs_patch_path, 
+                abort_flag, verify_written, lba0_bytes, use_sprout_bootloader, 
                 kernel_version_for_patch,
             );
         }
@@ -518,10 +525,13 @@ fn execute_extraction_workflow<R: ImageReader, W: UsbWriter>(
     unattend_xml_payload: Option<String>,
     autorun_inf_label: &str,
     abort_flag: Arc<AtomicBool>,
-    use_sprout_bootloader: bool,
+    mut use_sprout_bootloader: bool,
     iso_path: &str,
     kernel_version_for_patch: Option<String>,
 ) -> Result<(), String> {
+
+    WRITTEN_PATHS.with(|paths| paths.borrow_mut().clear());
+
     let mut written = 0u64;
     let mut found_kernel = None;
     let mut found_initrd = None;
@@ -530,7 +540,7 @@ fn execute_extraction_workflow<R: ImageReader, W: UsbWriter>(
     // Extract Files
     copy_recursive(
         reader, writer, "", tx, &mut written, total_size, original_iso_label, new_usb_label, &mut found_kernel, 
-        &mut found_initrd, &mut found_args, abort_flag.clone(), use_sprout_bootloader, 
+        &mut found_initrd, &mut found_args, abort_flag.clone(), &mut use_sprout_bootloader, 
         iso_path, &kernel_version_for_patch,
     )?;
 
@@ -610,7 +620,6 @@ fn burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
     verify_written: bool,
     lba0_bytes: [u8; 512], 
     use_sprout_bootloader: bool,
-    squashfs_patch_path: Option<String>,
     kernel_version_for_patch: Option<String>,
 ) {
     let mut file = File::open(iso_path).unwrap();
@@ -696,7 +705,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
     found_initrd: &mut Option<String>,  
     found_args: &mut Option<String>, 
     abort_flag: Arc<AtomicBool>,
-    use_sprout_bootloader: bool,
+    use_sprout_bootloader: &mut bool,
     iso_path: &str,
     kernel_version_for_patch: &Option<String>,
 ) -> Result<(), String> {
@@ -710,14 +719,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
         if clean_name == "." || clean_name == ".." || clean_name.is_empty() { continue; }
         
         let new_path = if current_path.is_empty() { format!("/{}", clean_name) } else { format!("{}/{}", current_path, clean_name) };
-        
-        if use_sprout_bootloader && current_path.is_empty() && clean_name.eq_ignore_ascii_case("EFI")  {
-            let _ = tx.send(EventMsg::log(&format!("Skipping original boot directory: {}", new_path)));
-            // Add the skipped size to the progress bar so the math doesn't break
-            *bytes_written += entry.size;
-            let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
-            continue; 
-        }
+        let path_upper = new_path.to_uppercase();
 
         if entry.is_dir {
             writer.create_dir(&new_path)?;
@@ -727,6 +729,14 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             continue;
         } 
         
+        let is_new_file = WRITTEN_PATHS.with(|paths| paths.borrow_mut().insert(path_upper.clone()));
+        if !is_new_file {
+            let _ = tx.send(EventMsg::log(&format!("Skipping duplicate file: {}", new_path)));
+            *bytes_written += entry.size;
+            let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
+            continue;
+        }
+
         let stream_path = if let Some(target) = &entry.symlink_target {
             let _ = tx.send(EventMsg::log(&format!("Resolving symlink: {} -> {}", new_path, target)));
             target
@@ -745,36 +755,22 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
         let is_initrd = bootloader::LINUX_INITRAMFS_PREFIXES.iter()
             .any(|&prefix| clean_name.to_lowercase().starts_with(prefix));
 
+        
+        let is_grub_efi = clean_name.eq_ignore_ascii_case("BOOTX64.EFI") 
+            || clean_name.eq_ignore_ascii_case("GRUBX64.EFI") 
+            || clean_name.eq_ignore_ascii_case("BOOTAA64.EFI");
+
         // intercepting Initramfs
         if is_initrd && kernel_version_for_patch.is_some() {
             let _ = tx.send(EventMsg::log(&format!("Intercepting and patching initramfs: {}", new_path)));
-            
-            let squashfs_candidates = [
-                    "LiveOS/squashfs.img",        // Fedora, OpenMandriva, Mageia
-                    "casper/filesystem.squashfs", // Ubuntu, Mint, Pop!_OS
-                    "live/filesystem.squashfs",   // Debian Live
-                    "arch/x86_64/airootfs.sfs",   // Arch Linux
-                    "manjaro/x86_64/rootfs.sfs",  // Manjaro
-                    "boot/x86_64/rootfs.sfs",     // Other Arch derivatives
-                ];
-            
-            let mut sq_offset = 0;
-            let mut sq_size = 0;
-            let mut actual_sq_path = "";
 
-            for path in &squashfs_candidates {
-                if let Ok((offset, size)) = reader.get_file_location(path) {
-                    sq_offset = offset;
-                    sq_size = size;
-                    actual_sq_path = path;
-                    break; 
+            let (sq_offset, sq_size, actual_sq_path) = match initramfs_patcher::locate_squashfs(reader) {
+                Ok(res) => res,
+                Err(e) => {
+                    let _ = tx.send(EventMsg::error(&e));
+                    return Err("Unrecognized Linux distribution layout".to_string());
                 }
-            }
-
-            if sq_size == 0 {
-                let _ = tx.send(EventMsg::error("Could not find a known SquashFS root filesystem."));
-                return Err("Unrecognized Linux distribution layout".to_string());
-            }
+            };
 
             let _ = tx.send(EventMsg::log(&format!("Found SquashFS at: {}", actual_sq_path)));
 
@@ -794,7 +790,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             })?;
 
             // Fire the patcher
-            let modules_to_fetch = ["fat.ko", "vfat.ko", "nls_cp437.ko", "nls_iso8859_1.ko"];
+            let modules_to_fetch = ["fat.ko", "vfat.ko", "nls_cp437.ko", "nls_iso8859_1.ko", "nls_utf8.ko"];
             let kver = kernel_version_for_patch.as_deref().unwrap();
             
             let _ = tx.send(EventMsg::log("Extracting kernel modules via Virtual Bridge..."));
@@ -810,7 +806,78 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             *bytes_written += entry.size;
             let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
             
+
+        } else if is_grub_efi || is_hidden_efi {
+            let mut file_data = Vec::new();
+            reader.stream_file(stream_path, &mut |chunk| {
+                file_data.extend_from_slice(chunk);
+                Ok(())
+            })?;
+
+            // A valid PE32+ executables starts with 'MZ' (0x4D, 0x5A)
+            let is_pe_executable = file_data.len() >= 2 && file_data[0] == 0x4D && file_data[1] == 0x5A;
+
+            if is_pe_executable {
+                // A real EFI binary, try to patch it natively
+                let successfully_patched = grub_patcher::patch_grub_efi(
+                    &mut file_data, 
+                    original_iso_label, 
+                    new_usb_label
+                );
+
+                // Try to patch the hidden UUID search in the memdisk
+                if grub_patcher::patch_memdisk_uuid_to_label(&mut file_data, new_usb_label) {
+                    let _ = tx.send(EventMsg::log(&format!("[+] Successfully binary-patched memdisk UUID search in {}", clean_name)));
+                }
+
+                if successfully_patched {
+                    let _ = tx.send(EventMsg::log(&format!("[+] Natively patched GRUB2 ({}). Disabling Sprout fallback.", clean_name)));
+                    *use_sprout_bootloader = false; 
+                }
+
+                // Write the file
+                let mut out_file = writer.open_file_writer(&new_path, file_data.len() as u64)?;
+                out_file.write_all(&file_data).map_err(|e| e.to_string())?;
+                out_file.flush().map_err(|e| e.to_string())?;
+
+                // The UEFI Fallback Mirror
+                let efi_fallback_path = format!("/EFI/BOOT/{}", clean_name.to_uppercase());
+                if !new_path.eq_ignore_ascii_case(&efi_fallback_path) {
+                    let is_new_mirror = WRITTEN_PATHS.with(|paths| paths.borrow_mut().insert(efi_fallback_path.clone()));
+                    if is_new_mirror {
+                        let _ = tx.send(EventMsg::log(&format!("Mirroring {} to strict UEFI path: {}", clean_name, efi_fallback_path)));
+                        let _ = writer.create_dir_all("/EFI/BOOT");
+                        
+                        if let Ok(mut fb_file) = writer.open_file_writer(&efi_fallback_path, file_data.len() as u64) {
+                            let _ = fb_file.write_all(&file_data);
+                            let _ = fb_file.flush();
+                        }
+                    } else {
+                        let _ = tx.send(EventMsg::log(&format!("Skipping mirror for {}, path already exists.", clean_name)));
+                    }
+                }
+            } else {
+                // a FAT image (whether named .img or disguised as .efi)
+                let _ = tx.send(EventMsg::log(&format!("File {} lacks MZ magic bytes. Processing as FAT image...", clean_name)));
+
+                // Crack it open and extract the true bootloader
+                if !*use_sprout_bootloader {
+                    let _ = tx.send(EventMsg::log(&format!("Intercepted hidden EFI image: {}", clean_name)));
+                    if let Err(e) = inject_hidden_efi(file_data, writer, tx, new_usb_label) {                        let _ = tx.send(EventMsg::log(&format!("[-] Failed to inject hidden EFI: {}", e)));
+                    } else {
+                        let _ = tx.send(EventMsg::log("[+] Hidden EFI extracted to metal successfully."));
+                    }
+                }
+
+                *bytes_written += entry.size;
+                let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
+            }
+            
+            *bytes_written += entry.size;
+            let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
+
         } else if is_config {
+
             // Buffer the config file entirely in RAM before writing so we can patch the string safely!
             let mut config_data = Vec::new();
             reader.stream_file(stream_path, &mut |chunk| {
@@ -820,6 +887,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             
             let final_data = if let Ok(cfg_str) = std::str::from_utf8(&config_data) {
                 let patched = bootloader::patch_boot_labels(cfg_str, new_usb_label);
+                               
                 bootloader::scrape_boot_args(&patched, found_args, new_usb_label);
                 if patched != cfg_str {
                     let _ = tx.send(EventMsg::log(&format!("Patched boot label inside: {}", new_path)));
@@ -837,31 +905,6 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             // Add the *original* entry size to the progress bar to maintain UI math
             *bytes_written += entry.size;
             let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
-
-        } else if is_hidden_efi {
-            // Buffer the image into RAM while also streaming it to the USB
-            let mut img_data = Vec::new();
-            let mut out_file = writer.open_file_writer(&new_path, entry.size)?;
-            
-            reader.stream_file(stream_path, &mut |chunk| {
-                img_data.extend_from_slice(chunk);
-                out_file.write_all(chunk).map_err(|e| e.to_string())?;
-                
-                *bytes_written += chunk.len() as u64;
-                let _ = tx.send(EventMsg::progress(*bytes_written, total_size));
-                Ok(())
-            })?;
-            out_file.flush().map_err(|e| e.to_string())?;
-            
-            // If we aren't using Sprout, inject the hidden EFI directly to the metal
-            if !use_sprout_bootloader {
-                let _ = tx.send(EventMsg::log(&format!("Intercepted hidden EFI image: {}", clean_name)));
-                if let Err(e) = inject_hidden_efi(img_data, writer) {
-                    let _ = tx.send(EventMsg::log(&format!("[-] Failed to inject hidden EFI: {}", e)));
-                } else {
-                    let _ = tx.send(EventMsg::log("[+] Hidden EFI extracted to metal successfully."));
-                }
-            }
 
         } else {
             // Not a config file: stream directly from disk to disk (Ultra Fast!)
@@ -915,7 +958,7 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
             PyRuntimeError::new_err(format!("Inspection failed: {}", e))
         })?
     } else {
-        let bare_fs = fat32::BareFat32::mount(wrapped_partition).map_err(|e| {
+        let bare_fs = fat32::BareFat32::mount(wrapped_partition, 0, 0).map_err(|e| {
             PyRuntimeError::new_err(format!("Failed to mount bare FAT32: {}", e))
         })?;
         bare_fs.inspect_all().map_err(|e| {
@@ -927,165 +970,3 @@ pub fn inspect_usb_partition(device_path: String) -> PyResult<Vec<String>> {
 }
 
 
-fn extract_to_fs<R: ImageReader>(reader: &R, current_path: &str, host_dir: &Path) -> Result<(), String> {
-    let entries = reader.list_dir(current_path)?;
-    for entry in entries {
-        let clean_name = entry.name;
-        if clean_name == "." || clean_name == ".." || clean_name.is_empty() { continue; }
-
-        let new_img_path = if current_path.is_empty() { format!("/{}", clean_name) } else { format!("{}/{}", current_path, clean_name) };
-        let new_host_path = host_dir.join(&clean_name);
-
-        if entry.is_dir {
-            std::fs::create_dir_all(&new_host_path).map_err(|e| e.to_string())?;
-            extract_to_fs(reader, &new_img_path, &new_host_path)?;
-        } else {
-            let stream_path = entry.symlink_target.unwrap_or(new_img_path);
-            let mut out_file = File::create(&new_host_path).map_err(|e| e.to_string())?;
-            reader.stream_file(&stream_path, &mut |chunk| {
-                out_file.write_all(chunk).map_err(|e| e.to_string())
-            })?;
-        }
-    }
-    Ok(())
-}
-
-
-#[pyfunction]
-#[pyo3(signature = (image_path, extract_dir))]
-pub fn extract_image(image_path: String, extract_dir: String) -> PyResult<()> {
-    let host_root = Path::new(&extract_dir);
-    if !host_root.exists() {
-        std::fs::create_dir_all(host_root)?;
-    }
-
-    let mut file = File::open(&image_path).map_err(|e| {
-        PyIOError::new_err(format!("Failed to open ISO: {}", e))
-    })?;
-
-    let is_udf_valid = if let Ok(udf_ctx) = udf::mount_udf(&mut file) {
-        udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb).is_ok()
-    } else { 
-        false 
-    };
-
-    if is_udf_valid {
-        let udf_ctx = udf::mount_udf(&mut file).unwrap();
-        let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
-        extract_to_fs(&reader, "", host_root).map_err(|e| {
-            PyRuntimeError::new_err(e)
-        })?;
-    } else {
-        let iso_file = File::open(&image_path)?;
-        let iso = IsoImage::open(iso_file).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to parse ISO9660: {:?}", e))
-        })?;
-        let reader = IsoReader { iso: &iso };
-        extract_to_fs(&reader, "", host_root).map_err(|e| {
-            PyRuntimeError::new_err(e)
-        })?;
-    }
-
-    Ok(())
-}
-
-
-#[pyfunction]
-#[pyo3(signature = (image_path, wim_path="sources/install.wim"))]
-pub fn get_wim_info_from_iso<'py>(py: Python<'py>, image_path: String, wim_path: &str) -> PyResult<Bound<'py, PyDict>> {
-    
-    let wim_path_owned = wim_path.to_string();
-
-    let wim_info_result: Option<esd::WimInfo> = py.detach(move || {
-        
-        let mut file = File::open(&image_path).ok()?;
-        
-        let is_udf_valid = if let Ok(udf_ctx) = udf::mount_udf(&mut file) {
-            udf::read_directory(&mut file, udf_ctx.partition_start, &udf_ctx.root_icb).is_ok()
-        } else { false };
-
-        let mut result = None;
-
-        let mut execute_wim_scan = |reader: &dyn ImageReader| -> Result<(), String> {
-            let mut current_offset = 0u64;
-            let mut xml_offset = 0u64;
-            let mut xml_size = 0u64;
-            let mut xml_buffer = Vec::new();
-            let mut header_buffer = Vec::new();
-
-            let stream_res = reader.stream_file(&wim_path_owned, &mut |chunk| {
-                if xml_size == 0 {
-                    header_buffer.extend_from_slice(chunk);
-                    if header_buffer.len() >= 204 {
-                        let header = &header_buffer[0..204];
-                        if &header[0..8] != b"MSWIM\x00\x00\x00" && &header[0..8] != b"WLPWM\x00\x00\x00" {
-                            return Err("Invalid WIM Header".to_string());
-                        }
-                        
-                        let mut size_arr = [0u8; 8];
-                        size_arr[..7].copy_from_slice(&header[72..79]);
-                        xml_size = u64::from_le_bytes(size_arr);
-                        
-                        let mut offset_arr = [0u8; 8];
-                        offset_arr.copy_from_slice(&header[80..88]);
-                        xml_offset = u64::from_le_bytes(offset_arr);
-                        
-                        if xml_size == 0 || xml_size > 50 * 1024 * 1024 {
-                            return Err("Invalid XML bounds".to_string());
-                        }
-                    }
-                }
-                
-                let chunk_end = current_offset + chunk.len() as u64;
-                if xml_size > 0 && chunk_end > xml_offset {
-                    let overlap_start = if current_offset < xml_offset { 
-                        (xml_offset - current_offset) as usize 
-                    } else { 0 };
-                    
-                    let overlap_data = &chunk[overlap_start..];
-                    xml_buffer.extend_from_slice(overlap_data);
-                    
-                    if xml_buffer.len() as u64 >= xml_size {
-                        xml_buffer.truncate(xml_size as usize);
-                        result = esd::parse_xml_payload(&xml_buffer);
-                        return Err("ABORT_SUCCESS".to_string());
-                    }
-                }
-
-                current_offset += chunk.len() as u64;
-                Ok(())
-            });
-
-            if let Err(e) = stream_res {
-                if e != "ABORT_SUCCESS" { return Err(e); }
-            }
-            Ok(())
-        };
-
-        if is_udf_valid {
-            let udf_ctx = udf::mount_udf(&mut file).unwrap();
-            let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
-            let _ = execute_wim_scan(&reader);
-        } else {
-            let iso_file = File::open(&image_path).ok()?;
-            let iso = IsoImage::open(iso_file).ok()?;
-            let reader = IsoReader { iso: &iso };
-            let _ = execute_wim_scan(&reader);
-        }
-
-        result
-    });
-
-    let info = wim_info_result.ok_or_else(|| PyValueError::new_err("Could not parse WIM info from ISO"))?;
-
-    let dict = PyDict::new(py);
-    if let Some(arch) = info.architecture {
-        dict.set_item("architecture", arch)?;
-    }
-    dict.set_item("editions", info.editions)?;
-    dict.set_item("total_size_bytes", info.total_size_bytes)?;
-    dict.set_item("raw_xml", info.raw_xml)?;
-    dict.set_item("suggested_label", info.suggested_label)?;
-
-    Ok(dict.into_any().cast_into::<PyDict>().unwrap())
-}

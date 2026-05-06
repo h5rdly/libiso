@@ -160,6 +160,8 @@ pub struct BareFat32<T: Read + Write + Seek> {
     pub dir_map: Mutex<HashMap<String, u32>>,
     pub file_map: Mutex<HashMap<String, (u32, u64)>>,
     pub next_free: Mutex<u32>,
+    pub fat_date: u16, 
+    pub fat_time: u16, 
 }
 
 
@@ -173,7 +175,7 @@ pub fn split_path(path: &str) -> (&str, &str) {
 
 impl<T: Read + Write + Seek> BareFat32<T> {
 
-    pub fn mount(mut inner: T) -> Result<Self, String> {
+    pub fn mount(mut inner: T, fat_date: u16, fat_time: u16) -> Result<Self, String> {
         let mut boot = [0u8; 512];
         inner.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         inner.read_exact(&mut boot).map_err(|e| e.to_string())?;
@@ -201,6 +203,8 @@ impl<T: Read + Write + Seek> BareFat32<T> {
             dir_map: Mutex::new(HashMap::new()),
             file_map: Mutex::new(HashMap::new()),
             next_free: Mutex::new(3), // Cluster 2 is the root dir, so 3 is the next free
+            fat_date,
+            fat_time,
         })
     }
 
@@ -416,8 +420,8 @@ impl<T: Read + Write + Seek> BareFat32<T> {
 }
 
 
-fn build_fat32_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> Vec<[u8; 32]> {
-    
+fn build_fat32_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool, fat_date: u16, fat_time: u16) -> Vec<[u8; 32]> {
+
     let mut entries = Vec::new();
     
     // Generate 8.3 Short File Name (SFN)
@@ -428,18 +432,46 @@ fn build_fat32_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> V
         if parts.len() == 2 { (parts[1], parts[0]) } else { (name_upper.as_str(), "") }
     };
 
-    let clean_stem: String = stem.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
-    let clean_ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    // Does the name naturally fit the 8.3 DOS standard
+    let is_perfect_83 = stem.len() <= 8 && ext.len() <= 3
+        && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
 
-    let stem_bytes = clean_stem.as_bytes();
-    let copy_len = std::cmp::min(6, stem_bytes.len());
-    sfn[..copy_len].copy_from_slice(&stem_bytes[..copy_len]);
-    sfn[6] = b'~';
-    sfn[7] = b'1'; 
+    if is_perfect_83 {
+        // It's a perfect fit! Skip hashing and just write the clean name.
+        sfn[..stem.len()].copy_from_slice(stem.as_bytes());
+        sfn[8..8+ext.len()].copy_from_slice(ext.as_bytes());
+    } else {
+        // --- 2. HASH FALLBACK FOR NON-STANDARD NAMES ---
+        let clean_stem: String = stem.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+        let clean_ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
 
-    let ext_bytes = clean_ext.as_bytes();
-    let ext_len = std::cmp::min(3, ext_bytes.len());
-    sfn[8..8+ext_len].copy_from_slice(&ext_bytes[..ext_len]);
+        // FNV-1A 32-bit hash
+        let mut hash_val: u32 = 2166136261;
+        for &b in name_upper.as_bytes() {
+            hash_val ^= b as u32;
+            hash_val = hash_val.wrapping_mul(16777619);
+        }
+        // Fold the 32-bit hash into 16 bits to get a 4-character hex string
+        let folded_hash = (hash_val ^ (hash_val >> 16)) & 0xFFFF;
+        let hash_str = format!("{:04X}", folded_hash);
+
+        let stem_bytes = clean_stem.as_bytes();
+        let copy_len = std::cmp::min(2, stem_bytes.len());
+        sfn[..copy_len].copy_from_slice(&stem_bytes[..copy_len]);
+
+        let mut idx = copy_len;
+        for b in hash_str.as_bytes() {
+            sfn[idx] = *b;
+            idx += 1;
+        }
+        sfn[idx] = b'~';
+        sfn[idx+1] = b'1';
+
+        let ext_bytes = clean_ext.as_bytes();
+        let ext_len = std::cmp::min(3, ext_bytes.len());
+        sfn[8..8+ext_len].copy_from_slice(&ext_bytes[..ext_len]);
+    }
 
     // Compute SFN Checksum for LFN Binding
     let mut checksum: u8 = 0;
@@ -483,11 +515,17 @@ fn build_fat32_entry_set(name: &str, cluster: u32, size: u64, is_dir: bool) -> V
     sfn_entry[26..28].copy_from_slice(&cluster_lo.to_le_bytes());
     sfn_entry[28..32].copy_from_slice(&(size as u32).to_le_bytes());
 
+    let date_bytes = fat_date.to_le_bytes();
+    let time_bytes = fat_time.to_le_bytes();
+    sfn_entry[14..16].copy_from_slice(&time_bytes); // Create time
+    sfn_entry[16..18].copy_from_slice(&date_bytes); // Create date
+    sfn_entry[18..20].copy_from_slice(&date_bytes); // Access date
+    sfn_entry[22..24].copy_from_slice(&time_bytes); // Modify time
+    sfn_entry[24..26].copy_from_slice(&date_bytes); // Modify date
+
     entries.push(sfn_entry);
     entries
 }
-
-
 
 
 // -- Aux structs and trait implelentations for writer / verifier
@@ -520,8 +558,13 @@ impl<T: Read + Write + Seek> UsbWriter for BareFat32<T> {
 
     fn create_dir(&self, path: &str) -> Result<(), String> {
 
-        let (parent_path, name) = split_path(path);
+        let clean_path = path.trim_matches('/').to_uppercase();
         let mut dir_map = self.dir_map.lock().unwrap();
+        if dir_map.contains_key(&clean_path) {
+            return Ok(());
+        }
+
+        let (parent_path, name) = split_path(path);
         let parent_cluster = *dir_map.get(&parent_path.to_uppercase()).unwrap_or(&self.root_cluster);
         
         let new_cluster = self.alloc_clusters(self.bytes_per_cluster)?;
@@ -559,10 +602,11 @@ impl<T: Read + Write + Seek> UsbWriter for BareFat32<T> {
         }
         
         // Add the directory's name to the parent directory's cluster
-        let entries = build_fat32_entry_set(name, new_cluster, 0, true);
+        let entries = build_fat32_entry_set(name, new_cluster, 0, true, self.fat_date, self.fat_time);
         self.append_entries(parent_cluster, &entries)?;
         
-        dir_map.insert(path.trim_matches('/').to_uppercase(), new_cluster);
+        // Cache it so we never duplicate it
+        dir_map.insert(clean_path, new_cluster);
         Ok(())
     }
 
@@ -574,8 +618,7 @@ impl<T: Read + Write + Seek> UsbWriter for BareFat32<T> {
         let parent_cluster = *dir_map.get(&parent_path.to_uppercase()).unwrap_or(&self.root_cluster);
         
         let file_cluster = self.alloc_clusters(size)?;
-        let entries = build_fat32_entry_set(name, file_cluster, size, false);
-        self.append_entries(parent_cluster, &entries)?;
+        let entries = build_fat32_entry_set(name, file_cluster, size, false, self.fat_date, self.fat_time);        self.append_entries(parent_cluster, &entries)?;
         
         // Cache the file location in memory so we NEVER have to parse the FAT table during verification
         self.file_map.lock().unwrap().insert(path.trim_matches('/').to_uppercase(), (file_cluster, size));

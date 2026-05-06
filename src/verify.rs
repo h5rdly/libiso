@@ -99,15 +99,25 @@ pub fn verify<R: ImageReader, U: UsbReader>(
             
             // Skip injected files AND any config files we might have dynamically patched!
             let mut skip_verify = matches!(clean_lower.as_str(), 
-                "sprout.toml" | "autounattend.xml" | "autorun.inf"
+                "sprout.toml" | "autounattend.xml" | "autorun.inf" | 
+                "bootx64.efi" | "grubx64.efi" | "bootaa64.efi" 
             ) || clean_lower.ends_with(".cfg") || clean_lower.ends_with(".conf");
             
+            // Skip the initramfs since our Virtual Bridge patched it in RAM 
+            let is_initrd = crate::bootloader::LINUX_INITRAMFS_PREFIXES.iter()
+                .any(|&prefix| clean_lower.starts_with(prefix));
+
+            if is_initrd {
+                skip_verify = true;
+            }
+
             // If we injected Sprout, skip verifying the EFI boot files
             if use_sprout_bootloader && matches!(clean_lower.as_str(), "bootx64.efi" | "bootaa64.efi") {
                 skip_verify = true;
             }
 
             if skip_verify {
+                let _ = tx.send(EventMsg::log(&format!("Skipping verification for patched file: {}", new_path)));
                 *verified += entry.size; 
                 let _ = tx.send(EventMsg::progress(*verified, total_size));
                 continue;

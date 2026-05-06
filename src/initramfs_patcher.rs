@@ -280,6 +280,40 @@ pub fn patch_initramfs<R: Read + Seek + Send>(
             continue; // Don't write it yet! We'll write the patched version at the end.
         }
         
+        // Intercept and patch the Mandriva Boot Script
+        if file_name == "usr/bin/liveiso-root" || file_name == "sbin/liveiso-root" {
+            // 1. EXTRACT METADATA FIRST (Before we consume the reader)
+            let builder = Builder::new(&file_name)
+                .ino(reader.entry().ino()).mode(reader.entry().mode()) 
+                .uid(reader.entry().uid()).gid(reader.entry().gid())
+                .nlink(reader.entry().nlink()).mtime(reader.entry().mtime())
+                .dev_major(reader.entry().dev_major()).dev_minor(reader.entry().dev_minor())
+                .rdev_major(reader.entry().rdev_major()).rdev_minor(reader.entry().rdev_minor());
+
+            // 2. CONSUME THE READER TO GET THE DATA
+            let mut buf = Vec::new();
+            let temp_writer = reader.to_writer(Cursor::new(&mut buf)).map_err(|e| e.to_string())?;
+            let mut script = String::from_utf8_lossy(&buf).to_string();
+
+            // 3. INJECT OUR TRACER ROUNDS
+            let injection = r#"
+echo "[LIBISO] ========================================" > /dev/kmsg
+echo "[LIBISO] STARTING LIVEISO-ROOT SCRIPT!" > /dev/kmsg
+echo "[LIBISO] Target device: $livedev" > /dev/kmsg
+echo "[LIBISO] UEFI flag: $liveuefi" > /dev/kmsg
+echo "[LIBISO] ========================================" > /dev/kmsg
+"#;
+            script = script.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", &format!("PATH=/usr/sbin:/usr/bin:/sbin:/bin\n{}", injection));
+
+            // 4. WRITE IT ALL BACK
+            let mut file_writer = builder.write(&mut output_stream, script.len() as u32);
+            file_writer.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+            file_writer.finish().map_err(|e| e.to_string())?;
+
+            reader = Reader::new(temp_writer).map_err(|e| e.to_string())?;
+            continue;
+        }
+
         // Standard copy for everything else
         let builder = Builder::new(&file_name)
             .ino(reader.entry().ino()).mode(reader.entry().mode())
@@ -299,24 +333,41 @@ pub fn patch_initramfs<R: Read + Seek + Send>(
     let base_mod_dir = format!("usr/lib/modules/{}/kernel/fs/fat", kernel_version);
     let nls_mod_dir = format!("usr/lib/modules/{}/kernel/fs/nls", kernel_version);
 
+    let mut successfully_injected = Vec::new();
+
     for mod_name in modules_to_fetch {
-        let (_, mod_bytes) = extract_file_from_squashfs(&mut *squashfs_reader, mod_name)
-            .map_err(|e| format!("Missing {}: {}", mod_name, e))?;
-        
-        // Determine where to put it in the initramfs
-        let target_dir = if mod_name.starts_with("nls") { &nls_mod_dir } else { &base_mod_dir };
-        let inject_path = format!("{}/{}", target_dir, mod_name);
-        
-        //  Inject into the CPIO stream
-        println!("    -> Injecting {}", inject_path);
-        inject_file(&mut output_stream, &inject_path, &mod_bytes)?;
+        match extract_file_from_squashfs(&mut *squashfs_reader, mod_name) {
+            Ok((_, mod_bytes)) => {
+                let target_dir = if mod_name.starts_with("nls") { &nls_mod_dir } else { &base_mod_dir };
+                let inject_path = format!("{}/{}", target_dir, mod_name);
+                
+                println!("    -> Injecting {}", inject_path);
+                inject_file(&mut output_stream, &inject_path, &mod_bytes)?;
+                successfully_injected.push(*mod_name);
+            }
+            Err(_) => {
+                // If it's missing, it's likely built into vmlinuz directly
+                println!("    -> Warning: {} not found in SquashFS. Skipping.", mod_name);
+            }
+        }
     }
 
-    // Append dependencies to the plain text file
-    let appended_dep_text = format!(
-        "{}\n{}/vfat.ko: {}/fat.ko\n{}/fat.ko:\n{}/nls_cp437.ko:\n{}/nls_iso8859_1.ko:\n",
-        old_dep_text.trim_end(), base_mod_dir, base_mod_dir, base_mod_dir, nls_mod_dir, nls_mod_dir
-    );
+    // Generate modules.dep 
+    let mut appended_dep_text = old_dep_text.trim_end().to_string();
+    appended_dep_text.push('\n');
+
+    for mod_name in &successfully_injected {
+        let target_dir = if mod_name.starts_with("nls") { &nls_mod_dir } else { &base_mod_dir };
+        
+        // vfat.ko depends on fat.ko (if we actually injected fat.ko)
+        if *mod_name == "vfat.ko" && successfully_injected.contains(&"fat.ko") {
+            appended_dep_text.push_str(&format!("{}/vfat.ko: {}/fat.ko\n", target_dir, base_mod_dir));
+        } else {
+            // Everything else has no dependencies
+            appended_dep_text.push_str(&format!("{}/{}:\n", target_dir, mod_name));
+        }
+    }
+
     inject_file(&mut output_stream, &dep_text_path, appended_dep_text.as_bytes())?;
 
     // Generate .bin from scratch

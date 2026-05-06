@@ -21,6 +21,8 @@ mod gpt;
 mod events;
 mod initramfs_patcher;
 mod kmod;
+mod extraction;
+mod grub_patcher;
 
 
 use drives::{list_removable_drives, DriveInfo};
@@ -29,12 +31,12 @@ use test_utils::{
     create_mock_iso, FakeDrive, test_verify_fake_drive_sync, create_mock_esd, hash_sha256
 };
 use events::{EventMsg, ProgressStream, AbortToken};
+use crate::extraction::{extract_image, get_wim_info_from_iso};
 use writer::{
-    write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition, extract_image,
-    get_wim_info_from_iso
-};
+    write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition, };
 use verify::{destructive_verify_usb_size};
 use initramfs_patcher::{patch_initramfs_py, extract_file_from_squashfs_py};
+use grub_patcher::scan_efi_pattern_py;
 
 
 #[pymodule]
@@ -48,6 +50,8 @@ fn _libiso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(list_removable_drives, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_image, m)?)?;
     m.add_function(wrap_pyfunction!(destructive_verify_usb_size, m)?)?; 
+
+    m.add_function(wrap_pyfunction!(scan_efi_pattern_py, m)?)?; 
     // m.add_function(wrap_pyfunction!(drives::_list_all_volumes, m)?)?; 
     
     // Writing

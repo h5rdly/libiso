@@ -77,6 +77,15 @@ pub fn detect_linux_payloads(
 pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
     let mut result = cfg.to_string();
     
+     // Inject FAT32 & GPT drivers. If the distro didn't include them, GRUB will fail to read Long File Names on the USB
+    if !result.contains("insmod fat") {
+        result = result.replacen("set default", "insmod part_gpt\ninsmod fat\nset default", 1);
+        // Fallback if 'set default' isn't the first line
+        if !result.contains("insmod fat") {
+            result = format!("insmod part_gpt\ninsmod fat\n{}", result);
+        }
+    }
+    
     // Patch kernel arguments (e.g., root=live:UUID=... -> root=live:LABEL=NEW_LABEL)
     let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "UUID=", "uuid="];
     for prefix in prefixes {
@@ -247,12 +256,28 @@ pub fn write_sprout_toml<W: UsbWriter>(
         // --- KERNEL ARGUMENT INJECTION ---
         let mut args = kernel_args.unwrap_or("quiet splash").to_string();
         
-        if inject_fat_drivers {
-            // rd.driver.pre=... forces Dracut (Fedora, OpenMandriva, Mageia) to load modules early
-            // modules=... forces mkinitcpio (Arch) and initramfs-tools (Debian) to load modules early
-            args.push_str(" rd.driver.pre=vfat,nls_cp437,nls_iso8859_1 modules=vfat,nls_cp437,nls_iso8859_1");
+        // 1. Fix the Label Match (OpenMandriva/Fedora LiveOS trap)
+        if args.contains("CDLABEL=") {
+            if let Some(start_idx) = args.find("CDLABEL=") {
+                let expected = args[start_idx + 8..].split_whitespace().next().unwrap_or("");
+                args = args.replace(expected, os_name);
+            }
+        } else if args.contains("LABEL=") {
+            if let Some(start_idx) = args.find("LABEL=") {
+                let expected = args[start_idx + 6..].split_whitespace().next().unwrap_or("");
+                args = args.replace(expected, os_name);
+            }
         }
-        
+
+        // 2. Inject FAT drivers and UEFI flag ONLY ONCE
+        if inject_fat_drivers {
+            /* rd.driver.pre=... forces Dracut (Fedora, OpenMandriva, Mageia) to load modules early
+               modules=... forces mkinitcpio (Arch) and initramfs-tools (Debian) to load modules early
+               We append the "UEFI" flag to coerce OpenMandriva/Mageia scripts to take the 'vfat' mount branch
+            */
+            args.push_str(" rd.driver.pre=vfat,nls_cp437,nls_iso8859_1,nls_utf8 modules=vfat,nls_cp437,nls_iso8859_1,nls_utf8 UEFI");
+        }
+            
         toml.push_str(&format!("options = ['{}']\n", args));
     }
     
