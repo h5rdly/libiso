@@ -300,7 +300,7 @@ def burn_worker():
                 partition_scheme=partition_scheme,
                 verify_written=verify,
                 abort_token=state['abort_token'],
-                use_sprout_bootloader=use_sprout_bootloader 
+                use_sprout_bootloader= use_sprout_bootloader 
             )
             
         # Event loop is the same for ISO and DD mode

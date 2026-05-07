@@ -139,10 +139,26 @@ pub fn format_usb_drive(
     ).map_err(|e| PyIOError::new_err(e))?;
     dest_file.sync_all()?;
 
+    let mut lba0_bytes = [0u8; 512];
+    dest_file.seek(SeekFrom::Start(0))?;
+    dest_file.read_exact(&mut lba0_bytes)?;
+    dest_file.seek(SeekFrom::Start(0))?;
+    dest_file.write_all(&[0u8; 512])?;
+    dest_file.sync_all()?;
+
     let partition_offset = geom_start_lba * 512;
     let partition_size = (geom_safe_end_lba - geom_start_lba + 1) * 512;
     let mut wrapped_partition = PartitionWrapper { inner: dest_file, offset: partition_offset, size: partition_size };
     format_partition(&mut wrapped_partition, is_exfat, volume_label, geom_start_lba).map_err(|e| PyRuntimeError::new_err(e))?;
+
+    // Restore LBA 0 and tell the OS to wake up and look at the new filesystem
+    let mut dest_file = wrapped_partition.inner;
+    dest_file.seek(SeekFrom::Start(0))?;
+    dest_file.write_all(&lba0_bytes)?;
+    dest_file.sync_all()?;
+    
+    // Attempt to trigger udev/udisks2 reread
+    let _ = trigger_os_reread(&dest_file, &device_path);
 
     Ok(())
 }
@@ -476,7 +492,7 @@ pub fn write_image_iso(
         has_large_file
     ).map_err(|e| PyIOError::new_err(e))?;
 
-    dest_file.sync_all()?;
+    // dest_file.sync_all()?;
 
     let mut lba0_bytes = [0u8; 512];
     dest_file.seek(SeekFrom::Start(0))?;
@@ -848,7 +864,10 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
         bootloader::detect_linux_payloads(&clean_name, current_path, found_kernel, found_initrd);
         
         // Look for configuration files that might contain the hardcoded 32-character ISO label
-        let is_config = clean_name.to_lowercase().ends_with(".cfg") || clean_name.to_lowercase().ends_with(".conf");
+        let clean_lower = clean_name.to_lowercase();
+        let is_config = clean_lower.ends_with(".cfg") 
+            || clean_lower.ends_with(".conf")
+            || clean_lower == "start_cfg";
         let is_hidden_efi = ["efi.img", "efiboot.img", "macefi.img"].iter()
             .any(|&name| clean_name.eq_ignore_ascii_case(name));
         let is_initrd = bootloader::LINUX_INITRAMFS_PREFIXES.iter()
@@ -889,7 +908,10 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             })?;
 
             // Fire the patcher
-            let modules_to_fetch = ["fat.ko", "vfat.ko", "nls_cp437.ko", "nls_iso8859_1.ko", "nls_utf8.ko"];
+            let modules_to_fetch = [
+                "fat.ko", "vfat.ko", "nls_cp437.ko", "nls_iso8859_1.ko", "nls_utf8.ko",
+                "modules.dep.bin", "modules.alias.bin", "modules.symbols.bin",
+                ];
             let kver = kernel_version_for_patch.as_deref().unwrap();
             
             let _ = tx.send(EventMsg::log("Extracting kernel modules via Virtual Bridge..."));
@@ -996,8 +1018,7 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             })?;
             
             let final_data = if let Ok(cfg_str) = std::str::from_utf8(&config_data) {
-                let patched = bootloader::patch_boot_labels(cfg_str, new_usb_label);
-                               
+                let patched = bootloader::patch_boot_labels(cfg_str, new_usb_label, kernel_version_for_patch.is_some());
                 bootloader::scrape_boot_args(&patched, found_args, new_usb_label);
                 if patched != cfg_str {
                     let _ = tx.send(EventMsg::log(&format!("Patched boot label inside: {}", new_path)));

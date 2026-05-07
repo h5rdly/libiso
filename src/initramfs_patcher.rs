@@ -4,6 +4,9 @@ use std::{
 };
 
 use backhand::{FilesystemReader, InnerNode};
+// use zstd::stream::read::Decoder as ZstdDecoder;
+// use flate2::read::GzDecoder;
+
 use pyo3::{prelude::*, exceptions::PyRuntimeError};
 
 use crate::image_parser::ImageReader;
@@ -183,6 +186,12 @@ pub fn patch_initramfs<R: Read + Seek + Send>(
 ) -> Result<Vec<u8>, String> {
     
     let mut final_initrd = original_initrd.to_vec();
+    
+    // The Linux kernel CPIO parser requires the `070701` magic header to be strictly 4-byte aligned
+    while final_initrd.len() % 4 != 0 {
+        final_initrd.push(0);
+    }
+
     let mut appended_cpio = Vec::new();
     let kver_short = kernel_version.split_whitespace().next().unwrap_or(kernel_version);
 
@@ -207,7 +216,9 @@ pub fn patch_initramfs<R: Read + Seek + Send>(
                         let mut file_reader = fs.file(squashfs_file).reader();
                         let mut extracted_bytes = Vec::new();
                         if file_reader.read_to_end(&mut extracted_bytes).is_ok() {
+                            
                             found_data = Some(extracted_bytes);
+                            
                             // Preserve the exact path (removing the leading slash)
                             actual_path = path_str.trim_start_matches('/').to_string();
                             break;

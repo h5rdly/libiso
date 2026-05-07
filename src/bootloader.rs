@@ -74,7 +74,7 @@ pub fn detect_linux_payloads(
 
 
 
-pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
+pub fn patch_boot_labels(cfg: &str, new_label: &str, inject_fat_kernel_args: bool) -> String {
     let mut result = cfg.to_string();
     
      // Inject FAT32 & GPT drivers. If the distro didn't include them, GRUB will fail to read Long File Names on the USB
@@ -85,7 +85,24 @@ pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
             result = format!("insmod part_gpt\ninsmod fat\n{}", result);
         }
     }
-    
+
+    // Patch search.fs_uuid strings
+    let mut current = 0;
+    while let Some(idx) = result[current..].find("search.fs_uuid") {
+        let start = current + idx;
+        let end_offset = result[start..].find('\n').unwrap_or(result[start..].len() - start);
+        let end = start + end_offset;
+        
+        // Extract the variable name at the end of the line (e.g., "root")
+        let parts: Vec<&str> = result[start..end].split_whitespace().collect();
+        let var_name = if parts.len() >= 3 { parts.last().unwrap() } else { "root" };
+        
+        // Rewrite the command to use our FAT32 label
+        let replacement = format!("search.fs_label '{}' {}", new_label, var_name);
+        result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
+        current = start + replacement.len();
+    }
+
     // Patch kernel arguments (e.g., root=live:UUID=... -> root=live:LABEL=NEW_LABEL)
     let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "UUID=", "uuid="];
     for prefix in prefixes {
@@ -123,6 +140,23 @@ pub fn patch_boot_labels(cfg: &str, new_label: &str) -> String {
         let end = val_start + end_offset;
         result = format!("{}{}{}", &result[..val_start], new_label, &result[end..]);
         current = val_start + new_label.len() + if has_quote { 1 } else { 0 };
+   
+        if inject_fat_kernel_args {
+            let mut new_result = String::new();
+            for line in result.lines() {
+                let trimmed = line.trim_start();
+                // Append our modprobe forces to the end of the linux execution lines!
+                if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
+                    new_result.push_str(line);
+                    new_result.push_str(" rd.driver.pre=vfat,nls_cp437,nls_iso8859_1,nls_utf8 modules=vfat,nls_cp437,nls_iso8859_1,nls_utf8\n");
+                } else {
+                    new_result.push_str(line);
+                    new_result.push('\n');
+                }
+            }
+            result = new_result;
+        }
+   
     }
 
     result
