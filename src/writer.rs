@@ -148,6 +148,96 @@ pub fn format_usb_drive(
 }
 
 
+// -- Pre-write analyzing logic
+
+
+#[pyclass(skip_from_py_object)]
+#[derive(Clone, Debug, Default)]
+pub struct IsoBootProfile {
+    #[pyo3(get)]
+    pub has_full_efi: bool,
+    #[pyo3(get)]
+    pub has_stub_efi: bool,
+    #[pyo3(get)]
+    pub has_hidden_efi: bool,
+    #[pyo3(get)]
+    pub requires_sprout: bool,
+}
+
+
+fn quick_scan<R: ImageReader>(reader: &R, current_path: &str, profile: &mut IsoBootProfile) -> Result<(), String> {
+    let entries = reader.list_dir(current_path)?;
+
+    for entry in entries {
+        let clean_name = entry.name.to_lowercase();
+        if clean_name == "." || clean_name == ".." || clean_name.is_empty() {
+            continue;
+        }
+
+        let new_path = if current_path.is_empty() { 
+            format!("/{}", entry.name) 
+        } else { 
+            format!("{}/{}", current_path, entry.name) 
+        };
+
+        if entry.is_dir {
+            quick_scan(reader, &new_path, profile)?;
+        } else {
+            // 1. Check native EFI binaries
+            if clean_name.ends_with(".efi") {
+                if entry.size < 400_000 {
+                    let mut file_data = Vec::new();
+                    let _ = reader.stream_file(&new_path, &mut |chunk| {
+                        file_data.extend_from_slice(chunk);
+                        Ok(())
+                    });
+                    
+                    let is_grub = file_data.windows(4).any(|w| w.eq_ignore_ascii_case(b"GRUB"));
+                    if is_grub {
+                        profile.has_stub_efi = true;
+                    } else {
+                        profile.has_full_efi = true;
+                    }
+                } else {
+                    profile.has_full_efi = true; 
+                }
+            } 
+            // Check inside hidden FAT images 
+            else if ["efi.img", "efiboot.img", "macefi.img"].contains(&clean_name.as_str()) {
+                profile.has_hidden_efi = true;
+                
+                // Stream the FAT image into RAM (Usually 4MB - takes ~2ms)
+                let mut fat_data = Vec::new();
+                let _ = reader.stream_file(&new_path, &mut |chunk| {
+                    fat_data.extend_from_slice(chunk);
+                    Ok(())
+                });
+
+                // Parse the FAT filesystem using your existing extractor!
+                if let Ok(fat_files) = crate::fat32::read_fat_image(&fat_data) {
+                    for (fat_path, fat_content) in fat_files {
+                        if fat_path.to_lowercase().ends_with(".efi") {
+                            if fat_content.len() < 400_000 {
+                                let is_grub = fat_content.windows(4).any(|w| w.eq_ignore_ascii_case(b"GRUB"));
+                                if is_grub {
+                                    profile.has_stub_efi = true;
+                                } else {
+                                    profile.has_full_efi = true;
+                                }
+                            } else {
+                                profile.has_full_efi = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+
+
 // -- EFI injection aux
 
 pub fn inject_hidden_efi<W: UsbWriter>(
@@ -168,7 +258,7 @@ pub fn inject_hidden_efi<W: UsbWriter>(
         if path_upper.starts_with("/EFI") {
             let is_new_file = WRITTEN_PATHS.with(|paths| paths.borrow_mut().insert(path_upper.clone()));
             if !is_new_file {
-                let _ = tx.send(EventMsg::log(&format!("    [CACHE HIT] Ledger blocked duplicate: {}", path_upper)));
+                let _ = tx.send(EventMsg::log(&format!("    [CACHE HIT] Blocked duplicate: {}", path_upper)));
                 continue; 
             }
             
@@ -544,6 +634,15 @@ fn execute_extraction_workflow<R: ImageReader, W: UsbWriter>(
         iso_path, &kernel_version_for_patch,
     )?;
 
+    // Was a real GRUB bootloader written
+    let efi_written = WRITTEN_PATHS.with(|paths| {
+        paths.borrow().contains("/EFI/BOOT/BOOTX64.EFI") || paths.borrow().contains("/EFI/BOOT/BOOTAA64.EFI")
+    });
+    if !efi_written && !use_sprout_bootloader {
+        let _ = tx.send(EventMsg::log("[!] No valid native EFI bootloader found (Stub-only ISO). Auto-enabling Sprout fallback."));
+        use_sprout_bootloader = true;
+    }
+
     // Linux Sprout Bootloader 
     if !has_large_file && use_sprout_bootloader {
         if let Err(e) = bootloader::install_uefi_sprout(writer, arch_selection) {
@@ -818,6 +917,17 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
             let is_pe_executable = file_data.len() >= 2 && file_data[0] == 0x4D && file_data[1] == 0x5A;
 
             if is_pe_executable {
+
+                // says "GRUB" but is tiny - a CD-ROM stub without the FAT32 driver
+                let is_grub = file_data.windows(4).any(|w| w.eq_ignore_ascii_case(b"GRUB"));
+                if is_grub && file_data.len() < 400_000 {
+                    let _ = tx.send(EventMsg::log(&format!("Identified {} as a crippled CD-ROM GRUB stub. Skipping to let efi.img provide the real one.", clean_name)));
+                    
+                    // Remove it from the ledger so the good one in efi.img can overwrite it later!
+                    WRITTEN_PATHS.with(|paths| paths.borrow_mut().remove(&path_upper)); 
+                    continue; 
+                }
+
                 // A real EFI binary, try to patch it natively
                 let successfully_patched = grub_patcher::patch_grub_efi(
                     &mut file_data, 
@@ -921,6 +1031,10 @@ pub fn copy_recursive<R: ImageReader, W: UsbWriter>(
 
     Ok(())
 }
+
+
+
+
 
 
 

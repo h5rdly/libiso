@@ -83,7 +83,14 @@ pub fn verify<R: ImageReader, U: UsbReader>(
     for entry in entries {
         let clean_name = entry.name;
         if clean_name == "." || clean_name == ".." || clean_name.is_empty() { continue; }
-        
+        let is_hidden_efi = ["efi.img", "efiboot.img", "macefi.img"].iter()
+            .any(|&name| clean_name.eq_ignore_ascii_case(name));
+
+        if is_hidden_efi {
+            let _ = tx.send(EventMsg::log(&format!("    Skipping verification for hidden EFI image: {}", clean_name)));
+            continue;
+        }
+
         let new_path = if current_path.is_empty() { format!("/{}", clean_name) } else { format!("{}/{}", current_path, clean_name) };
 
         if use_sprout_bootloader && current_path.is_empty() && clean_name.eq_ignore_ascii_case("EFI")  {

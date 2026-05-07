@@ -138,6 +138,7 @@ def dd_toggled_cb(sender, app_data, user_data):
 
 
 def on_iso_loaded(file_path):
+    
     stats = libiso.inspect_image(file_path).as_dict()
     
     grub_status = stats.get('grub_status', 'Unknown')
@@ -171,11 +172,11 @@ def on_iso_loaded(file_path):
             dpg.configure_item('chk_iso_mode', label= 'ISO mode (Native Boot)')
             state['tooltips']['chk_iso_mode'] = 'The GRUB bootloader on this distro is portable. No patching required'
         elif grub_status == 'Patchable':
-            dpg.configure_item('chk_iso_mode', label='Vanilla ISO mode (Auto-Patch GRUB)')
+            dpg.configure_item('chk_iso_mode', label='ISO mode (Auto-Patch GRUB)')
             state['tooltips']['chk_iso_mode'] = 'The GRUB bootloader on this distro hardcodes CD-ROM paths. Sulfur will patch it during the burn'
         else: # Unpatchable / Not Found
             dpg.configure_item('chk_iso_mode', label='Sprout UEFI Bootloader (ISO mode)')
-            state['tooltips']['chk_iso_mode'] = 'The bootloader on this distro  is unpatchable. Will use Sprout bootloader for ISO mode'    
+            state['tooltips']['chk_iso_mode'] = 'The bootloader on this distro is unpatchable. Will use Sprout bootloader for ISO mode'    
             
         # Default to ISO mode
         dpg.set_value('chk_iso_mode', True)
@@ -466,7 +467,7 @@ def gui(iso_path: str = None, burn_mode: str = None, verify: bool = True):
             dpg.add_separator()
             dpg.add_spacer(height=10)
 
-            dpg.add_checkbox(label='Verify written data', tag='chk_verify', default_value=True)
+            dpg.add_checkbox(label='Verify written data', tag='chk_verify', default_value=False)
             dpg.add_spacer(height=10)
 
             with dpg.group(tag='grp_dd'):

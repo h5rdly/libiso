@@ -12,8 +12,31 @@ use pyo3::{
 };
 
 use crate::image_parser::{ImageReader, IsoReader, UdfReader};
-use crate::initramfs_patcher::{detect_compression, CompressionType};
 use crate::{udf, esd};
+
+
+#[derive(Debug, PartialEq)]
+pub enum CompressionType {
+    Gzip,
+    Zstd,
+    Xz,
+    Uncompressed,
+}
+
+
+pub fn detect_compression(data: &[u8]) -> CompressionType {
+
+    if data.len() >= 4 {
+        match &data[0..4] {
+            [0x1F, 0x8B, _, _] => return CompressionType::Gzip,
+            [0x28, 0xB5, 0x2F, 0xFD] => return CompressionType::Zstd,
+            [0xFD, 0x37, 0x7A, 0x58] => return CompressionType::Xz,
+            _ => {}
+        }
+    }
+    CompressionType::Uncompressed
+}
+
 
 
 fn extract_to_fs<R: ImageReader>(reader: &R, current_path: &str, host_dir: &Path, auto_decompress: bool) -> Result<(), String> {

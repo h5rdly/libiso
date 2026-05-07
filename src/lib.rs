@@ -33,7 +33,7 @@ use test_utils::{
 use events::{EventMsg, ProgressStream, AbortToken};
 use crate::extraction::{extract_image, get_wim_info_from_iso};
 use writer::{
-    write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition, };
+    write_image_dd, write_image_iso, format_usb_drive, inspect_usb_partition};
 use verify::{destructive_verify_usb_size};
 use initramfs_patcher::{patch_initramfs_py, extract_file_from_squashfs_py};
 use grub_patcher::scan_efi_pattern_py;

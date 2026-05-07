@@ -17,12 +17,19 @@ pub enum GrubPatchStatus {
     NotFound,    // Not GRUB (e.g. systemd-boot, rEFInd)
 }
 
+
 // Analyze an EFI binary to determine if and how it needs to be patched.
 pub fn analyze_grub_efi(efi_bytes: &[u8], original_iso_label: &str, new_usb_label: &str) -> GrubPatchStatus {
     
+    // 1. Is it GRUB at all?
     if !efi_bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"GRUB")) {
-        return GrubPatchStatus::NotFound
+        return GrubPatchStatus::NotFound;
     } 
+
+    // IF too small it's a CD-ROM stub - "bodyless" GRUB
+    if efi_bytes.len() < 400_000 {
+        return GrubPatchStatus::Unpatchable;
+    }
 
     let nogo_patterns = vec![
         (format!(" '{}' ", original_iso_label), new_usb_label),
@@ -32,7 +39,7 @@ pub fn analyze_grub_efi(efi_bytes: &[u8], original_iso_label: &str, new_usb_labe
         (" '(cd)/EFI/BOOT' ".to_string(),   "/EFI/BOOT"),
     ];
 
-   let mut found_any_matches = false;
+    let mut found_any_matches = false;
 
     for (pat_str, replacement) in &nogo_patterns {
         if let Ok(offsets) = scan_efi_pattern(efi_bytes, pat_str) {

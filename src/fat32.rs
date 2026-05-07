@@ -6,6 +6,7 @@ use std::{
 };
 
 
+
 pub fn format_fat32<T: Write + Seek>(
     drive: &mut T, volume_size: u64, volume_label: &str, start_lba: u32,
 ) -> Result<(), String> {
@@ -18,14 +19,13 @@ pub fn format_fat32<T: Write + Seek>(
     }
 
     // Calculate Microsoft's standard Sectors Per Cluster based on drive size
-    // must guarantee cluster_count >= 65525 or it is legally FAT16
-    let sectors_per_cluster: u32 = if total_sectors <= 65525 * 2 { 1 } // < 64MB: 512B
-    else if total_sectors <= 65525 * 4 { 2 } // < 128MB: 1KB
-    else if total_sectors <= 65525 * 8 { 4 } // < 256MB: 2KB
-    else if total_sectors <= 16777216 { 8 }  // < 8GB:   4KB
-    else if total_sectors <= 33554432 { 16 } // < 16GB:  8KB
-    else if total_sectors <= 67108864 { 32 } // < 32GB:  16KB
-    else { 64 };                             // > 32GB:  32KB
+    let sectors_per_cluster: u32 = if total_sectors <= 65525 * 2 { 1 } 
+    else if total_sectors <= 65525 * 4 { 2 } 
+    else if total_sectors <= 65525 * 8 { 4 } 
+    else if total_sectors <= 16777216 { 8 }  
+    else if total_sectors <= 33554432 { 16 } 
+    else if total_sectors <= 67108864 { 32 } 
+    else { 64 };                             
 
     let reserved_sectors = 32u32;
     let num_fats = 2u32;
@@ -51,6 +51,12 @@ pub fn format_fat32<T: Write + Seek>(
     
     let sys_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let vol_id = (sys_time & 0xFFFFFFFF) as u32;
+
+    // Volume Label (11 bytes, space padded)
+    let mut label_bytes = [b' '; 11];
+    for (i, c) in volume_label.chars().take(11).enumerate() {
+        label_bytes[i] = c.to_ascii_uppercase() as u8;
+    }
 
     // Construct Boot Sector (BPB)
     let mut boot = vec![0u8; 512];
@@ -80,11 +86,7 @@ pub fn format_fat32<T: Write + Seek>(
     boot[66] = 0x29; // Extended signature
     boot[67..71].copy_from_slice(&vol_id.to_le_bytes());
     
-    // Volume Label (11 bytes, space padded)
-    let mut label_bytes = [b' '; 11];
-    for (i, c) in volume_label.chars().take(11).enumerate() {
-        label_bytes[i] = c.to_ascii_uppercase() as u8;
-    }
+    // OVERWRITE THE GHOST LABEL IN THE BOOT SECTOR!
     boot[71..82].copy_from_slice(&label_bytes);
     boot[82..90].copy_from_slice(b"FAT32   ");
     boot[510] = 0x55;
