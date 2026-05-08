@@ -18,10 +18,9 @@ rand = "0.10.1"    # For UUIDs and rsa for sbsign
 hadris-iso = "1.1.2"
 
 backhand = "0.25.1"
-cpio = "0.4.1"
 zstd = "0.13.3"
 flate2 = "1.1.9"
-fast_radix_trie = "1.2.0"
+# fast_radix_trie = "1.2.0"
 
 # See if these need removing
 temp-file = "=0.1.4"
@@ -37,8 +36,12 @@ sha2 = "0.11"
 # sbsign specific
 spki = "0.8.0"
 x509-cert = { version = " 0.3.0-rc.4", features = ["pem", "builder"] }
-signature = "3.0.0-rc.10"
-rsa = { version = "0.10.0-rc.17", features = ["sha2"] }
+signature = "3.0.0"
+rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
+
+
+[dev-dependencies]
+# backhand = "0.25.1"
 
 
 [profile.release]

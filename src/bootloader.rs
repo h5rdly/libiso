@@ -17,6 +17,13 @@ pub const LINUX_INITRAMFS_PREFIXES: &[&str] = &[
 ];
 
 
+/* rd.driver.pre=... forces Dracut (Fedora, OpenMandriva, Mageia) to load modules early
+    modules=... forces mkinitcpio (Arch) and initramfs-tools (Debian) to load modules early
+    UEFI flag to coerce OpenMandriva/Mageia scripts to take the 'vfat' mount branch
+*/
+pub const FAT_INJECTION_ARGS: &str = "rd.driver.pre=vfat,nls_cp437,nls_iso8859_1,nls_utf8 modules=vfat,nls_cp437,nls_iso8859_1,nls_utf8 UEFI";
+
+
 pub fn install_uefi_sprout<W: UsbWriter>(writer: &W, target_arch: &str,) -> PyResult<()> {
     
     let _ = writer.create_dir("/EFI");
@@ -75,9 +82,10 @@ pub fn detect_linux_payloads(
 
 
 pub fn patch_boot_labels(cfg: &str, new_label: &str, inject_fat_kernel_args: bool) -> String {
-    let mut result = cfg.to_string();
     
-     // Inject FAT32 & GPT drivers. If the distro didn't include them, GRUB will fail to read Long File Names on the USB
+    let mut result = cfg.to_string();
+        
+    // Inject FAT32 & GPT drivers. If the distro didn't include them, GRUB will fail to read Long File Names on the USB
     if !result.contains("insmod fat") {
         result = result.replacen("set default", "insmod part_gpt\ninsmod fat\nset default", 1);
         // Fallback if 'set default' isn't the first line
@@ -140,23 +148,21 @@ pub fn patch_boot_labels(cfg: &str, new_label: &str, inject_fat_kernel_args: boo
         let end = val_start + end_offset;
         result = format!("{}{}{}", &result[..val_start], new_label, &result[end..]);
         current = val_start + new_label.len() + if has_quote { 1 } else { 0 };
+    } 
    
-        if inject_fat_kernel_args {
-            let mut new_result = String::new();
-            for line in result.lines() {
-                let trimmed = line.trim_start();
-                // Append our modprobe forces to the end of the linux execution lines!
-                if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
-                    new_result.push_str(line);
-                    new_result.push_str(" rd.driver.pre=vfat,nls_cp437,nls_iso8859_1,nls_utf8 modules=vfat,nls_cp437,nls_iso8859_1,nls_utf8\n");
-                } else {
-                    new_result.push_str(line);
-                    new_result.push('\n');
-                }
+    if inject_fat_kernel_args {
+        let mut new_result = String::new();
+        for line in result.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
+                new_result.push_str(line);
+                new_result.push_str(&format!(" {FAT_INJECTION_ARGS}\n"));
+            } else {
+                new_result.push_str(line);
+                new_result.push('\n');
             }
-            result = new_result;
         }
-   
+        result = new_result;
     }
 
     result
@@ -290,7 +296,6 @@ pub fn write_sprout_toml<W: UsbWriter>(
         // --- KERNEL ARGUMENT INJECTION ---
         let mut args = kernel_args.unwrap_or("quiet splash").to_string();
         
-        // 1. Fix the Label Match (OpenMandriva/Fedora LiveOS trap)
         if args.contains("CDLABEL=") {
             if let Some(start_idx) = args.find("CDLABEL=") {
                 let expected = args[start_idx + 8..].split_whitespace().next().unwrap_or("");
@@ -303,13 +308,9 @@ pub fn write_sprout_toml<W: UsbWriter>(
             }
         }
 
-        // 2. Inject FAT drivers and UEFI flag ONLY ONCE
+        // Inject FAT drivers and UEFI flag ONLY ONCE
         if inject_fat_drivers {
-            /* rd.driver.pre=... forces Dracut (Fedora, OpenMandriva, Mageia) to load modules early
-               modules=... forces mkinitcpio (Arch) and initramfs-tools (Debian) to load modules early
-               We append the "UEFI" flag to coerce OpenMandriva/Mageia scripts to take the 'vfat' mount branch
-            */
-            args.push_str(" rd.driver.pre=vfat,nls_cp437,nls_iso8859_1,nls_utf8 modules=vfat,nls_cp437,nls_iso8859_1,nls_utf8 UEFI");
+            args.push_str(&format!(" {FAT_INJECTION_ARGS}"));
         }
             
         toml.push_str(&format!("options = ['{}']\n", args));

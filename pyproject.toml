@@ -10,7 +10,7 @@ readme = "Readme.md"
 requires-python = ">=3.12"
 
 [project.optional-dependencies]
-gui = [
+sulfur = [
     "dearpygui>=2.3.1"
 ]
 

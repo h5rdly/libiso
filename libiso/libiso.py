@@ -396,7 +396,7 @@ def write_image_iso(
     kver = stats.linux_kernel_version
     if use_sprout_bootloader is None:
         use_sprout_bootloader = stats.is_unpatchable_linux
-
+    # use_sprout_bootloader = True
     ext4_temp_path = None
     if persistence_size_mb:
         fd, ext4_temp_path = tempfile.mkstemp(suffix='.ext4')

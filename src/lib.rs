@@ -23,6 +23,7 @@ mod initramfs_patcher;
 mod kmod;
 mod extraction;
 mod grub_patcher;
+mod squashfs;
 
 
 use drives::{list_removable_drives, DriveInfo};
