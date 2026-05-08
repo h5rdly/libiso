@@ -17,10 +17,8 @@ rand = "0.10.1"    # For UUIDs and rsa for sbsign
 
 hadris-iso = "1.1.2"
 
-backhand = "0.25.1"
 zstd = "0.13.3"
 flate2 = "1.1.9"
-# fast_radix_trie = "1.2.0"
 
 # See if these need removing
 temp-file = "=0.1.4"

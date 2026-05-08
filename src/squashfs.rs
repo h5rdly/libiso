@@ -1,7 +1,12 @@
 use std::{
     io::{Read, Seek, SeekFrom, Result, Error, ErrorKind}, 
-    collections::HashSet
+    collections::HashSet, 
+    result::Result as StdResult, 
+    fs::File,
 };
+
+use pyo3::{prelude::*, exceptions::PyRuntimeError};
+
 
 /*
 # Etract files from SquashFS flow - 
@@ -25,6 +30,7 @@ const DATA_UNCOMPRESSED_FLAG: u32 = 0x01000000; // The 25th bit
 const DATA_SIZE_MASK: u32 = 0x00FFFFFF;         // The lower 24 bits
 
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Superblock {
     pub magic: u32,
@@ -50,6 +56,7 @@ pub struct Superblock {
 
 
 // Standard 16-byte header attached to every single file and folder in SquashFS
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct InodeHeader {
     pub inode_type: u16,
@@ -61,8 +68,9 @@ pub struct InodeHeader {
 }
 
 // A unified struct for Basic and Extended directories
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirectoryLocation {
+    pub path: String,      // tracks the current directory string
     pub block_index: u32,  // Offset into the Directory Table
     pub block_offset: u16, // Decompressed byte offset inside the Directory Table block
     pub file_size: u32,    // Total size of the directory entries we need to read
@@ -70,7 +78,7 @@ pub struct DirectoryLocation {
 
 #[derive(Debug)]
 pub struct FileLocation {
-    pub name: String,
+    pub path: String,
     pub block_index: u32,
     pub block_offset: u16,
 }
@@ -85,6 +93,7 @@ pub struct FileBlueprint {
 }
 
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct FragmentEntry {
     pub start: u64,       // Physical offset where the massive fragment block lives
@@ -93,7 +102,7 @@ pub struct FragmentEntry {
 }
 
 
-// -- Endianness Helpers 
+// -- Endianness helpers 
 
 fn read_u16(bytes: &[u8], is_le: bool) -> u16 {
     let b = bytes.try_into().unwrap();
@@ -110,7 +119,8 @@ fn read_u64(bytes: &[u8], is_le: bool) -> u64 {
     if is_le { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) }
 }
 
-// -- 
+
+// -- Reading logic
 
 pub fn read_superblock<R: Read + Seek>(mut reader: R) -> Result<Superblock> {
 
@@ -194,27 +204,67 @@ pub fn read_metadata_block<R: Read + Seek>(reader: &mut R, is_little_endian: boo
 }
 
 
+pub fn read_dir_inode<R: Read + Seek>(
+    reader: &mut R, 
+    superblock: &Superblock, 
+    block_index: u32, 
+    block_offset: u16, 
+    path: String,
+    is_le: bool,
+) -> Result<DirectoryLocation> {
 
-pub fn read_root_inode<R: Read + Seek>(reader: &mut R, superblock: &Superblock, is_le: bool, 
+    let physical_offset = superblock.inode_table_start + (block_index as u64);
+    reader.seek(SeekFrom::Start(physical_offset))?;
+    
+    let mut inode_data = read_metadata_block(reader, is_le)?;
+    
+    // If the inode starts near the end of the 8KB block, stitch the next one
+    // We need at most 40 bytes to safely parse a directory inode.
+    while inode_data.len() < (block_offset as usize) + 40 {
+        let mut next = read_metadata_block(reader, is_le)?;
+        inode_data.append(&mut next);
+    }
+    
+    let data = &inode_data[block_offset as usize ..];
+    let inode_type = read_u16(&data[0..2], is_le);
+    let payload = &data[16..];
+    
+    match inode_type {
+        1 => Ok(DirectoryLocation {
+            path,
+            block_index: read_u32(&payload[0..4], is_le),
+            file_size: read_u16(&payload[8..10], is_le) as u32,
+            block_offset: read_u16(&payload[10..12], is_le),
+        }),
+        8 => Ok(DirectoryLocation {
+            path,
+            file_size: read_u32(&payload[4..8], is_le),
+            block_index: read_u32(&payload[8..12], is_le),
+            block_offset: read_u16(&payload[18..20], is_le),
+        }),
+        _ => Err(Error::new(ErrorKind::InvalidData, "Expected Directory Inode")),
+    }
+}
+
+
+pub fn read_root_inode<R: Read + Seek>(
+    reader: &mut R, superblock: &Superblock, is_le: bool, 
 ) -> Result<(InodeHeader, DirectoryLocation)> {
     
-    // Upper 48 bits - offset from the Inode table. Lower 16 - byte offset within the block
     let block_index = (superblock.root_inode >> 16) as u64;
     let byte_offset = (superblock.root_inode & 0xFFFF) as usize;
 
-    // Seek to the exact metadata block in the Inode Table
     reader.seek(SeekFrom::Start(superblock.inode_table_start + block_index))?;
+    let mut inode_data = read_metadata_block(reader, is_le)?;
 
-    // Read and decompress the block
-    let inode_data = read_metadata_block(reader, is_le)?;
-
-    // Slice into the uncompressed data at the byte offset
-    if byte_offset + 16 > inode_data.len() {
-        return Err(Error::new(ErrorKind::InvalidData, "Inode crosses metadata boundary"));
+    // Stitch the next block if we are too close to the end
+    while inode_data.len() < byte_offset + 40 {
+        let mut next = read_metadata_block(reader, is_le)?;
+        inode_data.append(&mut next);
     }
-    let data = &inode_data[byte_offset..];
 
-    // Parse the 16-byte Inode Header
+    let data = &inode_data[byte_offset..];
+    
     let header = InodeHeader {
         inode_type: read_u16(&data[0..2], is_le),
         permissions: read_u16(&data[2..4], is_le),
@@ -224,150 +274,95 @@ pub fn read_root_inode<R: Read + Seek>(reader: &mut R, superblock: &Superblock, 
         inode_number: read_u32(&data[12..16], is_le),
     };
 
-    // Parse the specific Directory Payload (Basic = 1, Extended = 8)
     let payload = &data[16..];
     
     let location = match header.inode_type {
         1 => {
-            // Basic Directory (16 byte payload)
             DirectoryLocation {
+                path: "".to_string(),
                 block_index: read_u32(&payload[0..4], is_le),
                 file_size: read_u16(&payload[8..10], is_le) as u32,
                 block_offset: read_u16(&payload[10..12], is_le),
             }
         }
         8 => {
-            // Extended Directory (24 byte payload)
             DirectoryLocation {
+                path: "".to_string(),
                 file_size: read_u32(&payload[4..8], is_le),
                 block_index: read_u32(&payload[8..12], is_le),
                 block_offset: read_u16(&payload[18..20], is_le),
             }
         }
-        _ => {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                format!("Expected Directory Inode, got type: {}", header.inode_type)
-            ));
-        }
+        _ => return Err(Error::new(ErrorKind::Unsupported, "Expected Directory Inode")),
     };
 
     Ok((header, location))
 }
 
 
-pub fn traverse_directory<R: Read + Seek>(
-    reader: &mut R,
-    superblock: &Superblock,
-    dir_loc: &DirectoryLocation,
-    hit_list: &mut HashSet<String>,
-    is_le: bool,
-) -> Result<Vec<FileLocation>> {
-
-    let mut found_files = Vec::new();
-
-    // Seek to the start of the Directory Table + our specific block offset
-    let physical_offset = superblock.directory_table_start + (dir_loc.block_index as u64);
-    reader.seek(SeekFrom::Start(physical_offset))?;
-
-    /*
-    Decompression - Directories can be larger than a single 8KB block. `reader.read()` 
-    advances the file cursor automatically, so we keep reading metadata until enough 
-    uncompressed bytes have been accumulated
-    */
-
-    let mut dir_data = Vec::new();
-    let target_size = dir_loc.block_offset as usize + dir_loc.file_size as usize - 3; 
-    
-    while dir_data.len() < target_size {
-        let mut block = read_metadata_block(reader, is_le)?;
-        dir_data.append(&mut block);
-    }
-
-    // Slice into the uncompressed data at our exact starting offset
-    let payload = &dir_data[dir_loc.block_offset as usize .. target_size];
-    let mut cursor = 0;
-
-    while cursor + 12 <= payload.len() && !hit_list.is_empty() {
-        
-        // DIR header (12 Bytes) 
-        // The spec stores (count - 1), so we add 1 to get the true count
-        let count = read_u32(&payload[cursor..cursor+4], is_le) + 1; 
-        let start = read_u32(&payload[cursor+4..cursor+8], is_le);
-        // We skip inode_num (bytes 8..12) as we don't strictly need it for this
-        cursor += 12;
-
-        // DIR entries
-        for _ in 0..count {
-            if cursor + 8 > payload.len() { break; } // Bounds safety
-            
-            let offset = read_u16(&payload[cursor..cursor+2], is_le);
-            let _file_type = read_u16(&payload[cursor+4..cursor+6], is_le); // 1 = Dir, 2 = File
-            
-            // The spec stores (name_size - 1), so we add 1
-            let name_size = read_u16(&payload[cursor+6..cursor+8], is_le) as usize + 1;
-            cursor += 8;
-
-            if cursor + name_size > payload.len() { break; } // Bounds safety
-            
-            let name_bytes = &payload[cursor..cursor+name_size];
-            let name = String::from_utf8_lossy(name_bytes).to_string();
-            cursor += name_size;
-
-            // Pop the file if found
-            if hit_list.contains(&name) {
-                found_files.push(FileLocation {
-                    name: name.clone(),
-                    block_index: start,
-                    block_offset: offset,
-                });
-                
-                hit_list.remove(&name);
-                
-                if hit_list.is_empty() {
-                    break; 
-                }
-            }
-        }
-    }
-
-    Ok(found_files)
-}
-
-
-
 pub fn read_file_inode<R: Read + Seek>(
     reader: &mut R, superblock: &Superblock, block_index: u32, block_offset: u16, is_le: bool,
 ) -> Result<FileBlueprint> {
     
-    // Seek and decompress the Inode block
     let physical_offset = superblock.inode_table_start + (block_index as u64);
     reader.seek(SeekFrom::Start(physical_offset))?;
     
-    let inode_data = read_metadata_block(reader, is_le)?;
-    let data = &inode_data[block_offset as usize ..];
+    let mut inode_data = read_metadata_block(reader, is_le)?;
 
-    // Skip the 16-byte generic InodeHeader (we don't need permissions/UIDs here)
+    // Ensure we have at least 56 bytes to parse an ExtendedFile payload without panicking
+    while inode_data.len() < (block_offset as usize) + 56 {
+        let mut next = read_metadata_block(reader, is_le)?;
+        inode_data.append(&mut next);
+    }
+
+    let data = &inode_data[block_offset as usize ..];
+    let inode_type = read_u16(&data[0..2], is_le);
     let payload = &data[16..];
 
-    // Parse the BasicFile payload
-    let blocks_start = read_u32(&payload[0..4], is_le) as u64;
-    let frag_index = read_u32(&payload[4..8], is_le);
-    let block_offset_frag = read_u32(&payload[8..12], is_le);
-    let file_size = read_u32(&payload[12..16], is_le);
+    // Added Support for ExtendedFiles (Type 9)
+    let (blocks_start, frag_index, block_offset_frag, file_size, block_sizes_start) = match inode_type {
+        2 => { // Basic File
+            (
+                read_u32(&payload[0..4], is_le) as u64,
+                read_u32(&payload[4..8], is_le),
+                read_u32(&payload[8..12], is_le),
+                read_u32(&payload[12..16], is_le),
+                16
+            )
+        }
+        9 => { // Extended File
+            (
+                read_u64(&payload[0..8], is_le),
+                read_u32(&payload[28..32], is_le),
+                read_u32(&payload[32..36], is_le),
+                read_u64(&payload[8..16], is_le) as u32, 
+                40
+            )
+        }
+        _ => return Err(Error::new(ErrorKind::Unsupported, format!("Expected File Inode, got: {}", inode_type))),
+    };
 
-    // Calculate how many data blocks we have
-    // If there is no fragment (0xFFFFFFFF), the tail of the file is in a normal block
-    // If there IS a fragment, the tail is missing from this array
     let block_count = if frag_index == 0xFFFFFFFF {
         (file_size + superblock.block_size - 1) / superblock.block_size
     } else {
         file_size / superblock.block_size
     };
 
-    // Read the array of block sizes
+    // Huge files (1GB+) have thousands of block sizes. We might need to stitch multiple 
+    // metadata blocks together just to read the block sizes array
+    let required_total_size = block_offset as usize + 16 + block_sizes_start + (block_count as usize * 4);
+    
+    while inode_data.len() < required_total_size {
+        let mut next = read_metadata_block(reader, is_le)?;
+        inode_data.append(&mut next);
+    }
+
+    // Re-slice because appending may have reallocated the vector
+    let data = &inode_data[block_offset as usize ..];
+    let payload = &data[16..];
+
     let mut block_sizes = Vec::new();
-    let mut cursor = 16;
+    let mut cursor = block_sizes_start;
     for _ in 0..block_count {
         block_sizes.push(read_u32(&payload[cursor..cursor+4], is_le));
         cursor += 4;
@@ -381,6 +376,95 @@ pub fn read_file_inode<R: Read + Seek>(
         block_offset: block_offset_frag,
     })
 }
+
+
+// -- Search logic
+
+pub fn find_files<R: Read + Seek>(
+    reader: &mut R,
+    superblock: &Superblock,
+    root_loc: DirectoryLocation,
+    search_list: &mut HashSet<String>,
+    path_filter: &str, 
+    is_le: bool,
+) -> Result<Vec<FileLocation>> {
+    
+    let mut found_files = Vec::new();
+    let mut dir_queue = vec![root_loc];
+
+    while let Some(dir_loc) = dir_queue.pop() {
+        if search_list.is_empty() { break; }
+
+        let physical_offset = superblock.directory_table_start + (dir_loc.block_index as u64);
+        reader.seek(SeekFrom::Start(physical_offset))?;
+
+        let mut dir_data = Vec::new();
+        let target_size = dir_loc.block_offset as usize + dir_loc.file_size as usize - 3; 
+        
+        while dir_data.len() < target_size {
+            let mut block = read_metadata_block(reader, is_le)?;
+            dir_data.append(&mut block);
+        }
+
+        let payload = &dir_data[dir_loc.block_offset as usize .. target_size];
+        let mut cursor = 0;
+        let mut sub_dirs = Vec::new(); 
+
+        while cursor + 12 <= payload.len() && !search_list.is_empty() {
+            let count = read_u32(&payload[cursor..cursor+4], is_le) + 1; 
+            let start = read_u32(&payload[cursor+4..cursor+8], is_le); 
+            cursor += 12;
+
+            for _ in 0..count {
+                if cursor + 8 > payload.len() { break; } 
+                
+                let offset = read_u16(&payload[cursor..cursor+2], is_le); 
+                let file_type = read_u16(&payload[cursor+4..cursor+6], is_le); 
+                let name_size = read_u16(&payload[cursor+6..cursor+8], is_le) as usize + 1;
+                cursor += 8;
+
+                if cursor + name_size > payload.len() { break; } 
+                
+                let name_bytes = &payload[cursor..cursor+name_size];
+                let name = String::from_utf8_lossy(name_bytes).to_string();
+                cursor += name_size;
+
+                // Build the full path
+                let full_path = if dir_loc.path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", dir_loc.path, name)
+                };
+
+                if file_type == 1 {
+                    sub_dirs.push((start, offset, full_path)); // Save path for children
+                } else if file_type == 2 {
+                    // We only pop the list if the filename matches AND the path matches our kernel filter!
+                    if search_list.contains(&name) && (path_filter.is_empty() || full_path.contains(path_filter)) {
+                        found_files.push(FileLocation {
+                            path: full_path, // Save the full path!
+                            block_index: start,
+                            block_offset: offset,
+                        });
+                        
+                        search_list.remove(&name);
+                        if search_list.is_empty() { break; }
+                    }
+                }
+            }
+        }
+
+        // Add subdirectories to the queue
+        for (start, offset, sub_path) in sub_dirs {
+            if search_list.is_empty() { break; }
+            let child_dir = read_dir_inode(reader, superblock, start, offset, sub_path, is_le)?;
+            dir_queue.push(child_dir);
+        }
+    }
+
+    Ok(found_files)
+}
+
 
 
 pub fn read_fragment_entry<R: Read + Seek>(
@@ -477,3 +561,54 @@ pub fn extract_file_data<R: Read + Seek>(
 }
 
 
+
+pub fn extract_file_from_squashfs<R: Read + Seek>(mut reader: R, target_filename: &str
+) -> StdResult<(String, Vec<u8>), String> {
+    
+    // Map the disk
+    let superblock = read_superblock(&mut reader).map_err(|e| e.to_string())?;
+    
+    let is_le = superblock.magic == SQUASHFS_MAGIC;
+
+    // Build the search list with compressed variants
+    let mut search_list = HashSet::from([
+        target_filename.to_string(),
+        format!("{}.xz", target_filename),
+        format!("{}.zst", target_filename),
+        format!("{}.gz", target_filename),
+    ]);
+
+    // 3. Get the Root Directory
+    let (_, root_loc) = read_root_inode(&mut reader, &superblock, is_le)
+        .map_err(|e| e.to_string())?;
+
+    // Sweep the entire OS tree for the driver (passing "" for no path filter)
+    let found_files = find_files(&mut reader, &superblock, root_loc, &mut search_list, "", is_le)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(target) = found_files.into_iter().next() {
+        
+        let blueprint = read_file_inode(
+            &mut reader, &superblock, target.block_index, target.block_offset, is_le
+        ).map_err(|e| e.to_string())?;
+        
+        let data = extract_file_data(&mut reader, &superblock, &blueprint, is_le)
+            .map_err(|e| e.to_string())?;
+
+        return Ok((target.path, data));
+    }
+
+    Err(format!("{} not found in SquashFS!", target_filename))
+}
+
+
+#[pyfunction]
+#[pyo3(name = "extract_file_from_squashfs")]
+pub fn extract_file_from_squashfs_py(squashfs_path: &str, target_filename: &str) -> PyResult<(String, Vec<u8>)> {
+    
+    let file = File::open(squashfs_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to open SquashFS file: {}", e)))?;
+
+    extract_file_from_squashfs(file, target_filename)
+        .map_err(|e| PyRuntimeError::new_err(format!("SquashFS Extraction Failed: {}", e)))
+}

@@ -1,16 +1,16 @@
 use std::{
-    io::{Cursor, Read, BufReader, Seek, SeekFrom},
-    path::Path, fs::File, collections::VecDeque,
+    io::{Cursor, Read, Seek, SeekFrom},
+    path::Path, fs::File, collections::VecDeque,  collections::HashSet,
 };
-
-use backhand::{FilesystemReader, InnerNode};
-// use zstd::stream::read::Decoder as ZstdDecoder;
-// use flate2::read::GzDecoder;
 
 use pyo3::{prelude::*, exceptions::PyRuntimeError};
 
 use crate::image_parser::ImageReader;
 use crate::kmod::KmodIndex;
+use crate::squashfs::{
+    read_superblock, read_root_inode, find_files, read_file_inode, extract_file_data, SQUASHFS_MAGIC
+};
+
 
 pub struct SquashfsReader<'a> {
     pub iso_file: &'a mut std::fs::File,
@@ -142,52 +142,13 @@ fn write_cpio_header(out: &mut Vec<u8>, path: &str, filesize: u32) {
 }
 
 
-pub fn extract_file_from_squashfs<R: Read + Seek + Send>(mut reader: R, target_filename: &str) -> Result<(String, Vec<u8>), String> {
-    reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    let buf_reader = BufReader::new(reader);
-    let fs = FilesystemReader::from_reader(buf_reader).map_err(|e| e.to_string())?;
-
-    let mut target_file_reader = None;
-    let mut actual_filename = String::new();
-    
-    for node in fs.files() {
-        if let Some(path_str) = node.fullpath.to_str() {
-            if path_str.ends_with(target_filename) 
-                || path_str.ends_with(&format!("{}.xz", target_filename))
-                || path_str.ends_with(&format!("{}.zst", target_filename))
-                || path_str.ends_with(&format!("{}.gz", target_filename)) 
-            {
-                if let InnerNode::File(squashfs_file) = &node.inner {
-                    target_file_reader = Some(squashfs_file.clone());
-                    if let Some(name) = node.fullpath.file_name().and_then(|n| n.to_str()) {
-                        actual_filename = name.to_string();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    let squashfs_file = target_file_reader.ok_or_else(|| format!("{} not found in SquashFS!", target_filename))?;
-    let mut file_reader = fs.file(&squashfs_file).reader();
-    let mut extracted_bytes = Vec::new();
-    file_reader.read_to_end(&mut extracted_bytes).map_err(|e| e.to_string())?;
-
-    Ok((actual_filename, extracted_bytes))
-}
-
-
-
 pub fn patch_initramfs<R: Read + Seek + Send>(
-    original_initrd: &[u8],
-    kernel_version: &str,
-    squash_reader: R,
-    modules_to_fetch: &[&str],
+    original_initrd: &[u8], kernel_version: &str, mut squash_reader: R, modules_to_fetch: &[&str],
 ) -> Result<Vec<u8>, String> {
     
     let mut final_initrd = original_initrd.to_vec();
     
-    // The Linux kernel CPIO parser requires the `070701` magic header to be strictly 4-byte aligned
+    // The Linux kernel CPIO parser requires the magic header to be strictly 4-byte aligned
     while final_initrd.len() % 4 != 0 {
         final_initrd.push(0);
     }
@@ -195,52 +156,52 @@ pub fn patch_initramfs<R: Read + Seek + Send>(
     let mut appended_cpio = Vec::new();
     let kver_short = kernel_version.split_whitespace().next().unwrap_or(kernel_version);
 
-    // Mount SquashFS exactly once
-    let buf_reader = BufReader::new(squash_reader);
-    let fs = FilesystemReader::from_reader(buf_reader).map_err(|e| e.to_string())?;
+    // 1. Map the disk with our bare-metal engine
+    let superblock = read_superblock(&mut squash_reader).map_err(|e| e.to_string())?;
+    let is_le = superblock.magic == SQUASHFS_MAGIC;
 
-    for mod_name in modules_to_fetch {
-        let mut found_data = None;
-        let mut actual_path = String::new();
+    // 2. Build the hit list
+    let mut search_list = HashSet::new();
+    for &mod_name in modules_to_fetch {
+        search_list.insert(mod_name.to_string());
+        search_list.insert(format!("{}.xz", mod_name));
+        search_list.insert(format!("{}.zst", mod_name));
+        search_list.insert(format!("{}.gz", mod_name));
+    }
 
-        // Scan the tree for the module, accepting any compression suffix (.zst, .xz, .gz)
-        for node in fs.files() {
-            if let Some(path_str) = node.fullpath.to_str() {
-                if path_str.contains(kver_short) && 
-                   (path_str.ends_with(mod_name) 
-                    || path_str.ends_with(&format!("{}.xz", mod_name))
-                    || path_str.ends_with(&format!("{}.zst", mod_name))
-                    || path_str.ends_with(&format!("{}.gz", mod_name))) 
-                {
-                    if let InnerNode::File(squashfs_file) = &node.inner {
-                        let mut file_reader = fs.file(squashfs_file).reader();
-                        let mut extracted_bytes = Vec::new();
-                        if file_reader.read_to_end(&mut extracted_bytes).is_ok() {
-                            
-                            found_data = Some(extracted_bytes);
-                            
-                            // Preserve the exact path (removing the leading slash)
-                            actual_path = path_str.trim_start_matches('/').to_string();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    // 3. Get the Root Directory
+    let (_, root_loc) = read_root_inode(&mut squash_reader, &superblock, is_le)
+        .map_err(|e| e.to_string())?;
 
-        if let Some(mod_data) = found_data {
-            println!("    -> Appending {} to initramfs...", actual_path);
-            write_cpio_header(&mut appended_cpio, &actual_path, mod_data.len() as u32);
-            
-            appended_cpio.extend_from_slice(actual_path.as_bytes());
-            appended_cpio.push(0);
-            while appended_cpio.len() % 4 != 0 { appended_cpio.push(0); }
-            
-            appended_cpio.extend_from_slice(&mod_data);
-            while appended_cpio.len() % 4 != 0 { appended_cpio.push(0); }
-        } else {
-            println!("    -> Warning: {} not found in SquashFS. Skipping.", mod_name);
-        }
+    // 4. Sweep the entire OS tree for the drivers!
+    // We pass kver_short so we only match drivers for the correct kernel version
+    let found_files = find_files(
+        &mut squash_reader, &superblock, root_loc, &mut search_list, kver_short, is_le, 
+    ).map_err(|e| e.to_string())?;
+
+    // 5. Rip each driver off the disk and append it to the CPIO
+    for target in found_files {
+        let blueprint = read_file_inode(
+            &mut squash_reader, &superblock, target.block_index, target.block_offset, is_le
+        ).map_err(|e| e.to_string())?;
+        
+        let mod_data = extract_file_data(&mut squash_reader, &superblock, &blueprint, is_le)
+            .map_err(|e| e.to_string())?;
+
+        let actual_path = target.path.trim_start_matches('/').to_string();
+        println!("    -> Appending {} to initramfs...", actual_path);
+        
+        write_cpio_header(&mut appended_cpio, &actual_path, mod_data.len() as u32);
+        appended_cpio.extend_from_slice(actual_path.as_bytes());
+        appended_cpio.push(0);
+        while appended_cpio.len() % 4 != 0 { appended_cpio.push(0); }
+        
+        appended_cpio.extend_from_slice(&mod_data);
+        while appended_cpio.len() % 4 != 0 { appended_cpio.push(0); }
+    }
+
+    if !search_list.is_empty() {
+        println!("    -> Warning: Could not find some modules in SquashFS: {:?}", search_list);
     }
 
     let trailer_path = "TRAILER!!!";
@@ -254,16 +215,6 @@ pub fn patch_initramfs<R: Read + Seek + Send>(
     Ok(final_initrd)
 }
 
-
-#[pyfunction]
-#[pyo3(name = "extract_file_from_squashfs")]
-pub fn extract_file_from_squashfs_py(squashfs_path: &str, target_filename: &str) -> PyResult<(String, Vec<u8>)> {
-    let file = File::open(squashfs_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to open SquashFS file: {}", e)))?;
-
-    extract_file_from_squashfs(file, target_filename)
-        .map_err(|e| PyRuntimeError::new_err(format!("SquashFS Extraction Failed: {}", e)))
-}
 
 
 #[pyfunction(name="patch_initramfs")]
