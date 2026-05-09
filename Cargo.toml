@@ -1,6 +1,6 @@
 [package]
 name = "libiso"
-version = "0.0.8"
+version = "0.1.0a"
 edition = "2024"
 # rust-version = "1.95"   # The stabilized MaybeUninit<[T; N]> can allow skipping zero-filling
 
