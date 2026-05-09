@@ -8,17 +8,6 @@ use std::{
 use pyo3::{prelude::*, exceptions::PyRuntimeError};
 
 
-/*
-# Etract files from SquashFS flow - 
-- Read the Superblock to map the disk
-- Follow the 64-bit pointer into the Inode Table to find the Root Directory
-- Sweep through the compressed Directory Table 
-- Grab file (eg vfat.ko.zst) cooridnates
-- Jump back to the Inode Table to read the file's Blueprint
-- Jump to the raw Data Blocks, unpack, and reassembled the driver in RAM
-*/
-
-
 // SquashFS 4.0 Superblock is 96 bytes long
 pub const SUPERBLOCK_SIZE: usize = 96;
 pub const SQUASHFS_MAGIC: u32 = 0x73717368; // "hsqs" in Little-Endian
@@ -564,7 +553,15 @@ pub fn extract_file_data<R: Read + Seek>(
 
 pub fn extract_file_from_squashfs<R: Read + Seek>(mut reader: R, target_filename: &str
 ) -> StdResult<(String, Vec<u8>), String> {
-    
+    /*
+    - Read the Superblock to map the disk
+    - Follow the 64-bit pointer into the Inode Table to find the Root Directory
+    - Sweep through the compressed Directory Table 
+    - Grab file (eg vfat.ko.zst) cooridnates
+    - Jump back to the Inode Table to read the file's Blueprint
+    - Jump to the raw Data Blocks, unpack, and reassembled the driver in RAM
+    */
+
     // Map the disk
     let superblock = read_superblock(&mut reader).map_err(|e| e.to_string())?;
     
@@ -578,7 +575,7 @@ pub fn extract_file_from_squashfs<R: Read + Seek>(mut reader: R, target_filename
         format!("{}.gz", target_filename),
     ]);
 
-    // 3. Get the Root Directory
+    // Get the Root Directory
     let (_, root_loc) = read_root_inode(&mut reader, &superblock, is_le)
         .map_err(|e| e.to_string())?;
 

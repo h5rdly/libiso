@@ -8,6 +8,7 @@ use std::{
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::lzms::{LzmsDecompressor, lzms_x86_filter};
 
 pub struct WimInfo {
     pub architecture: Option<String>,
@@ -213,7 +214,7 @@ impl EsdArchive {
         self.file.read_exact(&mut comp_data)?;
 
         // Decompress natively
-        let mut decompressor = crate::lzms::LzmsDecompressor::new(&comp_data)
+        let mut decompressor = LzmsDecompressor::new(&comp_data)
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Invalid LZMS block"))?;
         
         let mut uncompressed_data = vec![0u8; uncompressed_size];
@@ -222,7 +223,7 @@ impl EsdArchive {
 
         // Apply x86 translation filter
         let mut last_target_usages = Box::new([0i32; 65536]);
-        crate::lzms::lzms_x86_filter(&mut uncompressed_data, &mut last_target_usages, true);
+        lzms_x86_filter(&mut uncompressed_data, &mut last_target_usages, true);
 
         // Parse the filesystem tree natively
         let mut files = Vec::new();

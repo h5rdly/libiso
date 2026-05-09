@@ -519,7 +519,6 @@ fn scan_directory(
                 *is_windows = true;
                 *install_image_type = "swm".to_string();
             }
-            if file_name == "APPRAISERRES.DLL" { *is_windows_11 = true; }
         }
     }
 }
