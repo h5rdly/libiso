@@ -15,13 +15,15 @@ pub struct DirectoryRef {
 pub struct IsoNode {
     pub name: String,
     pub is_dir: bool,
-    pub extent: DirectoryRef,
+    pub extents: Vec<DirectoryRef>,
 }
+
+
 
 /// Parses the SUSP / Rock Ridge metadata to find the real Linux filename.
 /// It seamlessly jumps across the disk if it hits a Continuation Entry (CE).
 fn parse_rock_ridge_name<R: Read + Seek>(
-    reader: &mut R, mut su_data: Vec<u8>, mut name_parts: Vec<u8>
+    reader: &mut R, su_data: Vec<u8>, mut name_parts: Vec<u8>
 ) -> Result<String> {
     
     let mut cursor = 0;
@@ -157,7 +159,7 @@ pub fn get_joliet_root_directory<R: Read + Seek>(reader: &mut R) -> Result<Optio
 
 pub fn read_directory<R: Read + Seek>(reader: &mut R, dir: &DirectoryRef) -> Result<Vec<IsoNode>> {
     
-    let mut nodes = Vec::new();
+    let mut nodes: Vec<IsoNode> = Vec::new();
     
     reader.seek(SeekFrom::Start((dir.lba as u64) * SECTOR_SIZE))?;
     let mut dir_data = vec![0u8; dir.size as usize];
@@ -183,7 +185,10 @@ pub fn read_directory<R: Read + Seek>(reader: &mut R, dir: &DirectoryRef) -> Res
         
         let lba = u32::from_le_bytes(record[2..6].try_into().unwrap());
         let size = u32::from_le_bytes(record[10..14].try_into().unwrap());
-        let is_dir = (record[25] & 0x02) != 0;
+
+        let flags = record[25];
+        let is_dir = (flags & 0x02) != 0;
+        let is_not_final = (flags & 0x80) != 0; // The 4GB Multi-Extent flag
         let name_len = record[32] as usize;
         let name_bytes = &record[33 .. 33 + name_len];
         
@@ -227,11 +232,20 @@ pub fn read_directory<R: Read + Seek>(reader: &mut R, dir: &DirectoryRef) -> Res
             }
         }
         
+        if let Some(last_node) = nodes.last_mut() {
+            if last_node.name == final_name {
+                // append the LBA to the existing one
+                last_node.extents.push(DirectoryRef { lba, size, is_joliet: dir.is_joliet });
+                continue;
+            }
+        }
+        
         nodes.push(IsoNode { 
             name: final_name, 
             is_dir, 
-            extent: DirectoryRef { lba, size, is_joliet: dir.is_joliet } // Pass the flag down!
+            extents: vec![DirectoryRef { lba, size, is_joliet: dir.is_joliet }] 
         });
+        
     }
     
     Ok(nodes)
@@ -261,7 +275,7 @@ pub fn find_iso_entry<R: Read + Seek>(reader: &mut R, root: &DirectoryRef, path:
         if i == parts.len() - 1 {
             return Ok(node);
         } else if node.is_dir {
-            current_dir = node.extent;
+            current_dir = node.extents[0].clone();
         } else {
             return Err(Error::new(ErrorKind::InvalidInput, format!("{} is a file, not a directory", part)));
         }
@@ -271,16 +285,36 @@ pub fn find_iso_entry<R: Read + Seek>(reader: &mut R, root: &DirectoryRef, path:
 }
 
 
-pub fn extract_iso_file<R: Read + Seek>(reader: &mut R, file: &IsoNode) -> Result<Vec<u8>> {
+pub fn stream_iso_file<R, F>(reader: &mut R, file: &IsoNode, mut on_chunk: F) -> Result<()>
+where
+    R: Read + Seek,
+    F: FnMut(&[u8]) -> Result<()>,
+{
     if file.is_dir {
-        return Err(Error::new(ErrorKind::InvalidInput, "Cannot extract a directory"));
+        return Err(Error::new(ErrorKind::InvalidInput, "Cannot stream a directory"));
+    }
+
+    // 100KB buffer (O(1) memory usage regardless of file size!)
+    let mut chunk_buf = vec![0u8; 100 * 1024]; 
+
+    for extent in &file.extents {
+        let mut extent_offset = 0u64;
+        let extent_len = extent.size as u64;
+        
+        reader.seek(SeekFrom::Start((extent.lba as u64) * SECTOR_SIZE))?;
+
+        while extent_offset < extent_len {
+            let read_size = (extent_len - extent_offset).min(chunk_buf.len() as u64) as usize;
+            reader.read_exact(&mut chunk_buf[..read_size])?;
+            
+            // Pass the bytes directly to your writer / progress bar
+            on_chunk(&chunk_buf[..read_size])?;
+            
+            extent_offset += read_size as u64;
+        }
     }
     
-    let mut file_data = vec![0u8; file.extent.size as usize];
-    reader.seek(SeekFrom::Start((file.extent.lba as u64) * SECTOR_SIZE))?;
-    reader.read_exact(&mut file_data)?;
-    
-    Ok(file_data)
+    Ok(())
 }
 
 
@@ -298,7 +332,7 @@ pub fn get_boot_image<R: Read + Seek>(reader: &mut R) -> Result<Option<BootImage
     
     let mut buf = [0u8; 2048];
     let mut current_sector = 16;
-    let mut catalog_lba = 0;
+    let mut catalog_lba;
     
     // Scan for the Boot Record Volume Descriptor (Type 0)
     loop {
