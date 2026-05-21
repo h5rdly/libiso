@@ -1,12 +1,12 @@
 use std::{
-    io::{Cursor, Read, Seek, SeekFrom},
-    path::Path, fs::File, collections::VecDeque,  collections::HashSet,
+    io::{Read, Seek, SeekFrom}, //path::Path,
+    fs::File, collections::VecDeque,  collections::HashSet,
 };
 
 use pyo3::{prelude::*, exceptions::PyRuntimeError};
 
 use crate::image_parser::ImageReader;
-use crate::kmod::KmodIndex;
+// use crate::kmod::KmodIndex;
 use crate::squashfs::{
     read_superblock, read_root_inode, find_files, read_file_inode, extract_file_data, SQUASHFS_MAGIC
 };
@@ -114,21 +114,21 @@ pub fn locate_squashfs<R: ImageReader>(reader: &R) -> Result<(u64, u64, String),
 }
 
 
-pub fn generate_modules_dep_bin(dep_text: &str) -> Vec<u8> {
-    let mut index = KmodIndex::new();
-    for line in dep_text.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if let Some((target, _deps)) = line.split_once(':') {
-            if let Some(modname) = Path::new(target.trim()).file_stem().and_then(|s| s.to_str()) {
-                index.insert(modname, line, 0);
-            }
-        }
-    }
-    let mut out = Cursor::new(Vec::new());
-    index.write(&mut out).unwrap();
-    out.into_inner()
-}
+// pub fn generate_modules_dep_bin(dep_text: &str) -> Vec<u8> {
+//     let mut index = KmodIndex::new();
+//     for line in dep_text.lines() {
+//         let line = line.trim();
+//         if line.is_empty() { continue; }
+//         if let Some((target, _deps)) = line.split_once(':') {
+//             if let Some(modname) = Path::new(target.trim()).file_stem().and_then(|s| s.to_str()) {
+//                 index.insert(modname, line, 0);
+//             }
+//         }
+//     }
+//     let mut out = Cursor::new(Vec::new());
+//     index.write(&mut out).unwrap();
+//     out.into_inner()
+// }
 
 
 fn write_cpio_header(out: &mut Vec<u8>, path: &str, filesize: u32) {

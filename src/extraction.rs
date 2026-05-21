@@ -3,8 +3,6 @@ use std::{io::Write, fs::File, path::Path, cell::RefCell};
 use flate2::write::GzDecoder;
 use zstd::stream::write::Decoder as ZstdDecoder;
 
-use hadris_iso::{sync::IsoImage};
-
 use pyo3::{
     prelude::*, 
     types::{PyDict}, 
@@ -134,11 +132,10 @@ pub fn extract_image(image_path: String, extract_dir: String, auto_decompress: b
         let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
         extract_to_fs(&reader, "", host_root, auto_decompress).map_err(|e| PyRuntimeError::new_err(e))?;
     } else {
-        let iso_file = File::open(&image_path)?;
-        let iso = IsoImage::open(iso_file).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to parse ISO9660: {:?}", e))
-        })?;
-        let reader = IsoReader { iso: &iso };
+        let root_dir = crate::iso9660::get_joliet_root_directory(&mut file)
+            .unwrap_or(None)
+            .unwrap_or_else(|| crate::iso9660::get_root_directory(&mut file).unwrap());
+        let reader = IsoReader { file: RefCell::new(&mut file), root_dir };
         extract_to_fs(&reader, "", host_root, auto_decompress).map_err(|e| PyRuntimeError::new_err(e))?;
     }
 
@@ -223,9 +220,8 @@ pub fn get_wim_info_from_iso<'py>(py: Python<'py>, image_path: String, wim_path:
             let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
             let _ = execute_wim_scan(&reader);
         } else {
-            let iso_file = File::open(&image_path).ok()?;
-            let iso = IsoImage::open(iso_file).ok()?;
-            let reader = IsoReader { iso: &iso };
+            let root_dir = crate::iso9660::get_joliet_root_directory(&mut file).ok()?.unwrap_or_else(|| crate::iso9660::get_root_directory(&mut file).unwrap());
+            let reader = IsoReader { file: RefCell::new(&mut file), root_dir };
             let _ = execute_wim_scan(&reader);
         }
 

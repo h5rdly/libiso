@@ -1,13 +1,5 @@
 use std::{
-    fs::File, 
-    sync::{Arc, mpsc}, 
-    io::{Cursor, Read, Write, Seek, SeekFrom}
-};
-
-use hadris_iso::{
-    read::PathSeparator,
-    write::{IsoImageWriter, InputFiles, File as IsoFile},
-    write::options::{FormatOptions, CreationFeatures, BaseIsoLevel}
+    fs::File, sync::{mpsc}, io::{Read, Write, Seek, SeekFrom}
 };
 
 use sha2::{Sha256, Digest};
@@ -22,59 +14,91 @@ use crate::verify;
 pub fn create_mock_iso(
     volume_name: String, files: Vec<String>, is_isohybrid: bool, dummy_file_size_mb: usize
 ) -> PyResult<Vec<u8>> {
+    
+    // ISOs must be a multiple of 2048 bytes. Start with 19 sectors (up to LBA 18 for root dir).
+    let mut iso = vec![0u8; 19 * 2048];
 
-    let mut iso_files = Vec::new();
-    
-    let file_content = vec![0u8; dummy_file_size_mb * 1024 * 1024];
-    
-    for name in &files {
-        iso_files.push(IsoFile::File {
-            name: Arc::new(name.clone()),
-            contents: file_content.clone(),
-        });
+    // 1. ISOHybrid MBR signature
+    if is_isohybrid {
+        iso[510] = 0x55;
+        iso[511] = 0xAA;
     }
 
-    let input_files = InputFiles {
-        path_separator: PathSeparator::ForwardSlash,
-        files: iso_files,
-    };
-
-    let mut features = CreationFeatures::default();
-    features.filenames = BaseIsoLevel::Level2 {
-        supports_lowercase: true,
-        supports_rrip: false,
-    };
-
-    let options = FormatOptions {
-        volume_name,
-        system_id: None,
-        volume_set_id: None,
-        publisher_id: None,
-        preparer_id: None,
-        application_id: None,
-        sector_size: 2048,
-        features,
-        path_separator: PathSeparator::ForwardSlash,
-        strict_charset: false, 
-    };
-
-    // Pre-allocate and zero-fill the buffer.
-    // The ISO writer expects a physical-disk-like canvas to seek around on.
-    let total_size = (files.len() * dummy_file_size_mb * 1024 * 1024) + (4 * 1024 * 1024);
-    let mut buffer = Cursor::new(vec![0u8; total_size]);
+    // 2. Sector 16: Primary Volume Descriptor (PVD)
+    let pvd = 16 * 2048;
+    iso[pvd] = 1; // Type: PVD
+    iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    iso[pvd + 6] = 1; // Version
     
-    IsoImageWriter::format_new(&mut buffer, input_files, options)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("ISO creation failed: {:?}", e)))?;
+    let vol_bytes = volume_name.as_bytes();
+    let copy_len = vol_bytes.len().min(32);
+    iso[pvd + 40..pvd + 40 + copy_len].copy_from_slice(&vol_bytes[..copy_len]);
+    for i in copy_len..32 { iso[pvd + 40 + i] = b' '; } // Pad with spaces
 
-    let mut bytes = buffer.into_inner();
+    // 3. Sector 17: Terminator
+    let term = 17 * 2048;
+    iso[term] = 255;
+    iso[term + 1..term + 6].copy_from_slice(b"CD001");
+    iso[term + 6] = 1;
 
-    // Inject the ISOHybrid MBR signature at the end of Sector 0
-    if is_isohybrid && bytes.len() >= 512 {
-        bytes[510] = 0x55;
-        bytes[511] = 0xAA;
+    // 4. Root Directory Record (Inside PVD at offset 156)
+    let root_rec = pvd + 156;
+    iso[root_rec] = 34; // Record length
+    iso[root_rec + 2..root_rec + 6].copy_from_slice(&18u32.to_le_bytes()); // LBA 18
+    iso[root_rec + 10..root_rec + 14].copy_from_slice(&2048u32.to_le_bytes()); // Size 2048
+    iso[root_rec + 25] = 0x02; // Directory flag
+    iso[root_rec + 32] = 1; // Name length
+    iso[root_rec + 33] = 0x00; // '\x00' is the name for the root directory itself
+
+    // 5. Sector 18: Root Directory Data
+    let mut dir_cursor = 18 * 2048;
+    
+    // Add "."
+    iso[dir_cursor] = 34;
+    iso[dir_cursor + 2..dir_cursor + 6].copy_from_slice(&18u32.to_le_bytes());
+    iso[dir_cursor + 25] = 0x02;
+    iso[dir_cursor + 32] = 1;
+    iso[dir_cursor + 33] = 0x00;
+    dir_cursor += 34;
+
+    // Add ".."
+    iso[dir_cursor] = 34;
+    iso[dir_cursor + 2..dir_cursor + 6].copy_from_slice(&18u32.to_le_bytes());
+    iso[dir_cursor + 25] = 0x02;
+    iso[dir_cursor + 32] = 1;
+    iso[dir_cursor + 33] = 0x01;
+    dir_cursor += 34;
+
+    // 6. Add Files
+    let mut current_file_lba = 19u32;
+    let file_size_bytes = (dummy_file_size_mb * 1024 * 1024) as u32;
+
+    for name in files {
+        // Mock the filename to ensure our ISO reader finds it easily
+        let mut name_upper = name.to_uppercase().replace("/", "_");
+        if !name_upper.contains(';') {
+            name_upper.push_str(";1");
+        }
+        let name_bytes = name_upper.as_bytes();
+        let padding = if name_bytes.len() % 2 == 0 { 1 } else { 0 };
+        let record_len = 33 + name_bytes.len() + padding;
+
+        iso[dir_cursor] = record_len as u8;
+        iso[dir_cursor + 2..dir_cursor + 6].copy_from_slice(&current_file_lba.to_le_bytes());
+        iso[dir_cursor + 10..dir_cursor + 14].copy_from_slice(&file_size_bytes.to_le_bytes());
+        iso[dir_cursor + 25] = 0x00; // File flag
+        iso[dir_cursor + 32] = name_bytes.len() as u8;
+        iso[dir_cursor + 33..dir_cursor + 33 + name_bytes.len()].copy_from_slice(name_bytes);
+        
+        dir_cursor += record_len;
+
+        // Expand the ISO file to accommodate the dummy file data
+        let file_sectors = (file_size_bytes as usize + 2047) / 2048;
+        iso.resize(iso.len() + (file_sectors * 2048), 0);
+        current_file_lba += file_sectors as u32;
     }
 
-    Ok(bytes)
+    Ok(iso)
 }
 
 

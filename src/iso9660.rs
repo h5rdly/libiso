@@ -188,7 +188,6 @@ pub fn read_directory<R: Read + Seek>(reader: &mut R, dir: &DirectoryRef) -> Res
 
         let flags = record[25];
         let is_dir = (flags & 0x02) != 0;
-        let is_not_final = (flags & 0x80) != 0; // The 4GB Multi-Extent flag
         let name_len = record[32] as usize;
         let name_bytes = &record[33 .. 33 + name_len];
         
@@ -294,7 +293,7 @@ where
         return Err(Error::new(ErrorKind::InvalidInput, "Cannot stream a directory"));
     }
 
-    // 100KB buffer (O(1) memory usage regardless of file size!)
+    // 100KB buffer 
     let mut chunk_buf = vec![0u8; 100 * 1024]; 
 
     for extent in &file.extents {
@@ -321,6 +320,7 @@ where
 // -- El Torito (Bootable CD)
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BootImage {
     pub lba: u32,
     pub sector_count: u16,
@@ -328,11 +328,11 @@ pub struct BootImage {
 }
 
 
-pub fn get_boot_image<R: Read + Seek>(reader: &mut R) -> Result<Option<BootImage>> {
+pub fn _get_boot_image<R: Read + Seek>(reader: &mut R) -> Result<Option<BootImage>> {
     
     let mut buf = [0u8; 2048];
     let mut current_sector = 16;
-    let mut catalog_lba;
+    let catalog_lba;
     
     // Scan for the Boot Record Volume Descriptor (Type 0)
     loop {
@@ -380,7 +380,7 @@ pub fn get_boot_image<R: Read + Seek>(reader: &mut R) -> Result<Option<BootImage
 }
 
 
-pub fn extract_boot_image<R: Read + Seek>(reader: &mut R, boot: &BootImage) -> Result<Vec<u8>> {
+pub fn _extract_boot_image<R: Read + Seek>(reader: &mut R, boot: &BootImage) -> Result<Vec<u8>> {
     
     // Multiply by 512 (not 2048!) because the El Torito spec counts in emulated 512-byte sectors
     let byte_size = (boot.sector_count as u64) * 512;

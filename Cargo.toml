@@ -12,10 +12,8 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 
-bytemuck = "1.25"
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 rand = "0.10.1"    # For UUIDs and rsa for sbsign
-
-hadris-iso = "1.1.2"
 
 zstd = "0.13.3"
 flate2 = "1.1.9"
@@ -39,7 +37,6 @@ rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
 
 
 [dev-dependencies]
-# backhand = "0.25.1"
 
 
 [profile.release]

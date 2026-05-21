@@ -147,9 +147,9 @@ def on_iso_loaded(file_path):
     if win_info := stats.get('windows_info'):
         state['is_windows'] = True
         
-        # Windows: Hide ISO Mode toggle, Force DD box
+        # Windows: Hide ISO Mode toggle AND the DD box entirely
         dpg.configure_item('grp_iso_mode', show=False)
-        dpg.configure_item('grp_dd', show=True)
+        dpg.configure_item('grp_dd', show=False)
         dpg.set_value('chk_dd', False)
         
         win_ver = 'Windows 11' if win_info.get('is_windows_11') else 'Windows 10'

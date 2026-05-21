@@ -7,8 +7,6 @@ use std::{
     cell::RefCell, collections::HashSet,
 };
 
-use hadris_iso::{sync::IsoImage,};
-
 use pyo3::{
     prelude::*,
     exceptions::{PyRuntimeError, PyPermissionError, PyIOError, PyFileNotFoundError, PyValueError}
@@ -680,9 +678,8 @@ fn burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
         )
     } else {
         let _ = tx.send(EventMsg::log("Using ISO9660 Parser"));
-        let iso_file = File::open(iso_path).unwrap();
-        let iso = IsoImage::open(iso_file).unwrap();
-        let reader = IsoReader { iso: &iso };
+        let root_dir = crate::iso9660::get_joliet_root_directory(&mut file).unwrap().unwrap_or_else(|| crate::iso9660::get_root_directory(&mut file).unwrap());
+        let reader = IsoReader { file: RefCell::new(&mut file), root_dir };
         execute_extraction_workflow(
             &reader, writer, tx, total_size, has_large_file, arch_selection, original_iso_label, 
             new_usb_label, unattend_xml_payload, autorun_inf_label, abort_flag, use_sprout_bootloader,
@@ -716,9 +713,8 @@ fn burn_and_verify<W: UsbWriter, U: verify::UsbReader>(
             let reader = UdfReader { file: RefCell::new(&mut file), ctx: &udf_ctx };
             execute_verify_workflow(&reader, usb_reader, tx, total_size, use_sprout_bootloader)
         } else {
-            let iso_file = File::open(iso_path).unwrap();
-            let iso = IsoImage::open(iso_file).unwrap();
-            let reader = IsoReader { iso: &iso };
+            let root_dir = crate::iso9660::get_joliet_root_directory(&mut file).unwrap().unwrap_or_else(|| crate::iso9660::get_root_directory(&mut file).unwrap());
+            let reader = IsoReader { file: RefCell::new(&mut file), root_dir };
             execute_verify_workflow(&reader, usb_reader, tx, total_size, use_sprout_bootloader)
         };
         if let Err(e) = verify_res {

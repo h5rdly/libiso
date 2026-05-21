@@ -20,11 +20,11 @@ mod ext4;
 mod gpt;
 mod events;
 mod initramfs_patcher;
-mod kmod;
 mod extraction;
 mod grub_patcher;
 mod squashfs;
 mod iso9660;
+// mod kmod;
 
 
 use drives::{list_removable_drives, DriveInfo};
