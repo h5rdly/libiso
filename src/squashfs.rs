@@ -154,7 +154,8 @@ pub fn read_superblock<R: Read + Seek>(mut reader: R) -> Result<Superblock> {
 
 
 
-pub fn read_metadata_block<R: Read + Seek>(reader: &mut R, is_little_endian: bool,
+pub fn read_metadata_block<R: Read + Seek>(
+    reader: &mut R, is_little_endian: bool, compressor_id: u16 
 ) -> Result<Vec<u8>> {
     
     // Read the 2-byte header
@@ -187,8 +188,7 @@ pub fn read_metadata_block<R: Read + Seek>(reader: &mut R, is_little_endian: boo
     if is_uncompressed {
         Ok(payload)
     } else {
-        // assume ZSTD 
-        zstd::stream::decode_all(std::io::Cursor::new(payload))
+        decompress_squashfs_block(&payload, compressor_id)
     }
 }
 
@@ -205,12 +205,12 @@ pub fn read_dir_inode<R: Read + Seek>(
     let physical_offset = superblock.inode_table_start + (block_index as u64);
     reader.seek(SeekFrom::Start(physical_offset))?;
     
-    let mut inode_data = read_metadata_block(reader, is_le)?;
+    let mut inode_data = read_metadata_block(reader, is_le, superblock.compressor)?;
     
     // If the inode starts near the end of the 8KB block, stitch the next one
     // We need at most 40 bytes to safely parse a directory inode.
     while inode_data.len() < (block_offset as usize) + 40 {
-        let mut next = read_metadata_block(reader, is_le)?;
+        let mut next = read_metadata_block(reader, is_le, superblock.compressor)?;
         inode_data.append(&mut next);
     }
     
@@ -244,11 +244,11 @@ pub fn read_root_inode<R: Read + Seek>(
     let byte_offset = (superblock.root_inode & 0xFFFF) as usize;
 
     reader.seek(SeekFrom::Start(superblock.inode_table_start + block_index))?;
-    let mut inode_data = read_metadata_block(reader, is_le)?;
+    let mut inode_data = read_metadata_block(reader, is_le, superblock.compressor)?;
 
     // Stitch the next block if we are too close to the end
     while inode_data.len() < byte_offset + 40 {
-        let mut next = read_metadata_block(reader, is_le)?;
+        let mut next = read_metadata_block(reader, is_le, superblock.compressor)?;
         inode_data.append(&mut next);
     }
 
@@ -296,11 +296,11 @@ pub fn read_file_inode<R: Read + Seek>(
     let physical_offset = superblock.inode_table_start + (block_index as u64);
     reader.seek(SeekFrom::Start(physical_offset))?;
     
-    let mut inode_data = read_metadata_block(reader, is_le)?;
+    let mut inode_data = read_metadata_block(reader, is_le, superblock.compressor)?;
 
     // Ensure we have at least 56 bytes to parse an ExtendedFile payload without panicking
     while inode_data.len() < (block_offset as usize) + 56 {
-        let mut next = read_metadata_block(reader, is_le)?;
+        let mut next = read_metadata_block(reader, is_le, superblock.compressor)?;
         inode_data.append(&mut next);
     }
 
@@ -342,7 +342,7 @@ pub fn read_file_inode<R: Read + Seek>(
     let required_total_size = block_offset as usize + 16 + block_sizes_start + (block_count as usize * 4);
     
     while inode_data.len() < required_total_size {
-        let mut next = read_metadata_block(reader, is_le)?;
+        let mut next = read_metadata_block(reader, is_le, superblock.compressor)?;
         inode_data.append(&mut next);
     }
 
@@ -364,6 +364,31 @@ pub fn read_file_inode<R: Read + Seek>(
         frag_index,
         block_offset: block_offset_frag,
     })
+}
+
+
+fn decompress_squashfs_block(data: &[u8], compressor_id: u16) -> Result<Vec<u8>> {
+    match compressor_id {
+        1 => {
+            // GZIP (Zlib)
+            let mut decoder = flate2::read::ZlibDecoder::new(data);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out)?;
+            Ok(out)
+        },
+        4 => {
+            // XZ (EndeavourOS / Arch Linux)
+            let mut decoder = liblzma::read::XzDecoder::new(data);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out)?;
+            Ok(out)
+        },
+        6 => {
+            // ZSTD (Fedora / Ubuntu)
+            zstd::stream::decode_all(std::io::Cursor::new(data))
+        },
+        _ => Err(Error::new(ErrorKind::InvalidData, format!("Unsupported SquashFS compression ID: {}", compressor_id)))
+    }
 }
 
 
@@ -391,7 +416,7 @@ pub fn find_files<R: Read + Seek>(
         let target_size = dir_loc.block_offset as usize + dir_loc.file_size as usize - 3; 
         
         while dir_data.len() < target_size {
-            let mut block = read_metadata_block(reader, is_le)?;
+            let mut block = read_metadata_block(reader, is_le, superblock.compressor)?;
             dir_data.append(&mut block);
         }
 
@@ -474,7 +499,7 @@ pub fn read_fragment_entry<R: Read + Seek>(
 
     // Jump to the Metadata block and decompress it using our engine
     reader.seek(SeekFrom::Start(metadata_block_ptr))?;
-    let metadata_block = read_metadata_block(reader, is_le)?;
+    let metadata_block = read_metadata_block(reader, is_le, superblock.compressor)?;
 
     // Slice out a 16-byte FragmentEntry
     let data = &metadata_block[entry_offset as usize .. (entry_offset + 16) as usize];
@@ -507,8 +532,7 @@ pub fn extract_file_data<R: Read + Seek>(
         if is_uncompressed {
             file_contents.extend_from_slice(&block);
         } else {
-            // assuming ZSTD 
-            let uncompressed_block = zstd::stream::decode_all(std::io::Cursor::new(block))?;
+            let uncompressed_block = decompress_squashfs_block(&block, superblock.compressor)?;
             file_contents.extend_from_slice(&uncompressed_block);
         }
     }
@@ -531,14 +555,12 @@ pub fn extract_file_data<R: Read + Seek>(
         let decompressed_frag = if is_uncompressed {
             frag_block
         } else {
-            // assuming ZSTD 
-            zstd::stream::decode_all(std::io::Cursor::new(frag_block))?
+            decompress_squashfs_block(&frag_block, superblock.compressor)?
         };
 
         // This decompressed block contains the tails of DOZENS of different files
         // We use the `block_offset` to find where it starts
         let bytes_remaining = blueprint.file_size as usize - file_contents.len();
-        
         let start = blueprint.block_offset as usize;
         let end = start + bytes_remaining;
         

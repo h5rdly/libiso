@@ -16,6 +16,7 @@ bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 rand = "0.10.1"    # For UUIDs and rsa for sbsign
 
 zstd = "0.13.3"
+liblzma = "0.4.6" 
 flate2 = "1.1.9"
 
 # See if these need removing

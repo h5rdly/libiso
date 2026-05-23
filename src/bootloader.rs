@@ -80,57 +80,57 @@ pub fn detect_linux_payloads(
 }
 
 
-
 pub fn patch_boot_labels(cfg: &str, new_label: &str, inject_fat_kernel_args: bool) -> String {
     
     let mut result = cfg.to_string();
         
-    // Inject FAT32 & GPT drivers. If the distro didn't include them, GRUB will fail to read Long File Names on the USB
-    if !result.contains("insmod fat") {
+    // GRUB: Inject FAT32 & GPT drivers
+    if !result.contains("insmod fat") && result.contains("set default") {
         result = result.replacen("set default", "insmod part_gpt\ninsmod fat\nset default", 1);
-        // Fallback if 'set default' isn't the first line
-        if !result.contains("insmod fat") {
-            result = format!("insmod part_gpt\ninsmod fat\n{}", result);
-        }
+    } else if !result.contains("insmod fat") && result.contains("menuentry ") {
+        result = format!("insmod part_gpt\ninsmod fat\n{}", result);
     }
 
-    // Patch search.fs_uuid strings
+    // GRUB: Patch search.fs_uuid strings
     let mut current = 0;
     while let Some(idx) = result[current..].find("search.fs_uuid") {
         let start = current + idx;
         let end_offset = result[start..].find('\n').unwrap_or(result[start..].len() - start);
         let end = start + end_offset;
         
-        // Extract the variable name at the end of the line (e.g., "root")
         let parts: Vec<&str> = result[start..end].split_whitespace().collect();
         let var_name = if parts.len() >= 3 { parts.last().unwrap() } else { "root" };
         
-        // Rewrite the command to use our FAT32 label
         let replacement = format!("search.fs_label '{}' {}", new_label, var_name);
         result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
         current = start + replacement.len();
     }
 
-    // Patch kernel arguments (e.g., root=live:UUID=... -> root=live:LABEL=NEW_LABEL)
-    let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "UUID=", "uuid="];
+    // Patch kernel arguments (GRUB, Syslinux, Systemd-boot)
+    let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "archisosearchuuid=", "UUID=", "uuid="];
     for prefix in prefixes {
         let mut current = 0;
         while let Some(idx) = result[current..].find(prefix) {
-            let start = current + idx; // Start BEFORE the prefix
+            let start = current + idx; 
             let val_start = start + prefix.len();
             let end_offset = result[val_start..]
                 .find(|c: char| c == ' ' || c == '"' || c == '\'' || c == '\n' || c == '\r')
                 .unwrap_or(result[val_start..].len());
             let end = val_start + end_offset;
             
-            // Rip out the whole "PREFIX=OLD_VAL" and replace it with "LABEL=NEW_LABEL"
-            let replacement = format!("LABEL={}", new_label);
+            // Map Arch's UUID flag to Arch's Label flag, otherwise use standard LABEL=
+            let replacement = if prefix.starts_with("archiso") {
+                format!("archisolabel={}", new_label)
+            } else {
+                format!("LABEL={}", new_label)
+            };
+            
             result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
             current = start + replacement.len();
         }
     }
     
-    // Patch GRUB search commands (e.g., search --label "Adelie-x86_64")
+    // GRUB: Patch search commands (e.g., search --label "Adelie-x86_64")
     let mut current = 0;
     let prefix = "--label ";
     while let Some(idx) = result[current..].find(prefix) {
@@ -150,11 +150,26 @@ pub fn patch_boot_labels(cfg: &str, new_label: &str, inject_fat_kernel_args: boo
         current = val_start + new_label.len() + if has_quote { 1 } else { 0 };
     } 
    
+    // Inject FAT driver kernel arguments (Line routing)
     if inject_fat_kernel_args {
+        // Detect the configuration file format
+        let is_systemd_boot = result.contains("\noptions ") || result.starts_with("options ");
+        let is_syslinux = result.contains("\nAPPEND ") || result.contains("\nappend ") || result.starts_with("APPEND ") || result.starts_with("append ");
+        
         let mut new_result = String::new();
         for line in result.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ") {
+            
+            // Route the arguments to the correct line for the specific bootloader
+            let should_inject = if is_systemd_boot {
+                trimmed.starts_with("options ")
+            } else if is_syslinux {
+                trimmed.starts_with("APPEND ") || trimmed.starts_with("append ")
+            } else {
+                trimmed.starts_with("linux ") || trimmed.starts_with("linuxefi ") || trimmed.starts_with("linux16 ")
+            };
+
+            if should_inject {
                 new_result.push_str(line);
                 new_result.push_str(&format!(" {FAT_INJECTION_ARGS}\n"));
             } else {
@@ -218,6 +233,13 @@ pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>, n
                 extracted_args = parts.join(" ");
             }
         }
+        // Systemd-boot style 
+        else if trimmed.starts_with("options ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+            if !parts.is_empty() {
+                extracted_args = parts.join(" ");
+            }
+        }
 
         // If we found arguments, process them!
         if !extracted_args.is_empty() {
@@ -230,7 +252,11 @@ pub fn scrape_boot_args(config_content: &str, found_args: &mut Option<String>, n
             }
 
             // Patch the labels for Sprout
-            let prefixes = ["LABEL=", "label=", "CDLABEL=", "archisolabel=", "UUID=", "uuid="];
+            let prefixes = [
+                "LABEL=", "label=", "CDLABEL=", "archisolabel=", "archisosearchuuid=", 
+                "UUID=", "uuid="
+            ];
+            
             for prefix in prefixes {
                 let mut current = 0;
                 while let Some(idx) = extracted_args[current..].find(prefix) {
