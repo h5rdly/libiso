@@ -57,7 +57,7 @@ jobs:
           apk add --no-cache gcc musl-dev patchelf
           
           # Rust and Cargo from the Alpine edge repositories 
-          apk add --no-cache rust cargo \
+          apk add --no-cache cargo \
             --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
         
       - name: Install dependencies
