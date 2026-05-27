@@ -54,12 +54,11 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Alpine build deps
         run: |
-          apk add --no-cache gcc musl-dev cargo patchelf
+          apk add --no-cache gcc musl-dev patchelf
           
           # Rust and Cargo from the Alpine edge repositories 
           apk add --no-cache rust cargo \
-            --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main \
-            --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community
+            --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
         
       - name: Install dependencies
         run: pip install maturin
